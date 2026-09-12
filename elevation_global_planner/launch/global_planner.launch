@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="map_frame" default="map"/>
+    <arg name="base_frame" default="base_link"/>
+    <arg name="max_layers" default="3"/>
+    <arg name="pcd_file" default=""/>
+
+    <node pkg="elevation_global_planner" type="elevation_global_planner_node" name="elevation_global_planner" output="screen">
+        <param name="map_frame" value="$(arg map_frame)"/>
+        <param name="base_frame" value="$(arg base_frame)"/>
+        <param name="max_layers" value="$(arg max_layers)"/>
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+    </node>
+</launch>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>elevation_map_loader</name>
+  <version>1.0.0</version>
+  <description>PCD point cloud loading and multi-layer elevation manifold extraction using ETH grid_map_pcl and Dijkstra spanning forest</description>
+  <maintainer email="user@todo.todo">Developer</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>roslib</depend>
+  <depend>grid_map_core</depend>
+  <depend>grid_map_ros</depend>
+  <depend>grid_map_pcl</depend>
+  <depend>grid_map_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>pcl_ros</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-uvicorn</exec_depend>
+  <exec_depend>python3-fastapi</exec_depend>
+</package>

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/map-segment.pcd"/>
+    <arg name="config_file" default="$(find elevation_map_loader)/config/parameters.yaml"/>
+    <arg name="resolution" default="0.10"/>
+
+    <!-- 纯 C++ 节点：使用官方 grid_map_pcl 将 PCD 点云自动转换为 2.5D 高程图 -->
+    <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+        <param name="config_file" value="$(arg config_file)"/>
+        <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
+        <param name="grid_map_topic" value="/grid_map"/>
+        <param name="frame_id" value="map"/>
+        <param name="resolution" value="$(arg resolution)"/>
+        <param name="max_step_height" value="0.25"/>
+        <param name="max_slope_deg" value="30.0"/>
+        <param name="max_stride_length" value="0.35"/>
+        <param name="dog_height" value="0.50"/>
+    </node>
+
+    <!-- Web 服务端 -->
+    <node pkg="elevation_map_loader" type="elevation_server.py" name="elevation_web_server" output="screen">
+        <param name="web_port" value="8080"/>
+    </node>
+
+    <!-- 点云直通流形规划与 3D 图构建节点 -->
+    <include file="$(find elevation_global_planner)/launch/global_planner.launch">
+        <arg name="pcd_file" value="$(arg pcd_file)"/>
+    </include>
+</launch>

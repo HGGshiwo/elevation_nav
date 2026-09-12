@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/map-segment.pcd"/>
+    <arg name="config_file" default="$(find elevation_map_loader)/config/parameters.yaml"/>
+    <arg name="resolution" default="0.10"/>
+    <arg name="web_port" default="8080"/>
+
+    <!-- 1. 地图与流形生成节点 (elevation_map_loader) -->
+    <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+        <param name="config_file" value="$(arg config_file)"/>
+        <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
+        <param name="grid_map_topic" value="/grid_map"/>
+        <param name="frame_id" value="map"/>
+        <param name="resolution" value="$(arg resolution)"/>
+        <param name="max_step_height" value="0.25"/>
+        <param name="max_slope_deg" value="30.0"/>
+        <param name="max_stride_length" value="0.35"/>
+        <param name="dog_height" value="0.50"/>
+    </node>
+
+    <!-- 2. 全局跨层拓扑规划器 (elevation_global_planner) -->
+    <node pkg="elevation_global_planner" type="elevation_global_planner_node" name="elevation_global_planner" output="screen">
+        <param name="map_frame" value="map"/>
+        <param name="base_frame" value="base_link"/>
+        <param name="max_layers" value="3"/>
+    </node>
+
+    <!-- 3. 局部轨迹优化与机体控制 (elevation_local_planner) -->
+    <node pkg="elevation_local_planner" type="elevation_local_planner_node" name="elevation_local_planner" output="screen">
+        <param name="map_frame" value="map"/>
+        <param name="base_frame" value="base_link"/>
+        <param name="cmd_vel_topic" value="/cmd_vel"/>
+        <param name="controller_freq" value="20.0"/>
+        <param name="max_vel_x" value="0.8"/>
+        <param name="max_vel_theta" value="1.0"/>
+        <param name="lookahead_dist" value="0.8"/>
+    </node>
+
+    <!-- 4. Web 服务端与三维可视化 (FastAPI + Three.js) -->
+    <node pkg="elevation_map_loader" type="elevation_server.py" name="elevation_web_server" output="screen">
+        <param name="web_port" value="$(arg web_port)"/>
+    </node>
+</launch>

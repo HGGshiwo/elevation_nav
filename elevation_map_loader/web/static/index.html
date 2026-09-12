@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Web 地图编辑器与高程图监控</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; color: #ddd; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        #ui-panel { position: absolute; top: 10px; left: 10px; background: rgba(30,30,30,0.9); padding: 15px; border-radius: 8px; width: 320px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); z-index: 10; }
+        .row { margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+        input[type="text"], input[type="number"] { width: 100px; padding: 4px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;}
+        button { padding: 6px 12px; cursor: pointer; background: #4CAF50; color: white; border: none; border-radius: 4px; font-weight: bold;}
+        button:hover { background: #45a049; }
+        .btn-danger { background: #f44336; }
+        .btn-danger:hover { background: #d32f2f; }
+        .btn-sync { background: #2196F3; width: 100%; margin-top: 5px; }
+        .btn-view { background: #444; font-size: 13px; padding: 6px 8px; flex: 1; text-align: center; }
+        .btn-view:hover { background: #555; }
+        hr { border-color: #444; margin: 10px 0; }
+        .active { border: 2px solid #fff; box-shadow: 0 0 8px #fff; }
+        #debug-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(30,30,30,0.92);
+            padding: 15px;
+            border-radius: 8px;
+            width: 330px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            border: 1px solid #444;
+            display: none;
+            z-index: 10;
+        }
+        .debug-title {
+            margin: 0 0 10px 0;
+            color: #2196F3;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+            font-size: 16px;
+            font-weight: bold;
+        }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/static/three.module.js",
+          "three/addons/controls/OrbitControls.js": "/static/OrbitControls.js"
+        }
+      }
+    </script>
+</head>
+<body>
+    <div id="loading-indicator" style="display: none; position: absolute; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(33, 150, 243, 0.95); color: white; padding: 10px 24px; border-radius: 20px; font-weight: bold; box-shadow: 0 4px 15px rgba(0,0,0,0.5); z-index: 1000; font-size: 14px; pointer-events: none; transition: opacity 0.3s ease;">
+        <span id="loading-msg">正在加载地图数据，请稍候...</span>
+    </div>
+    <div id="ui-panel">
+        <h3>文件管理</h3>
+        <div class="row">
+            <span>PCD:</span> <input type="text" id="pcd-path" value="/home/hggshiwo/catkin_ws/src/map-segment.pcd" style="width: 140px;">
+            <button id="btn-load-pcd" style="background: #009688;">导入</button>
+        </div>
+        <div class="row">
+            <span>地图包:</span> <input type="text" id="map-path" value="/home/robot/maps/map" style="width: 140px;">
+            <button id="btn-load">加载</button>
+        </div>
+        <hr>
+        <h3>栅格编辑</h3>
+        <div class="row" style="display: flex; gap: 10px; justify-content: flex-start; flex-wrap: wrap;">
+            <label><input type="radio" name="tool" value="view" checked> 拖动视角</label>
+            <label><input type="radio" name="tool" value="brush"> 画笔</label>
+            <label><input type="radio" name="tool" value="eraser"> 橡皮擦</label>
+            <label><input type="radio" name="tool" value="start"> 设起点</label>
+            <label><input type="radio" name="tool" value="goal"> 设终点</label>
+            <label><input type="radio" name="tool" value="debug"> 调试方块</label>
+        </div>
+        <div class="row">
+            <span>目标图层:</span>
+            <select id="edit-layer" style="background:#333;color:white;padding:4px;">
+                <option value="occupied">占据 (橙色)</option>
+                <option value="preblocked">禁行 (红色)</option>
+            </select>
+        </div>
+        <div class="row">
+            <span>画笔大小:</span> <input type="number" id="brush-size" value="1" min="1" max="10">
+        </div>
+        <div class="row" style="display: flex; gap: 10px; justify-content: flex-start; flex-wrap: wrap;">
+            <span>图层显隐:</span>
+            <label><input type="checkbox" id="show-preblocked" checked> 禁行(红)</label>
+            <label><input type="checkbox" id="show-traversable" checked> 可通行(绿)</label>
+            <label><input type="checkbox" id="show-risk-cost"> 通行代价(渐变)</label>
+            <label><input type="checkbox" id="show-octomap-local"> 局部Octomap(青)</label>
+            <label><input type="checkbox" id="show-octomap-fused"> 融合Octomap(紫)</label>
+            <label><input type="checkbox" id="show-emergency-stop"> 紧急制动探针</label>
+            <label><input type="checkbox" id="show-robot" checked> 狗定位(蓝)</label>
+            <label><input type="checkbox" id="show-local-astar" checked> 局部A*(黄)</label>
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 8px;">
+            <button id="btn-focus-robot" class="btn-sync" style="background:#009688; margin-top:0; flex:1;">对准机器人</button>
+            <button id="btn-cancel-goal" class="btn-sync btn-danger" style="margin-top:0; flex:1;">取消导航目标</button>
+        </div>
+        <button id="btn-sync" class="btn-sync">实时同步至 ROS</button>
+        <button id="btn-save" class="btn-sync" style="background:#FF9800;">永久保存地图</button>
+        <div id="status" style="margin-top: 10px; font-size: 12px; color: #8bc34a;">就绪</div>
+        <div id="ros-status" style="margin-top: 5px; font-size: 11px; color: #00bcd4; word-break: break-all;">ROS 状态: 就绪</div>
+    </div>
+    <div id="debug-panel">
+        <div class="debug-title">3D 方块与临边调试诊断</div>
+        <div style="font-size: 11px; color: #aaa; margin-bottom: 8px;">提示：依次点击方块 A 与方块 B，可直接诊断两者为何未能建立连通边</div>
+
+        <div style="font-weight: bold; color: #00e5ff; font-size: 13px; margin: 4px 0;">方块 A (基准点)</div>
+        <div class="row"><span>位置坐标 (X, Y):</span> <span id="debug-node-a-xy">-</span></div>
+        <div class="row"><span>踏面高度 (Z):</span> <span id="debug-node-a-z" style="color: #69f0ae; font-weight: bold;">-</span></div>
+        <div class="row"><span>通行状态:</span> <span id="debug-node-a-status">-</span></div>
+        <div class="row"><span>拓扑度 (临边数):</span> <span id="debug-node-a-edges">-</span></div>
+
+        <div style="font-weight: bold; color: #ffab40; font-size: 13px; margin: 8px 0 4px;">方块 B (对比点)</div>
+        <div class="row"><span>位置坐标 (X, Y):</span> <span id="debug-node-b-xy">-</span></div>
+        <div class="row"><span>踏面高度 (Z):</span> <span id="debug-node-b-z" style="color: #69f0ae; font-weight: bold;">-</span></div>
+        <div class="row"><span>通行状态:</span> <span id="debug-node-b-status">-</span></div>
+        <div class="row"><span>拓扑度 (临边数):</span> <span id="debug-node-b-edges">-</span></div>
+
+        <hr style="border-color: #444; margin: 8px 0;">
+        <div style="font-weight: bold; color: #ffeb3b; font-size: 13px; margin-bottom: 4px;">A ⟷ B 拓扑邻边关系分析</div>
+        <div class="row"><span>水平跨度 (Δxy):</span> <span id="debug-rel-dxy">-</span></div>
+        <div class="row"><span>台阶高差 (Δz):</span> <span id="debug-rel-dz">-</span></div>
+        <div class="row"><span>爬坡坡度 (Slope):</span> <span id="debug-rel-slope">-</span></div>
+        <div class="row"><span>是否连通:</span> <span id="debug-rel-connected" style="font-weight: bold;">-</span></div>
+        <div class="row" style="align-items: flex-start;">
+            <span>诊断结论:</span>
+            <span id="debug-rel-reason" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #ff5252;">-</span>
+        </div>
+
+        <div style="display: none;">
+            <!-- 兼容历史组件占位 -->
+            <span id="debug-grid-coord">-</span>
+            <span id="debug-world-coord">-</span>
+            <span id="debug-occupied">-</span>
+            <span id="debug-ground-support">-</span>
+            <span id="debug-preblocked">-</span>
+            <span id="debug-preblocked-reason">-</span>
+            <span id="debug-horizontal-col">-</span>
+            <span id="debug-vertical-col">-</span>
+            <span id="debug-below-preblocked">-</span>
+            <span id="debug-preblocked-cost">-</span>
+            <span id="debug-risk-cost">-</span>
+            <span id="debug-candidate">-</span>
+            <span id="debug-traversable">-</span>
+            <span id="debug-node-source">-</span>
+        </div>
+
+        <div style="display: flex; gap: 8px; margin-top: 10px;">
+            <button id="btn-copy-debug" style="flex: 1; background: #2196F3;">一键复制诊断</button>
+            <button id="btn-clear-debug" style="background: #555;">清空选择</button>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+    <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
