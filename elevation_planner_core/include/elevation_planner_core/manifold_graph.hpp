@@ -20,6 +20,16 @@ struct GraphEdge
   float cost{0.0f};        ///< 边权重 (3D欧氏距离 + 台阶高差惩罚 + 坡度代价)
 };
 
+/// GraphNode.flags 状态位定义
+namespace node_flags
+{
+constexpr uint16_t STAIR = 0x01;          ///< 楼梯踏面
+constexpr uint16_t BRIDGE = 0x02;         ///< 桥梁连廊
+constexpr uint16_t GATEWAY = 0x04;        ///< 层间网关
+constexpr uint16_t BLOCK_HEADROOM = 0x10; ///< 禁行原因: 头顶净空不足
+constexpr uint16_t BLOCK_LATERAL = 0x20;  ///< 禁行原因: 侧向障碍落入机体硬半径
+}
+
 /**
  * @brief 紧凑流形拓扑踏面节点 (32字节对齐，硬件缓存友好)
  */
@@ -36,7 +46,7 @@ struct alignas(32) GraphNode
   int32_t layer_id{0};      ///< 曲面层级编号 (0: 最底层, 1, 2...)
   uint32_t edge_offset{0};  ///< 在全局 CSR 边数组中的起始偏移
   uint16_t edge_count{0};   ///< 邻接边总数
-  uint16_t flags{0};        ///< 状态标记 (0x01: 楼梯, 0x02: 桥梁连廊, 0x04: 网关)
+  uint16_t flags{0};        ///< 状态标记 (见 node_flags 常量: 楼梯/连廊/网关/禁行原因)
 
   int64_t getKey() const
   {

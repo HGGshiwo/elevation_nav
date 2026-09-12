@@ -25,9 +25,15 @@ public:
 
     elevation_planner::GraphBuildConfig cfg;
     pnh.param<double>("resolution", cfg.resolution, 0.10);
-    pnh.param<double>("max_step_height", cfg.max_step_height, 0.22);
+    pnh.param<double>("max_step_height", cfg.max_step_height, 0.25);
     pnh.param<double>("max_stride_length", cfg.max_stride_length, 0.35);
     pnh.param<double>("dog_height", cfg.dog_height, 0.45);
+    pnh.param<double>("footprint_radius", cfg.footprint_radius, 0.30);
+    pnh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.20);
+    pnh.param<double>("sweep_penalty_weight", cfg.sweep_penalty_weight, 1.0);
+    pnh.param<double>("foot_clearance", cfg.foot_clearance, 0.05);
+    pnh.param<int>("sor_mean_k", cfg.sor_mean_k, 16);
+    pnh.param<double>("sor_std_mul", cfg.sor_std_mul, 1.5);
     builder_.setConfig(cfg);
 
     path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan", 1, true);
@@ -186,9 +192,22 @@ public:
       if (colon == std::string::npos) return 0.0;
       return std::strtod(s.c_str() + colon + 1, nullptr);
     };
-    double x1 = getVal("x1"), y1 = getVal("y1"), z1 = getVal("z1");
-    double x2 = getVal("x2"), y2 = getVal("y2"), z2 = getVal("z2");
-    std::string res = builder_.diagnoseEdge(graph_, x1, y1, z1, x2, y2, z2);
+    // 模式分发: {"mode":"node"} 为单节点禁行原因诊断, 其余 (含旧版无 mode) 为两点邻边诊断
+    size_t mode_pos = s.find("\"mode\"");
+    bool node_mode = false;
+    if (mode_pos != std::string::npos) {
+      size_t vpos = s.find("node", mode_pos);
+      node_mode = (vpos != std::string::npos) && (vpos - mode_pos < 20);
+    }
+    std::string res;
+    if (node_mode) {
+      double x1 = getVal("x1"), y1 = getVal("y1"), z1 = getVal("z1");
+      res = builder_.diagnoseNode(graph_, x1, y1, z1);
+    } else {
+      double x1 = getVal("x1"), y1 = getVal("y1"), z1 = getVal("z1");
+      double x2 = getVal("x2"), y2 = getVal("y2"), z2 = getVal("z2");
+      res = builder_.diagnoseEdge(graph_, x1, y1, z1, x2, y2, z2);
+    }
     std_msgs::String out_msg;
     out_msg.data = res;
     debug_result_pub_.publish(out_msg);

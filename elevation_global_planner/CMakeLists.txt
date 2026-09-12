@@ -45,3 +45,12 @@ target_link_libraries(elevation_global_planner_node
   elevation_global_planner_lib
   ${catkin_LIBRARIES}
 )
+
+# ---- 离线验证工具 (test/) ----
+add_executable(offline_test
+  test/offline_test.cpp
+)
+target_link_libraries(offline_test
+  elevation_global_planner_lib
+  ${catkin_LIBRARIES}
+)

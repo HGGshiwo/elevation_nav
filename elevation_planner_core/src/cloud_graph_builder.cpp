@@ -1,14 +1,79 @@
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <vector>
 
 namespace elevation_planner
 {
+
+namespace
+{
+// 在查询点 3x3 邻域格内查找最近节点 (无视可通行性, 供诊断接口使用)
+bool findNearestNodeAny(const ManifoldGraph & graph, double qx, double qy, double qz, uint32_t & out_id)
+{
+  int r = 0, c = 0;
+  if (!graph.toGridIndex(qx, qy, r, c)) return false;
+  double best_d = 1e9;
+  bool found = false;
+  for (int dr = -1; dr <= 1; ++dr) {
+    int nr = r + dr;
+    if (nr < 0 || nr >= graph.getRows()) continue;
+    for (int dc = -1; dc <= 1; ++dc) {
+      int nc = c + dc;
+      if (nc < 0 || nc >= graph.getCols()) continue;
+      for (uint32_t nid : graph.getSpatialCellNodes(nr, nc)) {
+        const auto & nd = graph.getNode(nid);
+        double d = std::hypot(nd.x - qx, nd.y - qy) + std::abs(nd.z - qz);
+        if (d < best_d) {
+          best_d = d;
+          out_id = nid;
+          found = true;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+// 机体胶囊扫掠硬碰撞: 沿 u->v 线段采样, 硬半径内出现 "本行走层" 的禁行节点即剐蹭。
+// 垂直方向仅做选层切一刀: 只算 [sz - foot_clearance, sz + dog_height] 内的禁行节点——
+// 脚平面以下的禁行节点是被踩的楼梯结构/其他层, 不参与水平胶囊判定
+// (建边丢弃与诊断报因共用同一判据, 保证口径一致)
+bool segmentHitsHardInflation(const ManifoldGraph & graph, const GraphNode & u, const GraphNode & v,
+                              double hard_radius, double dog_height, double foot_clearance, double res)
+{
+  const int rad = std::max(1, static_cast<int>(std::ceil(hard_radius / res)));
+  const float seg_len = std::hypot(v.x - u.x, v.y - u.y);
+  const int steps = std::max(1, static_cast<int>(std::ceil(seg_len / (res * 0.5))));
+  for (int s = 0; s <= steps; ++s) {
+    float t = static_cast<float>(s) / steps;
+    float sx = u.x + t * (v.x - u.x);
+    float sy = u.y + t * (v.y - u.y);
+    float sz = u.z + t * (v.z - u.z);
+    int r = 0, c = 0;
+    if (!graph.toGridIndex(sx, sy, r, c)) return true;
+    for (int dr = -rad; dr <= rad; ++dr) {
+      for (int dc = -rad; dc <= rad; ++dc) {
+        if (std::hypot(dr, dc) * res > hard_radius) continue;
+        for (uint32_t nid : graph.getSpatialCellNodes(r + dr, c + dc)) {
+          const auto & nd = graph.getNode(nid);
+          if (nd.traversability >= 0.95f &&
+              nd.z >= sz - foot_clearance && nd.z <= sz + dog_height) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+std::string fmt2(double v) { return std::to_string(v).substr(0, 4); }
+} // namespace
 
 bool CloudGraphBuilder::buildFromROSMsg(const sensor_msgs::PointCloud2 & cloud_msg, ManifoldGraph & out_graph)
 {
@@ -28,6 +93,20 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
   vox.setInputCloud(cloud);
   vox.setLeafSize(0.05f, 0.05f, 0.05f);
   vox.filter(*filtered_cloud);
+
+  if (filtered_cloud->empty()) return false;
+
+  // 1.5 残影点过滤 (SOR): 悬浮稀疏点串的近邻距离远大于真实表面点, 统计上可分离。
+  //     不过滤时残影串会被柱状聚类误判为水平表面, 撑爆上方净空判定
+  if (config_.sor_std_mul < 1e6 && config_.sor_mean_k > 0) {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr sor_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+    sor.setInputCloud(filtered_cloud);
+    sor.setMeanK(config_.sor_mean_k);
+    sor.setStddevMulThresh(config_.sor_std_mul);
+    sor.filter(*sor_cloud);
+    filtered_cloud = sor_cloud;
+  }
 
   if (filtered_cloud->empty()) return false;
 
@@ -69,6 +148,9 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
     int count;
   };
 
+  // 持久保存每格的曲面簇, 供后续机体侧向碰撞膨胀判定使用
+  std::vector<std::vector<RawSurface>> cell_surfaces(static_cast<size_t>(rows * cols));
+
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < cols; ++c) {
       auto & heights = column_heights[static_cast<size_t>(r * cols + c)];
@@ -94,6 +176,47 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
       }
       surfaces.push_back({cur_top, cur_bottom, cur_count});
 
+      cell_surfaces[static_cast<size_t>(r * cols + c)] = surfaces;
+    }
+  }
+
+  // 机体足印侧向碰撞膨胀: 扫描足印半径内 "垂直范围跨越踏步极限" 的结构 (墙体/台沿,
+  // 即从本层踏面高度附近向上生长、高到迈不上去的竖直结构), 硬半径内硬阻挡, 外围软代价
+  auto inflatedTraversability = [&](int r, int c, float tread_z, bool & lateral_hard) -> float {
+    const int rad = std::max(1, static_cast<int>(std::ceil(config_.footprint_radius / res)));
+    float worst = 0.0f;
+    lateral_hard = false;
+    const float soft_band = std::max(1e-3f, static_cast<float>(config_.footprint_radius - config_.body_hard_radius));
+    for (int dr = -rad; dr <= rad; ++dr) {
+      int nr = r + dr;
+      if (nr < 0 || nr >= rows) continue;
+      for (int dc = -rad; dc <= rad; ++dc) {
+        int nc = c + dc;
+        if (nc < 0 || nc >= cols) continue;
+        // double 计算: float 乘法会让 "整 2 格 = 0.2m" 恰好落在硬半径边界时因舍入差 3e-9 漏成软代价
+        const double d = std::hypot(dr, dc) * res;
+        if (d > config_.footprint_radius) continue;
+
+        for (const auto & S : cell_surfaces[static_cast<size_t>(nr * cols + nc)]) {
+          if (S.count < config_.min_cluster_points) continue;
+          // 侧向障碍判据: 结构底面贴近本层踏面、顶面超过踏步极限 (楼梯踢面高差 <= max_step_height, 不会误判)
+          if (!(S.z_bottom < tread_z + config_.max_step_height &&
+                S.z_top > tread_z + config_.max_step_height)) continue;
+
+          if (d <= config_.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
+          float soft = 0.7f * (config_.footprint_radius - d) / soft_band; // 距离衰减软代价 (上限0.7, 低于前端0.8禁行显示阈值)
+          worst = std::max(worst, soft);
+        }
+      }
+    }
+    return worst;
+  };
+
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      const auto & surfaces = cell_surfaces[static_cast<size_t>(r * cols + c)];
+      if (surfaces.empty()) continue;
+
       // 提取踏面节点并评估净空 (假设均可通行，不设踏面坡度截断)
       for (size_t s = 0; s < surfaces.size(); ++s) {
         if (surfaces[s].count < config_.min_cluster_points) continue;
@@ -115,8 +238,17 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
         // 顶棚净空不足判定 (满足身高净空即均可通行)
         if (headroom < config_.dog_height) {
           node.traversability = 1.0f; // 标记顶头不可通过
+          node.flags |= node_flags::BLOCK_HEADROOM;
         } else {
           node.traversability = 0.0f;
+        }
+
+        // 机体足印膨胀: 贴墙节点标记阻挡/软代价, 使 A* 走走廊中线、转角外侧绕行
+        if (node.traversability < 0.95f) {
+          bool lateral_hard = false;
+          float inf = inflatedTraversability(r, c, node.z, lateral_hard);
+          node.traversability = std::max(node.traversability, inf);
+          if (lateral_hard) node.flags |= node_flags::BLOCK_LATERAL;
         }
 
         out_graph.addNode(node);
@@ -124,9 +256,110 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
     }
   }
 
-  // 5. 拓扑邻居建边 (四足运动学触足工作空间：垂直行程 + 水平步长 + 净空，假设台阶与坡度均可通行)
+  // 5. 拓扑邻居建边: 两遍式 "短边主干 + 长边按需架桥"
+  //    第一遍只建 8 邻域短边 (连通性主干); 第二遍在跨步窗口内为仍不连通的区域架长边桥,
+  //    使长边仅出现在短边链无法连通的位置 (锯齿高差/点云缺失/窄缝), 消除平地冗余直连边
   size_t total_nodes = out_graph.numNodes();
 
+  // 跨步搜索窗口: 按机器狗实际跨步极限换算为栅格半径, 让 max_stride_length 真正约束建边
+  const int stride_cells = std::max(1, static_cast<int>(std::ceil(config_.max_stride_length / res)));
+
+  // 并查集: 记录当前连通性, 长边只在两端尚不连通时才架设 (最小桥集)
+  std::vector<uint32_t> uf_parent(total_nodes);
+  std::vector<uint32_t> uf_size(total_nodes, 1);
+  for (size_t i = 0; i < total_nodes; ++i) uf_parent[i] = static_cast<uint32_t>(i);
+  auto uf_find = [&](uint32_t x) -> uint32_t {
+    while (uf_parent[x] != x) { uf_parent[x] = uf_parent[uf_parent[x]]; x = uf_parent[x]; }
+    return x;
+  };
+  auto uf_union = [&](uint32_t a, uint32_t b) {
+    a = uf_find(a); b = uf_find(b);
+    if (a == b) return;
+    if (uf_size[a] < uf_size[b]) std::swap(a, b);
+    uf_parent[b] = a;
+    uf_size[a] += uf_size[b];
+  };
+
+  // 途经支撑检查: 跨多格的长边, 线段途经的每个栅格必须存在处于通行高度带内的可通行节点,
+  // 防止 A* 借长边跨越楼梯井/空洞 (短邻接边不受影响, 保持原有拓扑)
+  auto hasIntermediateSupport = [&](const GraphNode & u, const GraphNode & v) -> bool {
+    const float seg_len = std::hypot(v.x - u.x, v.y - u.y);
+    const int steps = std::max(1, static_cast<int>(std::ceil(seg_len / (res * 0.5))));
+    for (int s = 1; s < steps; ++s) { // 端点即 u/v 自身, 只查中间点
+      float t = static_cast<float>(s) / steps;
+      float sx = u.x + t * (v.x - u.x);
+      float sy = u.y + t * (v.y - u.y);
+      float sz = u.z + t * (v.z - u.z);
+      int r = 0, c = 0;
+      if (!out_graph.toGridIndex(sx, sy, r, c)) return false;
+      bool supported = false;
+      for (uint32_t nid : out_graph.getSpatialCellNodes(r, c)) {
+        const auto & nd = out_graph.getNode(nid);
+        if (nd.traversability < 0.95f && std::abs(nd.z - sz) <= config_.max_step_height) { supported = true; break; }
+      }
+      if (!supported) return false;
+    }
+    return true;
+  };
+
+  // 机体胶囊扫掠检查: 沿 u->v 线段采样, 硬半径内出现本行走层禁行节点则该步会剐蹭, 丢弃此边
+  auto sweepHardCollision = [&](const GraphNode & u, const GraphNode & v) -> bool {
+    return segmentHitsHardInflation(out_graph, u, v,
+                                    config_.body_hard_radius, config_.dog_height,
+                                    config_.foot_clearance, res);
+  };
+
+  // 机体扫掠软代价: 线段附近足印半径内的软膨胀区越多, 该边代价越高 (引导路径远离墙体)
+  auto sweepSoftCost = [&](const GraphNode & u, const GraphNode & v) -> float {
+    const int rad = std::max(1, static_cast<int>(std::ceil(config_.footprint_radius / res)));
+    const float seg_len = std::hypot(v.x - u.x, v.y - u.y);
+    const int steps = std::max(1, static_cast<int>(std::ceil(seg_len / (res * 0.5))));
+    float worst = 0.0f;
+    for (int s = 0; s <= steps; ++s) {
+      float t = static_cast<float>(s) / steps;
+      float sx = u.x + t * (v.x - u.x);
+      float sy = u.y + t * (v.y - u.y);
+      float sz = u.z + t * (v.z - u.z);
+      int r = 0, c = 0;
+      if (!out_graph.toGridIndex(sx, sy, r, c)) continue;
+      for (int dr = -rad; dr <= rad; ++dr) {
+        for (int dc = -rad; dc <= rad; ++dc) {
+          if (std::hypot(dr, dc) * res > config_.footprint_radius) continue;
+          for (uint32_t nid : out_graph.getSpatialCellNodes(r + dr, c + dc)) {
+            const auto & nd = out_graph.getNode(nid);
+            if (nd.traversability > 0.05f && nd.traversability < 0.95f &&
+                nd.z >= sz - config_.foot_clearance && nd.z <= sz + config_.dog_height) {
+              worst = std::max(worst, nd.traversability);
+            }
+          }
+        }
+      }
+    }
+    return worst;
+  };
+
+  // 统一建边: 全部物理检查 + 代价计算, 写入双向边并同步并查集
+  auto addEdgeChecked = [&](uint32_t u_id, uint32_t v_id) -> bool {
+    const GraphNode & u = out_graph.getNode(u_id);
+    const GraphNode & v = out_graph.getNode(v_id);
+
+    if (sweepHardCollision(u, v)) return false;
+
+    float dz = std::abs(u.z - v.z);
+    float dxy = std::hypot(u.x - v.x, u.y - v.y);
+    // 边代价：3D欧氏位移 + 高差势能惩罚 (鼓励走平地，但楼梯绝对连通)
+    float edge_len = std::sqrt(dxy * dxy + dz * dz);
+    float cost = edge_len + 2.0f * dz + 0.5f * (u.traversability + v.traversability);
+    // 扫掠区软代价: 边身靠近墙体时提高代价, 引导 A* 居中绕行
+    cost += static_cast<float>(config_.sweep_penalty_weight) * sweepSoftCost(u, v);
+
+    out_graph.addEdge(u_id, v_id, cost);
+    out_graph.addEdge(v_id, u_id, cost); // 双向边, A* 两个方向均可通行
+    uf_union(u_id, v_id);
+    return true;
+  };
+
+  // ---- 第一遍: 8 邻域短边 (连通性主干) ----
   for (uint32_t u_id = 0; u_id < total_nodes; ++u_id) {
     const auto & u = out_graph.getNode(u_id);
     if (u.traversability >= 0.95f) continue;
@@ -138,23 +371,52 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
         int nc = u.col + dc;
         if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
 
-        // 在 nr, nc 查找处于触足工作空间包络内的踏面
+        for (uint32_t v_id : out_graph.getSpatialCellNodes(nr, nc)) {
+          if (v_id == u_id || v_id < u_id) continue; // 每无序对仅处理一次 (addEdgeChecked 已写双向)
+          const auto & v = out_graph.getNode(v_id);
+          if (v.traversability >= 0.95f) continue;
+
+          // 仅约束四足物理极限: 垂直行程 (短边水平距离必然在跨步极限内)
+          if (std::abs(u.z - v.z) > config_.max_step_height) continue;
+
+          addEdgeChecked(u_id, v_id);
+        }
+      }
+    }
+  }
+
+  // ---- 第二遍: 跨步窗口长边按需架桥 (仅当两端尚不连通, 省去无谓的扫掠检查) ----
+  for (uint32_t u_id = 0; u_id < total_nodes; ++u_id) {
+    const auto & u = out_graph.getNode(u_id);
+    if (u.traversability >= 0.95f) continue;
+
+    for (int dr = -stride_cells; dr <= stride_cells; ++dr) {
+      for (int dc = -stride_cells; dc <= stride_cells; ++dc) {
+        if (dr == 0 && dc == 0) continue;
+        int nr = u.row + dr;
+        int nc = u.col + dc;
+        if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+
         for (uint32_t v_id : out_graph.getSpatialCellNodes(nr, nc)) {
           if (v_id == u_id) continue;
           const auto & v = out_graph.getNode(v_id);
           if (v.traversability >= 0.95f) continue;
 
-          // 仅约束四足物理极限：垂直行程与水平步长
           float dz = std::abs(u.z - v.z);
           if (dz > config_.max_step_height) continue;
 
           float dxy = std::hypot(u.x - v.x, u.y - v.y);
           if (dxy > config_.max_stride_length) continue;
 
-          // 边代价：3D欧氏位移 + 高差势能惩罚 (鼓励走平地，但楼梯绝对连通)
-          float edge_len = std::sqrt(dxy * dxy + dz * dz);
-          float cost = edge_len + 2.0f * dz + 0.5f * (u.traversability + v.traversability);
-          out_graph.addEdge(u_id, v_id, cost);
+          // 连通性门控: 两端已可达则长边无增量价值, 直接跳过 (最便宜的检查放最前)。
+          // 不设 dxy 下限: 同格跨层 (dxy=0) 等短距离对在第一遍被扫掠/高差拒绝后,
+          // 此处仍需作为桥候选参与连通
+          if (uf_find(u_id) == uf_find(v_id)) continue;
+
+          // 长边必须全线有落脚支撑, 防止借桥跨洞
+          if (!hasIntermediateSupport(u, v)) continue;
+
+          addEdgeChecked(u_id, v_id);
         }
       }
     }
@@ -232,32 +494,10 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
                                             double x2, double y2, double z2) const
 {
   std::stringstream ss;
-  auto findAnyClosestNode = [&](double qx, double qy, double qz, uint32_t & out_id) -> bool {
-    int r = 0, c = 0;
-    if (!graph.toGridIndex(qx, qy, r, c)) return false;
-    double best_d = 1e9;
-    bool found = false;
-    for (int dr = -1; dr <= 1; ++dr) {
-      int nr = r + dr;
-      for (int dc = -1; dc <= 1; ++dc) {
-        int nc = c + dc;
-        for (uint32_t nid : graph.getSpatialCellNodes(nr, nc)) {
-          const auto & nd = graph.getNode(nid);
-          double d = std::hypot(nd.x - qx, nd.y - qy) + std::abs(nd.z - qz);
-          if (d < best_d) {
-            best_d = d;
-            out_id = nid;
-            found = true;
-          }
-        }
-      }
-    }
-    return found;
-  };
 
   uint32_t u_id = 0, v_id = 0;
-  bool found_u = findAnyClosestNode(x1, y1, z1, u_id);
-  bool found_v = findAnyClosestNode(x2, y2, z2, v_id);
+  bool found_u = findNearestNodeAny(graph, x1, y1, z1, u_id);
+  bool found_v = findNearestNodeAny(graph, x2, y2, z2, v_id);
 
   if (!found_u || !found_v) {
     ss << "{\"status\":\"error\",\"message\":\"Failed to find nearest graph nodes for one or both coordinates\"}";
@@ -286,20 +526,51 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
   int dr = std::abs(u.row - v.row);
   int dc = std::abs(u.col - v.col);
 
+  // 节点禁行原因描述 (供两点诊断引用)
+  auto nodeBlockReason = [&](const GraphNode & n) -> std::string {
+    if (n.traversability < 0.8f) return "";
+    if (n.flags & node_flags::BLOCK_HEADROOM) return "头顶净空不足 " + fmt2(n.headroom) + "m < 机体高度 " + fmt2(config_.dog_height) + "m";
+    if (n.flags & node_flags::BLOCK_LATERAL) return "侧向墙体落入机体硬半径 " + fmt2(config_.body_hard_radius) + "m 内";
+    return "禁行节点";
+  };
+
   std::vector<std::string> reasons;
+  const int stride_cells = std::max(1, static_cast<int>(std::ceil(config_.max_stride_length / config_.resolution)));
   if (!connected) {
-    if (u.traversability >= 0.8f) {
-      reasons.push_back("Node A low headroom (" + std::to_string(u.headroom).substr(0,4) + "m < " + std::to_string(config_.dog_height).substr(0,4) + "m)");
+    std::string ra = nodeBlockReason(u);
+    std::string rb = nodeBlockReason(v);
+    if (!ra.empty()) reasons.push_back("方块A禁行: " + ra);
+    if (!rb.empty()) reasons.push_back("方块B禁行: " + rb);
+    if (dr > stride_cells || dc > stride_cells) reasons.push_back("超出跨步搜索窗口 (栅格距离 dr=" + std::to_string(dr) + ", dc=" + std::to_string(dc) + " > 窗口半径 " + std::to_string(stride_cells) + " 格)");
+    if (dz > config_.max_step_height) reasons.push_back("台阶高差超限 (Δz=" + fmt2(dz) + "m > 抬腿极限 " + fmt2(config_.max_step_height) + "m)");
+    if (dxy > config_.max_stride_length) reasons.push_back("跨步距离超限 (Δxy=" + fmt2(dxy) + "m > 步长极限 " + fmt2(config_.max_stride_length) + "m)");
+    if (reasons.empty()) {
+      // 稀疏图常态: 两点无直连边但同连通域, 经多跳短边可达 (A* 可正常规划, 非异常)
+      std::vector<uint8_t> vis(graph.numNodes(), 0);
+      std::vector<uint32_t> stack{u_id};
+      vis[u_id] = 1;
+      bool reachable = false;
+      while (!stack.empty() && !reachable) {
+        uint32_t x = stack.back(); stack.pop_back();
+        uint16_t ec = 0;
+        const auto * es = graph.getEdges(x, ec);
+        for (uint16_t k = 0; k < ec; ++k) {
+          uint32_t t = es[k].target_id;
+          if (t == v_id) { reachable = true; break; }
+          if (!vis[t]) { vis[t] = 1; stack.push_back(t); }
+        }
+      }
+      if (reachable) {
+        reasons.push_back("两点在同一连通域内, 经多跳短边链可达 (稀疏图无直连边属正常, A* 可正常规划)");
+      } else if (segmentHitsHardInflation(graph, u, v, config_.body_hard_radius, config_.dog_height,
+                                          config_.foot_clearance, config_.resolution)) {
+        reasons.push_back("机体扫掠碰撞: 两端虽可站立, 但连线剐蹭硬膨胀禁行区 (典型为转角内切)");
+      } else {
+        reasons.push_back("两踏面不属于同一层簇或不在搜索窗口内");
+      }
     }
-    if (v.traversability >= 0.8f) {
-      reasons.push_back("Node B low headroom (" + std::to_string(v.headroom).substr(0,4) + "m < " + std::to_string(config_.dog_height).substr(0,4) + "m)");
-    }
-    if (dr > 1 || dc > 1) reasons.push_back("Not 8-connected grid neighbors (dr=" + std::to_string(dr) + ", dc=" + std::to_string(dc) + ")");
-    if (dz > config_.max_step_height) reasons.push_back("Step height dz exceeds max_step_height (" + std::to_string(dz).substr(0,4) + "m > " + std::to_string(config_.max_step_height).substr(0,4) + "m)");
-    if (dxy > config_.max_stride_length) reasons.push_back("Stride length dxy exceeds max_stride_length (" + std::to_string(dxy).substr(0,4) + "m > " + std::to_string(config_.max_stride_length).substr(0,4) + "m)");
-    if (reasons.empty()) reasons.push_back("Nodes belong to different layer clusters or not in search window");
   } else {
-    reasons.push_back("Satisfies all quadruped kinematic workspace constraints; active edge in manifold graph");
+    reasons.push_back("满足四足运动学工作空间约束, 流形图中存在活跃邻边");
   }
 
   ss << "{"
@@ -309,7 +580,7 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
      << "\"node_a\":{\"id\":" << u_id << ",\"x\":" << u.x << ",\"y\":" << u.y << ",\"z\":" << u.z << ",\"row\":" << u.row << ",\"col\":" << u.col << ",\"layer\":" << u.layer_id << ",\"headroom\":" << u.headroom << ",\"traversability\":" << u.traversability << "},"
      << "\"node_b\":{\"id\":" << v_id << ",\"x\":" << v.x << ",\"y\":" << v.y << ",\"z\":" << v.z << ",\"row\":" << v.row << ",\"col\":" << v.col << ",\"layer\":" << v.layer_id << ",\"headroom\":" << v.headroom << ",\"traversability\":" << v.traversability << "},"
      << "\"metrics\":{\"dxy\":" << dxy << ",\"dz\":" << dz << ",\"slope_deg\":" << slope_deg << ",\"dr\":" << dr << ",\"dc\":" << dc << "},"
-     << "\"limits\":{\"max_step_height\":" << config_.max_step_height << ",\"max_stride_length\":" << config_.max_stride_length << ",\"dog_height\":" << config_.dog_height << "},"
+     << "\"limits\":{\"max_step_height\":" << config_.max_step_height << ",\"max_stride_length\":" << config_.max_stride_length << ",\"dog_height\":" << config_.dog_height << ",\"body_hard_radius\":" << config_.body_hard_radius << ",\"footprint_radius\":" << config_.footprint_radius << "},"
      << "\"reason\":\"";
   for (size_t i = 0; i < reasons.size(); ++i) {
     if (i > 0) ss << "; ";
@@ -317,6 +588,111 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
   }
   ss << "\"}";
 
+  return ss.str();
+}
+
+std::string CloudGraphBuilder::diagnoseNode(const ManifoldGraph & graph,
+                                            double x, double y, double z) const
+{
+  std::stringstream ss;
+  uint32_t nid = 0;
+  if (!findNearestNodeAny(graph, x, y, z, nid)) {
+    ss << "{\"status\":\"error\",\"message\":\"坐标附近未找到流形图节点\"}";
+    return ss.str();
+  }
+  const auto & u = graph.getNode(nid);
+
+  // 扫描足印半径内的侧向障碍节点: 从踏面带向上生长 (超过抬腿极限) 的结构。
+  // 楼梯上一级踏面 Δz ≤ max_step_height 不会命中; 窗口上限取 max(1.5m, 2倍机高),
+  // 覆盖栏杆/矮墙 (顶面可高于机体), 排除上层楼板 (层高 ~3m)。
+  // 注意: 图节点只存表面顶高, 与建图时基于表面底高的栅格级判定存在少量口径差,
+  // 找不到精确墙体时如实回退到 flags 描述, 不编造方位。
+  bool has_wall = false;
+  double wall_d = 1e9, wall_dx = 0.0, wall_dy = 0.0, wall_z = 0.0;
+  {
+    int r0 = 0, c0 = 0;
+    if (graph.toGridIndex(u.x, u.y, r0, c0)) {
+      const double z_win_up = std::max(1.5, config_.dog_height * 2.0);
+      const int rad = std::max(1, static_cast<int>(std::ceil(config_.footprint_radius / config_.resolution))) + 1;
+      for (int dr = -rad; dr <= rad; ++dr) {
+        for (int dc = -rad; dc <= rad; ++dc) {
+          for (uint32_t wid : graph.getSpatialCellNodes(r0 + dr, c0 + dc)) {
+            if (wid == nid) continue;
+            const auto & w = graph.getNode(wid);
+            double dz = w.z - u.z;
+            if (dz <= config_.max_step_height || dz >= z_win_up) continue;
+            double d = std::hypot(w.x - u.x, w.y - u.y);
+            if (d < wall_d) {
+              wall_d = d;
+              wall_dx = w.x - u.x;
+              wall_dy = w.y - u.y;
+              wall_z = w.z;
+              has_wall = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 侧向障碍方位 (8 方位, 供前端直读)
+  auto dirName = [](double dx, double dy) -> std::string {
+    if (std::hypot(dx, dy) < 1e-3) return "正上方";
+    double ang = std::atan2(dy, dx) * 180.0 / M_PI;
+    static const char * names[8] = {"+X 方向", "+X+Y 方向", "+Y 方向", "-X+Y 方向",
+                                    "-X 方向", "-X-Y 方向", "-Y 方向", "+X-Y 方向"};
+    int idx = static_cast<int>(std::floor((ang + 22.5) / 45.0));
+    idx = ((idx % 8) + 8) % 8;
+    return names[idx];
+  };
+
+  bool blocked = u.traversability >= 0.95f;
+  const bool wall_in_hard = has_wall && wall_d <= config_.body_hard_radius + config_.resolution;
+  std::string code, reason;
+  if (blocked) {
+    if (u.flags & node_flags::BLOCK_HEADROOM) {
+      code = "headroom";
+      reason = "禁行: 头顶净空 " + fmt2(u.headroom) + "m < 机体站立高度 " + fmt2(config_.dog_height) + "m, 通行会顶头";
+    } else if (u.flags & node_flags::BLOCK_LATERAL) {
+      code = "lateral_body";
+      if (wall_in_hard) {
+        reason = "禁行: 侧向墙体距踏面中心 " + fmt2(wall_d) + "m (" + dirName(wall_dx, wall_dy) + ", 高出踏面 " + fmt2(wall_z - u.z) + "m) < 机体硬半径 " + fmt2(config_.body_hard_radius) + "m, 机身无法通过";
+      } else {
+        reason = "禁行: 建图时栅格级判定足印硬半径 " + fmt2(config_.body_hard_radius) + "m 内存在竖直墙体 (细结构未形成独立图节点, 无法给出精确方位)";
+      }
+    } else {
+      code = "blocked";
+      reason = "禁行节点 (原因未记录)";
+    }
+  } else if (u.traversability > 0.05f) {
+    code = "soft_inflation";
+    if (has_wall && wall_d > config_.body_hard_radius + config_.resolution) {
+      reason = "软膨胀减速区: 距侧向墙体 " + fmt2(wall_d) + "m (" + dirName(wall_dx, wall_dy) + ", 膨胀带 " + fmt2(config_.body_hard_radius) + "~" + fmt2(config_.footprint_radius) + "m), 可通行但代价升高";
+    } else {
+      reason = "软代价减速区 (trav=" + fmt2(u.traversability) + "), 位于机体膨胀带内, 可通行但代价升高";
+    }
+  } else {
+    code = "free";
+    reason = "可安全通行";
+  }
+
+  ss << "{"
+     << "\"status\":\"ok\","
+     << "\"node\":{\"id\":" << nid << ",\"x\":" << u.x << ",\"y\":" << u.y << ",\"z\":" << u.z
+     << ",\"layer\":" << u.layer_id << ",\"headroom\":" << u.headroom
+     << ",\"traversability\":" << u.traversability << ",\"flags\":" << u.flags << "},"
+     << "\"blocked\":" << (blocked ? "true" : "false") << ","
+     << "\"reason_code\":\"" << code << "\","
+     << "\"reason\":\"" << reason << "\","
+     << "\"nearest_obstacle\":"
+     << (has_wall
+          ? ("{\"dist\":" + fmt2(wall_d) + ",\"dx\":" + fmt2(wall_dx) + ",\"dy\":" + fmt2(wall_dy) + ",\"z\":" + fmt2(wall_z) + ",\"direction\":\"" + dirName(wall_dx, wall_dy) + "\"}")
+          : std::string("null")) << ","
+     << "\"limits\":{\"body_hard_radius\":" << config_.body_hard_radius
+     << ",\"footprint_radius\":" << config_.footprint_radius
+     << ",\"dog_height\":" << config_.dog_height
+     << ",\"max_step_height\":" << config_.max_step_height << "}"
+     << "}";
   return ss.str();
 }
 

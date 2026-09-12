@@ -37,7 +37,22 @@ bool ElevationLocalPlanner::computeVelocityCommands(
 
   double cur_x = current_pose.pose.position.x;
   double cur_y = current_pose.pose.position.y;
+  double cur_z = current_pose.pose.position.z;
   double cur_yaw = tf2::getYaw(current_pose.pose.orientation);
+
+  // 机体足印碰撞检查: 当前位置足印半径内存在阻挡节点 (顶头净空不足 / 侧向墙体膨胀) 时停车
+  if (graph_.numNodes() > 0) {
+    uint32_t nid = 0;
+    if (graph_.findClosestNode(cur_x, cur_y, cur_z, nid, 0.5, 0.8)) {
+      int layer = graph_.getNode(nid).layer_id;
+      if (collision_checker_.checkCollision(cur_x, cur_y, cur_z, layer, graph_)) {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.linear.y = 0.0;
+        cmd_vel.angular.z = 0.0;
+        return false;
+      }
+    }
+  }
 
   // 1. 查找前瞻追踪目标点
   while (target_idx_ < global_path_.poses.size() - 1) {

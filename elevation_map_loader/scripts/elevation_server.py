@@ -191,6 +191,13 @@ def diagnose_edge(x1: float, y1: float, z1: float, x2: float, y2: float, z2: flo
     return JSONResponse(content=res)
 
 
+@app.get("/api/nav/diagnose_node")
+def diagnose_node(x: float, y: float, z: float):
+    """请求 C++ 规划器节点权威诊断单个踏面方块的通行状态与禁行原因"""
+    res = ros_bridge.diagnose_node(x, y, z)
+    return JSONResponse(content=res)
+
+
 @app.post("/api/load_pcd")
 def load_pcd(req: LoadPcdRequest):
     """向 C++ 节点发送加载 PCD 文件指令并自动提取高程图"""

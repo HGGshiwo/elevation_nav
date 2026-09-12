@@ -17,6 +17,7 @@ struct LocalPlannerConfig
   double lookahead_dist{1.0};  ///< 前瞻跟踪距离 (m)
   double goal_tolerance_xy{0.25};
   double goal_tolerance_yaw{0.3};
+  double footprint_radius{0.30}; ///< 机体足印碰撞检查半径 (m)
 };
 
 class ElevationLocalPlanner : public elevation_planner::LocalPlannerInterface
@@ -25,7 +26,11 @@ public:
   ElevationLocalPlanner();
   ~ElevationLocalPlanner() override = default;
 
-  void setConfig(const LocalPlannerConfig & config) { config_ = config; }
+  void setConfig(const LocalPlannerConfig & config)
+  {
+    config_ = config;
+    collision_checker_ = CollisionChecker(config.footprint_radius, 0.50);
+  }
   void setGraph(const elevation_planner::ManifoldGraph & graph) { graph_ = graph; }
 
   bool setPlan(const nav_msgs::Path & global_path) override;

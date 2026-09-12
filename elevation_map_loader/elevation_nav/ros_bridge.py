@@ -254,6 +254,19 @@ class ElevationRosBridge:
         self._debug_event.clear()
         query_str = json.dumps({"x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2})
         self._debug_query_pub.publish(RosString(data=query_str))
+        return self._wait_debug_result(timeout)
+
+    def diagnose_node(self, x: float, y: float, z: float, timeout: float = 1.0) -> Dict[str, Any]:
+        """向 C++ 节点请求单个踏面方块的权威通行状态与禁行原因诊断"""
+        if not self._debug_query_pub:
+            return {"status": "error", "message": "ROS bridge publisher not ready"}
+        self._debug_event.clear()
+        query_str = json.dumps({"mode": "node", "x1": x, "y1": y, "z1": z})
+        self._debug_query_pub.publish(RosString(data=query_str))
+        return self._wait_debug_result(timeout)
+
+    def _wait_debug_result(self, timeout: float) -> Dict[str, Any]:
+        """等待 C++ 节点在 /elevation_debug_result 上的权威诊断回包"""
         if self._debug_event.wait(timeout=timeout):
             with self._lock:
                 try:

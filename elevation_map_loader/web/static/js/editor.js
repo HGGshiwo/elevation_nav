@@ -178,6 +178,42 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         }
     }
 
+    // 请求 C++ 规划器单节点权威诊断, 将禁行原因写入面板行 (queryEl 不存在或查询失败时静默跳过)
+    function fetchNodeReason(node, reasonElId) {
+        const reasonEl = document.getElementById(reasonElId);
+        if (!reasonEl) return;
+        // 可通行且非软代价区无需查询原因, 显示确定文案
+        if (!node.isBlocked && node.traversability <= 0.05) {
+            reasonEl.innerText = '可安全通行';
+            reasonEl.style.color = '#69f0ae';
+            return;
+        }
+        reasonEl.innerText = '查询中...';
+        reasonEl.style.color = '#aaa';
+        fetch(`/api/nav/diagnose_node?x=${node.x}&y=${node.y}&z=${node.z}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.status !== 'ok') {
+                    reasonEl.innerText = (data.status === 'timeout') ? '后端诊断超时' : '诊断不可用';
+                    reasonEl.style.color = '#ffab40';
+                    return;
+                }
+                reasonEl.innerText = data.reason || '-';
+                const colors = {
+                    free: '#69f0ae',
+                    soft_inflation: '#ffab40',
+                    lateral_body: '#ff5252',
+                    headroom: '#ff5252',
+                    blocked: '#ff5252'
+                };
+                reasonEl.style.color = colors[data.reason_code] || '#ff5252';
+            })
+            .catch(() => {
+                reasonEl.innerText = '诊断请求失败';
+                reasonEl.style.color = '#ffab40';
+            });
+    }
+
     // 踏面方块深度调试与两点邻边关系诊断
     function handleDebugInspection(node) {
         if (!node) return;
@@ -204,11 +240,13 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 const cnt = graphVisualizer ? graphVisualizer.getNodeEdgeCount(node) : 0;
                 edgesElA.innerText = `${cnt} 条连通边`;
             }
+            fetchNodeReason(node, 'debug-node-a-reason');
 
             // 清空 B 与 对比关系
             document.getElementById('debug-node-b-xy') && (document.getElementById('debug-node-b-xy').innerText = '-');
             document.getElementById('debug-node-b-z') && (document.getElementById('debug-node-b-z').innerText = '-');
             document.getElementById('debug-node-b-status') && (document.getElementById('debug-node-b-status').innerText = '-');
+            document.getElementById('debug-node-b-reason') && (document.getElementById('debug-node-b-reason').innerText = '-');
             document.getElementById('debug-node-b-edges') && (document.getElementById('debug-node-b-edges').innerText = '-');
             document.getElementById('debug-rel-dxy') && (document.getElementById('debug-rel-dxy').innerText = '-');
             document.getElementById('debug-rel-dz') && (document.getElementById('debug-rel-dz').innerText = '-');
@@ -242,6 +280,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 const cnt = graphVisualizer ? graphVisualizer.getNodeEdgeCount(node) : 0;
                 edgesElB.innerText = `${cnt} 条连通边`;
             }
+            fetchNodeReason(node, 'debug-node-b-reason');
 
             // 计算相对几何量
             const dxy = Math.hypot(debugNodeB.x - debugNodeA.x, debugNodeB.y - debugNodeA.y);
@@ -427,8 +466,8 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         debugNodeA = null;
         debugNodeB = null;
         if (graphVisualizer) graphVisualizer.clearDebugMarkers();
-        ['debug-node-a-xy', 'debug-node-a-z', 'debug-node-a-status', 'debug-node-a-edges',
-         'debug-node-b-xy', 'debug-node-b-z', 'debug-node-b-status', 'debug-node-b-edges',
+        ['debug-node-a-xy', 'debug-node-a-z', 'debug-node-a-status', 'debug-node-a-reason', 'debug-node-a-edges',
+         'debug-node-b-xy', 'debug-node-b-z', 'debug-node-b-status', 'debug-node-b-reason', 'debug-node-b-edges',
          'debug-rel-dxy', 'debug-rel-dz', 'debug-rel-slope', 'debug-rel-connected', 'debug-rel-reason'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.innerText = '-';
