@@ -323,6 +323,10 @@ export class GraphVisualizer {
         let bestNearDistSq = Infinity;
         let bestNearT = Infinity;
         const maxSnapMargin = 0.10; // 平滑吸附容差 10cm
+        // 层偏好阈值: xy 距离差在 5cm 以内的候选视为"同距段",
+        // 同距段内取 t 最小 (最靠近相机 = 用户正视的上层表面),
+        // 防止俯视多层重叠时吸附到夹缝下方的低层踏面
+        const layerPrefDistSq = 0.0025;
 
         for (let i = 0; i < list.length; i++) {
             const n = list[i];
@@ -344,7 +348,8 @@ export class GraphVisualizer {
                 const ey = Math.max(0, dy - s);
                 const distSq = ex * ex + ey * ey;
                 if (distSq <= maxSnapMargin * maxSnapMargin) {
-                    if (distSq < bestNearDistSq || (Math.abs(distSq - bestNearDistSq) < 0.0004 && t < bestNearT)) {
+                    if (distSq < bestNearDistSq - layerPrefDistSq ||
+                        (distSq <= bestNearDistSq + layerPrefDistSq && t < bestNearT)) {
                         bestNearDistSq = distSq;
                         bestNearT = t;
                         bestNearNode = n;

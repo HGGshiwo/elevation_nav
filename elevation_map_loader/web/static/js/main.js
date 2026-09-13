@@ -11,10 +11,11 @@ import { RoamController } from './controls_roam.js';
 const container = document.getElementById('canvas-container');
 const { scene, camera, renderer, controls, setUpdateCallback } = createMainScene(container);
 
-// 键盘漫游控制器
+// 键盘漫游控制器 (渲染循环每帧回调: 漫游 + 跟随视角驱动)
 const roamController = new RoamController(camera, controls);
 setUpdateCallback(() => {
     roamController.update();
+    robotVisualizer.updateFollow();
 });
 
 // ---- 2. 核心组件实例化 ----
@@ -98,8 +99,8 @@ document.getElementById('show-path').addEventListener('change', (e) => {
     pathVisualizer.setVisible(e.target.checked);
 });
 
-document.getElementById('btn-focus-robot').addEventListener('click', () => {
-    robotVisualizer.focusRobot();
+document.getElementById('follow-robot').addEventListener('change', (e) => {
+    robotVisualizer.setFollowEnabled(e.target.checked);
 });
 
 document.getElementById('btn-cancel-goal').addEventListener('click', () => {

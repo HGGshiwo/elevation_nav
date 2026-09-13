@@ -1,0 +1,7 @@
+<library path="lib/libelevation_global_planner_plugin">
+  <class name="elevation_global_planner/ElevationGlobalPlanner" type="elevation_global_planner::ElevationGlobalPlanner" base_class_type="nav_core::BaseGlobalPlanner">
+    <description>
+      Multi-layer manifold elevation graph A* global planner plugin for ROS 1 move_base.
+    </description>
+  </class>
+</library>

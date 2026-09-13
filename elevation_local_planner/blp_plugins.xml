@@ -1,0 +1,7 @@
+<library path="lib/libelevation_local_planner_lib">
+  <class name="elevation_local_planner/ElevationLocalPlannerPlugin" type="elevation_local_planner::ElevationLocalPlannerPlugin" base_class_type="nav_core::BaseLocalPlanner">
+    <description>
+      D1 proportional path tracker with fused manifold-graph footprint collision safety layer, for ROS 1 move_base.
+    </description>
+  </class>
+</library>

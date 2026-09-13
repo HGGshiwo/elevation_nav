@@ -155,10 +155,10 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 
 | 模块 | 功能描述 |
 | :--- | :--- |
-| **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`)、跨层门户 (`LayerPortal`)、代价评估器 (`CostEvaluator`) |
-| **`elevation_map_loader`** | 点云加载、流形森林生成器 (`ManifoldForest`)、FastAPI 服务端与 Web 3D 可视化交互编辑器 |
-| **`elevation_global_planner`** | 全局跨层路径规划器 (`ManifoldAStar`)、路径平滑器 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
-| **`elevation_local_planner`** | 局部前瞻跟踪控制器、3D 空间碰撞检测器、速度控制指令生成 (`/cmd_vel`) |
+| **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`，含柱表生成/逐柱融合/建边压平两段式管线)、进程级共享存储 (`GraphStore`)、跨层门户 (`LayerPortal`)、代价评估器 (`CostEvaluator`) |
+| **`elevation_map_loader`** | 点云加载、流形森林生成器 (`ManifoldForest`)、FastAPI 服务端与 Web 3D 可视化交互编辑器、仿真伪 TF 广播 |
+| **`elevation_global_planner`** | move_base 全局规划器插件 (`ElevationGlobalPlanner`)：离线 PCD 先验建图、跨层 A* (`ManifoldAStar`)、路径平滑 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
+| **`elevation_local_planner`** | move_base 局部规划器插件 (`ElevationLocalPlannerPlugin`)：D1 比例跟踪控制、实时点云融合图后台线程、融合图足印碰撞安全层、速度指令生成 (`/cmd_vel`) |
 
 ---
 
@@ -178,3 +178,63 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 | `body_hard_radius` | `0.20` | 机体硬阻挡半径 (m)，约半身宽+安全余量，侧向障碍进入此范围节点不可通行 |
 | `sweep_penalty_weight` | `1.0` | 建边时机体扫掠区软代价权重 |
 | `foot_clearance` | `0.05` | 足底容差 (m)，行走面下方此深度内的禁行节点仍保守视为剐蹭，更深处视为脚下楼梯结构/其他层 |
+| `crop_radius_xy` | `1.5` | 实时点云融合的 ROI 滚动窗口半径 (m)，融合图边长 = 2 × crop_radius_xy |
+| `crop_height_above` / `crop_height_below` | `2.0` / `1.0` | ROI 裁剪的垂直高度带：机器人脚下平面以上/以下保留范围 (m) |
+| `fusion_rate` | `5.0` | 融合图刷新频率 (Hz)，与控制循环 (controller_frequency) 解耦 |
+| `cloud_topic` | `lidar_points` | 实时点云话题，融合线程的数据源 |
+
+---
+
+## 五、实时点云融合与 move_base 导航架构
+
+### 1. 融合图数据流 (Live Cloud to Fused Graph)
+
+系统在离线先验图之外，维护一张机器人周围的**滚动融合图**：实时点云只覆盖传感器当前视场（且被机体遮挡扫不到脚下），单独建图会产生"图闪烁"与脚下空洞；融合层将观测与先验逐柱合并，兼得实时性与完整性。
+
+```mermaid
+flowchart TD
+    A["实时点云 lidar_points"] --> B["TF 变换到 map 系"]
+    B --> C["ROI 裁剪: 机器人周围 2*crop_radius_xy 方窗 + 垂直高度带"]
+    C --> D["CloudGraphBuilder 步骤 1~4: 观测柱表"]
+    E["全局先验柱表 (离线 PCD, GraphStore 只读)"] --> F["fuseColumnTables 逐柱并集融合"]
+    D --> F
+    F --> G["CloudGraphBuilder 步骤 5~6: 融合柱表建边 + CSR 压平"]
+    G --> H["融合图 (ManifoldGraph, 双缓冲 swap)"]
+    H --> I["局部规划器: 足印碰撞安全层 (20Hz 控制循环独立读图)"]
+```
+
+### 2. 逐柱并集融合规则 (fuseColumnTables)
+
+先验柱表与观测柱表共用同一份 `GraphBuildConfig` 与栅格分辨率，节点按 `(row, col, layer)` 天然对齐。对窗口内每根柱独立合并：
+
+1. **同一物理面**（两侧 `z_top` 差 ≤ `cluster_height_diff`）：合并为一层，几何取观测值（反映当前状态），点数取 max（一次稀疏观测不推翻先验已确认的支撑面）；
+2. **仅存在于先验**：原样保留——实时雷达被机体遮挡扫不到脚下时，先验地面层仍在，脚下永远有支撑面；
+3. **仅存在于观测**：新增一层（实时发现的新踏面或新障碍）；
+4. **窗口最外一圈强制采用先验**：保证融合图与全局图在窗口边界处拓扑衔接。
+
+融合**无时间衰减**：观测柱表每帧从零重建、先验柱表永不被写入，动态障碍只存在于被扫到的当帧，下帧自动消失，无需衰减参数。融合只决定"每根柱上有哪些层、每层的通行性"，**建边不融合**——融合柱表整体走同一套建边判据（短边主干 + 跨步架桥 + 胶囊扫掠）重建，保证融合图与全局图的运动学口径完全一致。
+
+### 3. move_base 插件化架构
+
+规划闭环统一由 move_base 调度，全局/局部均为 nav_core 插件：
+
+| 插件 | 注册名 | 职责 |
+| :--- | :--- | :--- |
+| `ElevationGlobalPlanner` | `elevation_global_planner/ElevationGlobalPlanner` | 离线 PCD 建图（柱表+全局图写入 GraphStore）、`makePlan` = 起终点锚定 → 跨层 A* → 平滑；全局图保持纯先验，不订阅实时点云 |
+| `ElevationLocalPlannerPlugin` | `elevation_local_planner/ElevationLocalPlannerPlugin` | D1 比例跟踪（3D 前瞻投影选点 + 纵/横/航向三通道 + 加速度限幅）；后台融合线程按 `fusion_rate` 刷新融合图；控制周期入口先做融合图足印碰撞检查，命中禁行节点即零速停车 |
+
+costmap 仅保留空层维持 move_base 框架运转，3D 规划与避障完全由流形图承担。局部持续受阻时由 move_base 的恢复行为与 `planner_frequency` 周期重规划形成闭环。
+
+### 4. 仿真与实机启动
+
+```bash
+# 仿真 (默认): Web 端伪 TF 广播 map->odom->base_link, /cmd_vel 积分运动
+roslaunch elevation_map_loader navigation.launch
+
+# 实机: 关闭伪 TF, 位姿来自实机定位
+roslaunch elevation_map_loader navigation.launch sim:=false
+```
+
+- **设置起点 = 触发 TF 变换**：Web 端吸附踏面节点设置起点时，仿真模式下机器人位姿立即跳转该处（直接采用吸附节点的踏面高程，不在二次贴地探测中掉层）；实机模式下仅发布 `/initialpose`，不动 TF
+- **设置终点 = 触发 move_base 规划**：发布 `/move_base_simple/goal`，路径经 `/move_base/plan` 与 `/elevation_global_plan` (latched) 回传前端
+- 行进中地形跟随采用**分层带过滤**：优先 `|dz| ≤ max_step_height` 的同层踏面带，禁止经楼板边缘时跨层瞬移

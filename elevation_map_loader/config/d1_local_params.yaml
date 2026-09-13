@@ -1,0 +1,30 @@
+# D1 局部跟踪控制参数 (移植自 octo_planner, 默认无机型偏移)
+map_frame: map
+lookahead_distance: 0.45
+tracking_point_reached_xy_tolerance: 0.20
+goal_position_tolerance: 0.05
+goal_yaw_tolerance: 0.10
+linear_gain: 1.2
+lateral_gain: 0.4
+heading_gain: 1.2
+final_yaw_gain: 0.5
+enable_lateral_motion: true
+align_final_yaw: true
+max_linear_speed: 0.60
+max_lateral_speed: 0.30
+max_angular_speed: 1.00
+max_linear_acc: 0.80
+max_lateral_acc: 0.40
+max_angular_acc: 1.20
+enable_lateral_decoupling: true
+linear_deadband: 0.05
+lateral_deadband: 0.05
+angular_deadband: 0.05
+
+# 融合图安全层参数
+cloud_topic: /lidar_points
+crop_radius_xy: 1.5
+crop_height_above: 2.0
+crop_height_below: 1.0
+fusion_rate: 5.0
+collision_footprint_radius: 0.30

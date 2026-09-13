@@ -13,6 +13,9 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   tf2_ros
+  nav_core
+  costmap_2d
+  pluginlib
 )
 
 find_package(PCL REQUIRED)
@@ -20,7 +23,7 @@ find_package(PCL REQUIRED)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES elevation_global_planner_lib
-  CATKIN_DEPENDS roscpp elevation_planner_core geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions tf2_ros
+  CATKIN_DEPENDS roscpp elevation_planner_core geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions tf2_ros nav_core costmap_2d pluginlib
   DEPENDS PCL
 )
 
@@ -38,10 +41,11 @@ target_link_libraries(elevation_global_planner_lib
   ${catkin_LIBRARIES}
 )
 
-add_executable(elevation_global_planner_node
-  src/elevation_global_planner_node.cpp
+# move_base nav_core 全局规划器插件库
+add_library(elevation_global_planner_plugin
+  src/elevation_global_planner_plugin.cpp
 )
-target_link_libraries(elevation_global_planner_node
+target_link_libraries(elevation_global_planner_plugin
   elevation_global_planner_lib
   ${catkin_LIBRARIES}
 )

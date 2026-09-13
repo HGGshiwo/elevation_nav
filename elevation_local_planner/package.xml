@@ -16,4 +16,13 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>nav_core</depend>
+  <depend>costmap_2d</depend>
+  <depend>pluginlib</depend>
+  <depend>pcl_ros</depend>
+  <depend>pcl_conversions</depend>
+
+  <export>
+    <nav_core plugin="${prefix}/blp_plugins.xml" />
+  </export>
 </package>

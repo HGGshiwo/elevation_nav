@@ -27,7 +27,7 @@ export class RoamController {
 
         // 2. 键盘漫游状态
         this.keys = {};
-        this.speed = options.speed || 0.18; // 基础移动步长
+        this.speed = options.speed || 0.10; // 基础移动步长
         this.enabled = true;
         this.keyRoamEnabled = true;
 

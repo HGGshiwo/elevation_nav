@@ -9,7 +9,7 @@ import { initWsStream } from './ws_stream.js';
 
 // ---- 1. 场景初始化 ----
 const container = document.getElementById('canvas-container');
-const { scene, camera, renderer, controls, roamController, editPlane } = initScene(container);
+const { scene, camera, renderer, controls, roamController, editPlane, setFrameCallback } = initScene(container);
 renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
 
 // ---- 2. 高性能图层管理器初始化 ----
@@ -53,8 +53,9 @@ function getActiveRequestedLayers() {
 }
 
 // ---- 3. 核心功能模块组装 ----
-// 3.1 机器狗追踪与路径模块
+// 3.1 机器狗追踪与路径模块 (跟随视角驱动挂入渲染循环)
 const robotTracker = initRobotTracker(scene, controls);
+if (setFrameCallback) setFrameCallback(() => robotTracker.updateFollow());
 
 // 3.2 地图持久化存储与 ROS 同步模块
 const mapStorage = initMapStorage(layers, () => {

@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Elevation Nav 总装: move_base 插件化导航 + Web 3D 交互 -->
+    <!-- sim=true: Web 端 RosBridge 广播伪 TF (积分 /cmd_vel), 起点设置即触发 TF 变换;
+         sim=false: 实机自带 map->odom->base_link 定位 TF, 伪 TF 不启用 -->
+    <arg name="sim" default="true"/>
+    <arg name="sim_init_x" default="0.0"/>
+    <arg name="sim_init_y" default="0.0"/>
+    <arg name="sim_init_z" default="0.0"/>
+    <arg name="sim_init_yaw" default="0.0"/>
+    <arg name="sim_noise_linear" default="0.008"/>
+    <arg name="sim_noise_lateral" default="0.008"/>
+    <arg name="sim_noise_angular" default="0.006"/>
+
+    <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/map-segment.pcd"/>
+    <arg name="config_file" default="$(find elevation_map_loader)/config/parameters.yaml"/>
+    <arg name="resolution" default="0.10"/>
+    <arg name="web_port" default="8080"/>
+    <arg name="point_cloud_topic" default="/lidar_points"/>
+
+    <!-- 1. 地图与流形生成节点 (Web 端 GridMap 展示数据源) -->
+    <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+        <param name="config_file" value="$(arg config_file)"/>
+        <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
+        <param name="grid_map_topic" value="/grid_map"/>
+        <param name="frame_id" value="map"/>
+        <param name="resolution" value="$(arg resolution)"/>
+        <param name="max_step_height" value="0.25"/>
+        <param name="max_slope_deg" value="30.0"/>
+        <param name="max_stride_length" value="0.35"/>
+        <param name="dog_height" value="0.50"/>
+    </node>
+
+    <!-- 2. move_base: 全局流形 A* 插件 + D1 局部跟踪/融合图插件 -->
+    <include file="$(find elevation_map_loader)/launch/move_base.launch">
+        <arg name="pcd_file" value="$(arg pcd_file)"/>
+        <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
+    </include>
+
+    <!-- 3. Web 服务端与三维可视化 (FastAPI + Three.js); sim 时广播伪 TF -->
+    <node pkg="elevation_map_loader" type="elevation_server.py" name="elevation_web_server" output="screen">
+        <param name="web_port" value="$(arg web_port)"/>
+        <param name="publish_fake_tf" value="$(arg sim)"/>
+        <param name="tf_child_frame" value="base_link"/>
+        <param name="init_x" value="$(arg sim_init_x)"/>
+        <param name="init_y" value="$(arg sim_init_y)"/>
+        <param name="init_z" value="$(arg sim_init_z)"/>
+        <param name="init_yaw" value="$(arg sim_init_yaw)"/>
+        <param name="linear_noise_std" value="$(arg sim_noise_linear)"/>
+        <param name="lateral_noise_std" value="$(arg sim_noise_lateral)"/>
+        <param name="angular_noise_std" value="$(arg sim_noise_angular)"/>
+    </node>
+</launch>

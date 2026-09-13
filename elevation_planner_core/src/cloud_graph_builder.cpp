@@ -85,6 +85,15 @@ bool CloudGraphBuilder::buildFromROSMsg(const sensor_msgs::PointCloud2 & cloud_m
 bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr & cloud,
                                            ManifoldGraph & out_graph)
 {
+  ColumnTable table;
+  if (!buildColumnTable(cloud, table)) return false;
+  return buildGraphFromColumnTable(table, out_graph);
+}
+
+bool CloudGraphBuilder::buildColumnTable(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr & cloud,
+                                        ColumnTable & out_table,
+                                        const GridExtent * aligned_extent)
+{
   if (!cloud || cloud->empty()) return false;
 
   // 1. 体素降采样 (0.05m 网格保持几何边缘且去重)
@@ -110,25 +119,38 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
 
   if (filtered_cloud->empty()) return false;
 
-  // 2. 计算 XY 空间包围盒
-  float min_x = std::numeric_limits<float>::max();
-  float max_x = std::numeric_limits<float>::lowest();
-  float min_y = std::numeric_limits<float>::max();
-  float max_y = std::numeric_limits<float>::lowest();
-
-  for (const auto & pt : filtered_cloud->points) {
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-    min_x = std::min(min_x, pt.x);
-    max_x = std::max(max_x, pt.x);
-    min_y = std::min(min_y, pt.y);
-    max_y = std::max(max_y, pt.y);
-  }
-
+  // 2. 栅格几何: 对齐模式直接沿用全局图几何 (格对齐融合的前提), 否则按点云包围盒自算
   double res = config_.resolution;
-  int rows = static_cast<int>(std::ceil((max_x - min_x) / res)) + 1;
-  int cols = static_cast<int>(std::ceil((max_y - min_y) / res)) + 1;
+  double min_x = 0.0, min_y = 0.0;
+  int rows = 0, cols = 0;
 
-  out_graph.initSpatialGrid(res, min_x, min_y, rows, cols);
+  if (aligned_extent && aligned_extent->valid()) {
+    res = aligned_extent->resolution;
+    min_x = aligned_extent->min_x;
+    min_y = aligned_extent->min_y;
+    rows = aligned_extent->rows;
+    cols = aligned_extent->cols;
+  } else {
+    float bbox_min_x = std::numeric_limits<float>::max();
+    float bbox_max_x = std::numeric_limits<float>::lowest();
+    float bbox_min_y = std::numeric_limits<float>::max();
+    float bbox_max_y = std::numeric_limits<float>::lowest();
+    for (const auto & pt : filtered_cloud->points) {
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+      bbox_min_x = std::min(bbox_min_x, pt.x);
+      bbox_max_x = std::max(bbox_max_x, pt.x);
+      bbox_min_y = std::min(bbox_min_y, pt.y);
+      bbox_max_y = std::max(bbox_max_y, pt.y);
+    }
+    min_x = bbox_min_x;
+    min_y = bbox_min_y;
+    rows = static_cast<int>(std::ceil((bbox_max_x - bbox_min_x) / res)) + 1;
+    cols = static_cast<int>(std::ceil((bbox_max_y - bbox_min_y) / res)) + 1;
+  }
+  if (rows <= 0 || cols <= 0) return false;
+
+  out_table.extent = GridExtent{res, min_x, min_y, rows, cols};
+  out_table.cells.assign(static_cast<size_t>(rows * cols), {});
 
   // 3. 空间栅格投影桶 (单个 O(N) 遍历)
   std::vector<std::vector<float>> column_heights(static_cast<size_t>(rows * cols));
@@ -141,16 +163,7 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
     }
   }
 
-  // 4. 单柱多曲面聚类与垂直净空计算 (提取一楼、二楼及楼梯踏面)
-  struct RawSurface {
-    float z_top;
-    float z_bottom;
-    int count;
-  };
-
-  // 持久保存每格的曲面簇, 供后续机体侧向碰撞膨胀判定使用
-  std::vector<std::vector<RawSurface>> cell_surfaces(static_cast<size_t>(rows * cols));
-
+  // 4. 单柱多曲面聚类 (提取一楼、二楼及楼梯踏面), 簇按高度升序写入柱表
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < cols; ++c) {
       auto & heights = column_heights[static_cast<size_t>(r * cols + c)];
@@ -158,7 +171,7 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
 
       std::sort(heights.begin(), heights.end());
 
-      std::vector<RawSurface> surfaces;
+      std::vector<ColumnSurface> surfaces;
       float cur_bottom = heights[0];
       float cur_top = heights[0];
       int cur_count = 1;
@@ -176,9 +189,87 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
       }
       surfaces.push_back({cur_top, cur_bottom, cur_count});
 
-      cell_surfaces[static_cast<size_t>(r * cols + c)] = surfaces;
+      out_table.cells[static_cast<size_t>(r * cols + c)] = std::move(surfaces);
     }
   }
+  return true;
+}
+
+ColumnTable fuseColumnTables(const ColumnTable & prior,
+                             const ColumnTable & observed,
+                             double same_surface_tol,
+                             int boundary_ring)
+{
+  // 先验缺失或分辨率不一致 (无法逐格对齐) 时, 退化为纯观测
+  if (prior.empty() || observed.empty()) return observed;
+  if (std::abs(prior.extent.resolution - observed.extent.resolution) > 1e-9) return observed;
+
+  const GridExtent & oe = observed.extent;
+  const GridExtent & pe = prior.extent;
+
+  ColumnTable fused = observed; // extent 沿用观测表, 逐格覆写融合结果
+
+  for (int r = 0; r < oe.rows; ++r) {
+    for (int c = 0; c < oe.cols; ++c) {
+      // 窗口最外 boundary_ring 圈强制先验, 保证出窗处与全局图衔接
+      const bool boundary = (r < boundary_ring || r >= oe.rows - boundary_ring ||
+                             c < boundary_ring || c >= oe.cols - boundary_ring);
+
+      // 观测格中心世界坐标 -> 先验表格索引
+      const double wx = oe.min_x + (r + 0.5) * oe.resolution;
+      const double wy = oe.min_y + (c + 0.5) * oe.resolution;
+      int pr = static_cast<int>(std::floor((wx - pe.min_x) / pe.resolution));
+      int pc = static_cast<int>(std::floor((wy - pe.min_y) / pe.resolution));
+      const bool has_prior = pr >= 0 && pr < pe.rows && pc >= 0 && pc < pe.cols &&
+                             !prior.cells[static_cast<size_t>(pr * pe.cols + pc)].empty();
+      if (!has_prior) continue; // 无先验: 保留观测原样
+
+      const auto & pri = prior.cells[static_cast<size_t>(pr * pe.cols + pc)];
+      if (boundary) {
+        fused.cells[static_cast<size_t>(r * oe.cols + c)] = pri;
+        continue;
+      }
+
+      // 双指针并集合并 (两列表均按 z 升序)
+      const auto & obs = observed.cells[static_cast<size_t>(r * oe.cols + c)];
+      std::vector<ColumnSurface> merged;
+      merged.reserve(obs.size() + pri.size());
+      size_t i = 0, j = 0;
+      while (i < obs.size() || j < pri.size()) {
+        if (j >= pri.size()) { merged.push_back(obs[i++]); continue; }
+        if (i >= obs.size()) { merged.push_back(pri[j++]); continue; }
+        const ColumnSurface & a = obs[i];
+        const ColumnSurface & b = pri[j];
+        if (std::abs(static_cast<double>(a.z_top) - static_cast<double>(b.z_top)) <= same_surface_tol) {
+          ColumnSurface m = a; // 同一物理面: 几何取观测 (反映当前状态)
+          m.count = std::max(a.count, b.count); // 一次稀疏观测不推翻先验支撑面
+          merged.push_back(m);
+          ++i; ++j;
+        } else if (b.z_top < a.z_top) {
+          merged.push_back(b); ++j; // 仅先验: 保留 (雷达扫不到的脚下支撑面)
+        } else {
+          merged.push_back(a); ++i; // 仅观测: 新增 (新踏面/新障碍)
+        }
+      }
+      fused.cells[static_cast<size_t>(r * oe.cols + c)] = std::move(merged);
+    }
+  }
+  return fused;
+}
+
+bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, ManifoldGraph & out_graph)
+{
+  const GridExtent & ext = table.extent;
+  if (!ext.valid() || table.cells.size() != static_cast<size_t>(ext.rows * ext.cols)) return false;
+
+  const double res = ext.resolution;
+  const double min_x = ext.min_x;
+  const double min_y = ext.min_y;
+  const int rows = ext.rows;
+  const int cols = ext.cols;
+
+  out_graph.initSpatialGrid(res, min_x, min_y, rows, cols); // 内部 clear, 支持重复建图
+  const auto & cell_surfaces = table.cells;
 
   // 机体足印侧向碰撞膨胀: 扫描足印半径内 "垂直范围跨越踏步极限" 的结构 (墙体/台沿,
   // 即从本层踏面高度附近向上生长、高到迈不上去的竖直结构), 硬半径内硬阻挡, 外围软代价

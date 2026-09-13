@@ -184,6 +184,31 @@ def cancel_nav_goal():
     return {"status": "cancelled"}
 
 
+@app.get("/api/nav/robot_model")
+def get_robot_model():
+    """返回理论建模的机器人几何尺寸 (与 planner_common.yaml 同源, 供前端按真实包络渲染胶囊体+足印圆盘)"""
+    def read_param(names, default):
+        for name in names:
+            try:
+                value = rospy.get_param(name)
+                if value is not None:
+                    return float(value)
+            except Exception:
+                continue
+        return default
+
+    return {
+        "dog_height": read_param(
+            ["/move_base/ElevationGlobalPlanner/dog_height"], 0.45),
+        "body_hard_radius": read_param(
+            ["/move_base/ElevationGlobalPlanner/body_hard_radius"], 0.20),
+        "footprint_radius": read_param(
+            ["/move_base/ElevationGlobalPlanner/footprint_radius"], 0.30),
+        "max_step_height": read_param(
+            ["/move_base/ElevationGlobalPlanner/max_step_height"], 0.25),
+    }
+
+
 @app.get("/api/nav/diagnose_edge")
 def diagnose_edge(x1: float, y1: float, z1: float, x2: float, y2: float, z2: float):
     """请求 C++ 规划器节点权威诊断两踏面方块的拓扑邻边关系与物理原因"""

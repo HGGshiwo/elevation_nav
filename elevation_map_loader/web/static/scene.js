@@ -57,12 +57,14 @@ export function initScene(container) {
     });
 
     // 核心持续帧渲染循环 (驱动漫游平移、阻尼与视角更新)
+    let frameCallback = null;
     function animate() {
         requestAnimationFrame(animate);
         roamController.update();
+        if (frameCallback) frameCallback();
         renderer.render(scene, camera);
     }
     animate();
 
-    return { scene, camera, renderer, controls, roamController, editPlane };
+    return { scene, camera, renderer, controls, roamController, editPlane, setFrameCallback: (cb) => { frameCallback = cb; } };
 }

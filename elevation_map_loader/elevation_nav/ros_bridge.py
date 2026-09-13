@@ -6,10 +6,12 @@ ROS 状态通信桥接模块 (ROS Bridge)
 
 import json
 import math
+import random
 import threading
 from typing import Dict, Any, Optional, List
 import rospy
-from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped
+import tf2_ros
+from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped, Twist, TransformStamped
 from nav_msgs.msg import Path as ROSPath, Odometry
 from actionlib_msgs.msg import GoalID
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString
@@ -19,14 +21,30 @@ import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import MarkerArray
 import numpy as np
 
-def euler_to_quaternion(yaw: float) -> Quaternion:
-    """航向角 Yaw 转 ROS 四元数"""
+def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
+    """欧拉角转四元数 (移植自 jie_octomap ros_bridge)"""
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+
     q = Quaternion()
-    q.x = 0.0
-    q.y = 0.0
-    q.z = math.sin(yaw * 0.5)
-    q.w = math.cos(yaw * 0.5)
+    q.w = cr * cp * cy + sr * sp * sy
+    q.x = sr * cp * cy - cr * sp * sy
+    q.y = cr * sp * cy + sr * cp * sy
+    q.z = cr * cp * sy - sr * sp * cy
     return q
+
+
+def normalize_angle(angle: float) -> float:
+    """归一化角度到 [-pi, pi]"""
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
 
 
 class ElevationRosBridge:
@@ -55,6 +73,24 @@ class ElevationRosBridge:
         self._debug_event = threading.Event()
         self._last_debug_result = ""
 
+        # 仿真运动学与位姿状态 (publish_fake_tf=True 时启用动态积分, 移植自 jie_octomap ros_bridge)
+        self.publish_fake_tf = False
+        self.tf_broadcaster: Optional[tf2_ros.TransformBroadcaster] = None
+        self.tf_child_frame = "base_link"
+        self.sim_x = 0.0
+        self.sim_y = 0.0
+        self.sim_z = 0.0
+        self.sim_yaw = 0.0
+        self.cmd_vx = 0.0
+        self.cmd_vy = 0.0
+        self.cmd_wz = 0.0
+        self.last_cmd_time = None
+        self.last_sim_time = None
+        self.linear_noise_std = 0.008
+        self.lateral_noise_std = 0.008
+        self.angular_noise_std = 0.006
+        self.max_step_height = 0.25
+
     def init_ros(self, node_name: str = "elevation_web_server"):
         """初始化 ROS 节点与通道"""
         try:
@@ -77,6 +113,27 @@ class ElevationRosBridge:
             self._debug_query_pub = rospy.Publisher(
                 "/elevation_debug_query", RosString, queue_size=5
             )
+
+            # 仿真模式 (伪 TF): 参数、TF 广播器、里程计与速度指令 (移植自 jie_octomap ros_bridge)
+            self.publish_fake_tf = rospy.get_param("~publish_fake_tf", False)
+            self.tf_child_frame = rospy.get_param("~tf_child_frame", "base_link")
+            self.linear_noise_std = rospy.get_param("~linear_noise_std", 0.008)
+            self.lateral_noise_std = rospy.get_param("~lateral_noise_std", 0.008)
+            self.angular_noise_std = rospy.get_param("~angular_noise_std", 0.006)
+            self.sim_x = rospy.get_param("~init_x", 0.0)
+            self.sim_y = rospy.get_param("~init_y", 0.0)
+            self.sim_z = rospy.get_param("~init_z", 0.0)
+            self.sim_yaw = rospy.get_param("~init_yaw", 0.0)
+            # 地形跟随的分层带宽度: 与建图 max_step_height 同源 (相邻踏面高差极限, 跨层跳变被禁止)
+            self.max_step_height = rospy.get_param(
+                "/move_base/ElevationGlobalPlanner/max_step_height", 0.25)
+            self.tf_broadcaster = tf2_ros.TransformBroadcaster()
+            self._odom_pub = rospy.Publisher("/loc_base", Odometry, queue_size=10)
+            rospy.Subscriber("/cmd_vel", Twist, self._cmd_vel_callback, queue_size=5)
+
+            if self.publish_fake_tf:
+                self.last_sim_time = rospy.Time.now()
+                rospy.Timer(rospy.Duration(0.02), self.publish_fake_tf_loop)  # 50Hz 高频广播与积分
 
             # 订阅机器人位姿（支持 /loc_base 或 /odom）
             rospy.Subscriber("/loc_base", Odometry, self._odom_callback, queue_size=5)
@@ -153,6 +210,165 @@ class ElevationRosBridge:
         with self._lock:
             self.local_path = pts
 
+    # ------------------ 仿真运动学积分与 TF/Odom 高频广播 (移植自 jie_octomap) ------------------
+    def _cmd_vel_callback(self, msg: Twist):
+        self.cmd_vx = msg.linear.x
+        self.cmd_vy = msg.linear.y
+        self.cmd_wz = msg.angular.z
+        self.last_cmd_time = rospy.Time.now()
+
+    def get_terrain_z(self, x: float, y: float, fallback_z: float) -> float:
+        """基于流形踏面节点缓存 (graph_nodes: [x, y, z, traversability]) 探测 (x, y) 处的地表高度。
+        分层带过滤: 优先取 |dz| <= max_step_height 的节点 (同层踏面逐级跟随),
+        该带内无节点才放宽窗口 —— 防止行进中经过楼板空洞/边缘时 z 跳到下层"""
+        best_z = None
+        min_sq = 0.35 * 0.35  # 机体半径范围 (35cm)
+
+        with self._lock:
+            nodes = self.graph_nodes
+
+        # 第一带: 机体当前层附近 (|dz| <= max_step_height)
+        for p in nodes:
+            dz = p[2] - fallback_z
+            if abs(dz) > self.max_step_height:
+                continue
+            dx = p[0] - x
+            dy = p[1] - y
+            sq = dx * dx + dy * dy
+            if sq < min_sq:
+                min_sq = sq
+                best_z = p[2]
+
+        if best_z is not None:
+            return best_z
+
+        # 第二带 (放宽): 当前层附近无踏面节点时, 扩大到机体上下活动窗口
+        min_sq = 0.35 * 0.35
+        for p in nodes:
+            # 过滤掉远高于机体/天花板或深坑
+            if p[2] > fallback_z + 0.5 or p[2] < fallback_z - 1.8:
+                continue
+            dx = p[0] - x
+            dy = p[1] - y
+            sq = dx * dx + dy * dy
+            if sq < min_sq:
+                min_sq = sq
+                best_z = p[2]
+
+        if best_z is not None:
+            return best_z
+
+        # 次选：局部盲区无踏面节点时，回退参考规划路径的 3D 航路点高度
+        with self._lock:
+            local_path = list(self.local_path)
+            global_path = list(self.global_path)
+        for path_points in [local_path, global_path]:
+            if path_points:
+                min_path_sq = 0.8 * 0.8
+                path_z = None
+                for pt in path_points:
+                    dx = pt[0] - x
+                    dy = pt[1] - y
+                    sq = dx * dx + dy * dy
+                    if sq < min_path_sq:
+                        min_path_sq = sq
+                        path_z = pt[2]
+                if path_z is not None:
+                    return path_z
+
+        return fallback_z
+
+    def set_sim_pose(self, x: float, y: float, z: float, yaw: Optional[float] = None):
+        """前端修改初始位置时, 直接采用吸附节点的踏面高程 z (前端射线拾取已确定层归属),
+        立即同步并立即更新 TF; 不再重新贴地探测 —— 防止多层重叠处重新吸附掉到下层"""
+        self.sim_x = float(x)
+        self.sim_y = float(y)
+        self.sim_z = float(z) if z is not None else self.get_terrain_z(self.sim_x, self.sim_y, 0.0)
+        if yaw is not None:
+            self.sim_yaw = float(yaw)
+        self.cmd_vx, self.cmd_vy, self.cmd_wz = 0.0, 0.0, 0.0
+        self.last_sim_time = rospy.Time.now()
+        if self.publish_fake_tf:
+            self.publish_fake_tf_loop()
+
+    def publish_fake_tf_loop(self, event=None):
+        if not self.publish_fake_tf or self.tf_broadcaster is None:
+            return
+        try:
+            now_stamp = rospy.Time.now()
+
+            # 运动学积分更新
+            if self.last_sim_time is not None:
+                dt = (now_stamp - self.last_sim_time).to_sec()
+                if 0.0 < dt < 0.5:
+                    if self.last_cmd_time is not None and (now_stamp - self.last_cmd_time).to_sec() <= 0.5:
+                        vx, vy, wz = self.cmd_vx, self.cmd_vy, self.cmd_wz
+                        is_moving = abs(vx) > 1e-4 or abs(vy) > 1e-4 or abs(wz) > 1e-4
+                        if is_moving:
+                            noisy_vx = vx + random.gauss(0.0, self.linear_noise_std)
+                            noisy_vy = vy + random.gauss(0.0, self.lateral_noise_std)
+                            noisy_wz = wz + random.gauss(0.0, self.angular_noise_std)
+                        else:
+                            noisy_vx, noisy_vy, noisy_wz = 0.0, 0.0, 0.0
+                    else:
+                        noisy_vx, noisy_vy, noisy_wz = 0.0, 0.0, 0.0
+
+                    cos_y = math.cos(self.sim_yaw)
+                    sin_y = math.sin(self.sim_yaw)
+                    dx_body = noisy_vx * dt
+                    dy_body = noisy_vy * dt
+                    dyaw = noisy_wz * dt
+
+                    self.sim_x += dx_body * cos_y - dy_body * sin_y
+                    self.sim_y += dx_body * sin_y + dy_body * cos_y
+                    self.sim_yaw = normalize_angle(self.sim_yaw + dyaw)
+
+                    # 动态自动跟随 3D 地形与规划路径的 z 高度 (平滑低通滤波过渡)
+                    target_z = self.get_terrain_z(self.sim_x, self.sim_y, self.sim_z)
+                    self.sim_z = 0.85 * self.sim_z + 0.15 * target_z
+
+            self.last_sim_time = now_stamp
+            q = euler_to_quaternion(0.0, 0.0, self.sim_yaw)
+
+            # 1. 广播 TF 变换树: map -> odom -> base_link / base_footprint
+            transforms = []
+            t_map_odom = TransformStamped()
+            t_map_odom.header.stamp = now_stamp
+            t_map_odom.header.frame_id = "map"
+            t_map_odom.child_frame_id = "odom"
+            t_map_odom.transform.rotation.w = 1.0
+            transforms.append(t_map_odom)
+
+            for frame_name in dict.fromkeys([self.tf_child_frame, "base_link", "base_footprint"]):
+                t_odom = TransformStamped()
+                t_odom.header.stamp = now_stamp
+                t_odom.header.frame_id = "odom"
+                t_odom.child_frame_id = frame_name
+                t_odom.transform.translation.x = self.sim_x
+                t_odom.transform.translation.y = self.sim_y
+                t_odom.transform.translation.z = self.sim_z
+                t_odom.transform.rotation = q
+                transforms.append(t_odom)
+
+            self.tf_broadcaster.sendTransform(transforms)
+
+            # 2. 发布 /loc_base 里程计
+            if self._odom_pub:
+                odom_msg = Odometry()
+                odom_msg.header.stamp = now_stamp
+                odom_msg.header.frame_id = "map"
+                odom_msg.child_frame_id = self.tf_child_frame
+                odom_msg.pose.pose.position.x = self.sim_x
+                odom_msg.pose.pose.position.y = self.sim_y
+                odom_msg.pose.pose.position.z = self.sim_z
+                odom_msg.pose.pose.orientation = q
+                odom_msg.twist.twist.linear.x = self.cmd_vx
+                odom_msg.twist.twist.linear.y = self.cmd_vy
+                odom_msg.twist.twist.angular.z = self.cmd_wz
+                self._odom_pub.publish(odom_msg)
+        except Exception:
+            pass
+
     def publish_grid_map(self, grid_map_data: Dict[str, Any], frame_id: str = "map"):
         """将生成的 GridMap 数据发布为标准 ROS grid_map_msgs/GridMap"""
         if not self._grid_map_pub:
@@ -200,7 +416,7 @@ class ElevationRosBridge:
         rospy.loginfo(f"[ElevationRosBridge] Published ROS GridMap: {cols}x{rows}, res = {meta['resolution']}m")
 
     def publish_initial_pose(self, x: float, y: float, z: float = 0.0, yaw: float = 0.0, frame_id: str = "map"):
-        """发布起始位姿并直接更新本地机器人模型"""
+        """发布起始位姿并直接更新本地机器人模型; 仿真模式下同步伪 TF 位姿"""
         if self._initial_pose_pub:
             pose = PoseWithCovarianceStamped()
             pose.header.stamp = rospy.Time.now()
@@ -208,11 +424,16 @@ class ElevationRosBridge:
             pose.pose.pose.position.x = x
             pose.pose.pose.position.y = y
             pose.pose.pose.position.z = z
-            pose.pose.pose.orientation = euler_to_quaternion(yaw)
+            pose.pose.pose.orientation = euler_to_quaternion(0.0, 0.0, yaw)
             pose.pose.covariance[0] = 0.25
             pose.pose.covariance[7] = 0.25
             pose.pose.covariance[35] = 0.068
             self._initial_pose_pub.publish(pose)
+
+        # 仿真模式: Web 设置起点 = 触发伪 TF 变换 (立即生效); 实机模式不动 TF, 仅保留 /initialpose
+        if self.publish_fake_tf:
+            self.set_sim_pose(x, y, z, yaw)
+            return
 
         with self._lock:
             self.robot_pose = {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3), "yaw": round(yaw, 3)}
@@ -227,7 +448,7 @@ class ElevationRosBridge:
         goal.pose.position.x = x
         goal.pose.position.y = y
         goal.pose.position.z = z
-        goal.pose.orientation = euler_to_quaternion(yaw)
+        goal.pose.orientation = euler_to_quaternion(0.0, 0.0, yaw)
         self._goal_pub.publish(goal)
 
     def cancel_navigation(self):
