@@ -16,7 +16,7 @@ export function initRobotTracker(scene, controls) {
     // 理论建模尺寸 (api 未就绪时的兜底默认值, 与 planner_common.yaml 一致)
     let modelParams = {
         dog_height: 0.45,
-        body_hard_radius: 0.20,
+        body_hard_radius: 0.15,
         footprint_radius: 0.30,
         max_step_height: 0.25
     };
@@ -120,7 +120,7 @@ export function initRobotTracker(scene, controls) {
     let localAStarPathLine = null;
 
     const pathMat = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 3 });
-    const localPathMat = new THREE.LineBasicMaterial({ color: 0xff3d00, linewidth: 4 });
+    const localPathMat = new THREE.LineBasicMaterial({ color: 0xfacc15, linewidth: 4 }); // 亮金黄 (TEB/局部规划轨迹)
     const localAStarMat = new THREE.LineBasicMaterial({ color: 0xffeb3b, linewidth: 3 });
 
     function updatePath(points) {
@@ -152,6 +152,9 @@ export function initRobotTracker(scene, controls) {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.Float32BufferAttribute(coords, 3));
         localPathLine = new THREE.Line(geo, localPathMat);
+        const showLocal = (document.getElementById('show-local-path')?.checked ??
+                           document.getElementById('show-local-astar')?.checked ?? true);
+        localPathLine.visible = showLocal;
         scene.add(localPathLine);
     }
 
@@ -270,6 +273,12 @@ export function initRobotTracker(scene, controls) {
     });
 
     document.getElementById('show-local-astar')?.addEventListener('change', (e) => {
+        if (localAStarPathLine) localAStarPathLine.visible = e.target.checked;
+        if (localPathLine) localPathLine.visible = e.target.checked;
+    });
+
+    document.getElementById('show-local-path')?.addEventListener('change', (e) => {
+        if (localPathLine) localPathLine.visible = e.target.checked;
         if (localAStarPathLine) localAStarPathLine.visible = e.target.checked;
     });
 

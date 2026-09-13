@@ -2,7 +2,7 @@
  * WebSocket 流式增量数据同步模块 (WebSocket Stream)
  * 完整保留原版：全双工通道、图层差量版本同步(unchanged 跳过)、状态主动分发与断线重连
  */
-export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null) {
+export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, localCostmapVisualizer = null) {
     let ws = null;
     let isConnecting = false;
     const clientLayerVersions = {};
@@ -77,6 +77,11 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
                 console.log(`[WsStream] 收到 3D 流形步态边: ${frame.graph_edges.length} 条`);
                 graphVisualizer.updateEdges(frame.graph_edges);
             }
+        }
+
+        // 3. 1:1 流形局部代价地图更新
+        if (frame.local_costmap && localCostmapVisualizer) {
+            localCostmapVisualizer.update(frame.local_costmap);
         }
 
         // 4. 增量图层更新

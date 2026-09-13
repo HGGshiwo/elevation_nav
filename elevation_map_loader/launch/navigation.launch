@@ -17,6 +17,7 @@
     <arg name="resolution" default="0.10"/>
     <arg name="web_port" default="8080"/>
     <arg name="point_cloud_topic" default="/lidar_points"/>
+    <arg name="local_planner" default="astar" doc="局部规划器类型: astar (3D A*避障跟踪) 或 teb"/>
 
     <!-- 1. 地图与流形生成节点 (Web 端 GridMap 展示数据源) -->
     <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
@@ -32,10 +33,11 @@
         <param name="dog_height" value="0.50"/>
     </node>
 
-    <!-- 2. move_base: 全局流形 A* 插件 + D1 局部跟踪/融合图插件 -->
+    <!-- 2. move_base: 全局流形 A* 插件 + 局部规划器 (astar / teb 可选) -->
     <include file="$(find elevation_map_loader)/launch/move_base.launch">
         <arg name="pcd_file" value="$(arg pcd_file)"/>
         <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
+        <arg name="local_planner" value="$(arg local_planner)"/>
     </include>
 
     <!-- 3. Web 服务端与三维可视化 (FastAPI + Three.js); sim 时广播伪 TF -->

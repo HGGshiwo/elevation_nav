@@ -48,11 +48,13 @@ public:
     private_nh.param<double>("max_stride_length", cfg.max_stride_length, 0.35);
     private_nh.param<double>("dog_height", cfg.dog_height, 0.45);
     private_nh.param<double>("footprint_radius", cfg.footprint_radius, 0.30);
-    private_nh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.20);
+    private_nh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.15);
     private_nh.param<double>("sweep_penalty_weight", cfg.sweep_penalty_weight, 1.0);
     private_nh.param<double>("foot_clearance", cfg.foot_clearance, 0.05);
     private_nh.param<int>("sor_mean_k", cfg.sor_mean_k, 16);
     private_nh.param<double>("sor_std_mul", cfg.sor_std_mul, 1.5);
+    private_nh.param<double>("cluster_height_diff", cfg.cluster_height_diff, 0.08);
+    private_nh.param<int>("min_cluster_points", cfg.min_cluster_points, 2);
     builder_.setConfig(cfg);
 
     ros::NodeHandle nh;

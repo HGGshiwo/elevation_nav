@@ -49,6 +49,18 @@ public:
     return global_graph_;
   }
 
+  void setFusedGraph(std::shared_ptr<const ManifoldGraph> graph)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fused_graph_ = std::move(graph);
+  }
+
+  std::shared_ptr<const ManifoldGraph> getFusedGraph() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fused_graph_;
+  }
+
 private:
   GraphStore() = default;
   GraphStore(const GraphStore &) = delete;
@@ -57,6 +69,7 @@ private:
   mutable std::mutex mutex_;
   std::shared_ptr<const ColumnTable> global_table_;
   std::shared_ptr<const ManifoldGraph> global_graph_;
+  std::shared_ptr<const ManifoldGraph> fused_graph_;
 };
 
 } // namespace elevation_planner

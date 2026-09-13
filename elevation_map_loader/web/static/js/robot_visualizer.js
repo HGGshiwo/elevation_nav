@@ -21,7 +21,7 @@ export class RobotVisualizer {
         // 理论建模尺寸 (api 未就绪时的兜底默认值, 与 planner_common.yaml 一致)
         this.modelParams = {
             dog_height: 0.45,
-            body_hard_radius: 0.20,
+            body_hard_radius: 0.15,
             footprint_radius: 0.30,
             max_step_height: 0.25
         };

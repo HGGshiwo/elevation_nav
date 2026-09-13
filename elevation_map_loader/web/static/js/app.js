@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { initScene } from '../scene.js';
 import { LayerManager } from '../layer.js';
 import { GraphVisualizer } from './graph_visualizer.js';
+import { LocalCostmapVisualizer } from './local_costmap_visualizer.js';
 import { initEditor } from './editor.js';
 import { initRobotTracker } from './robot_tracker.js';
 import { initMapStorage } from './map_storage.js';
@@ -37,6 +38,9 @@ layers.emergency_stop_occupied.mesh.visible = false;
 // 3D 流形拓扑图渲染器 (点云直通踏面与连通网格)
 const graphVisualizer = new GraphVisualizer(scene, camera, controls);
 
+// 1:1 流形局部代价地图 3D 渲染器 (实时贴地地毯与规划窗口外框)
+const localCostmapVisualizer = new LocalCostmapVisualizer(scene);
+
 // 获取当前已勾选需流式同步的图层列表
 function getActiveRequestedLayers() {
     const requested = [];
@@ -67,8 +71,14 @@ const editor = initEditor(scene, camera, renderer, controls, layers, editPlane, 
     mapStorage.markDirty(layerName);
 }, graphVisualizer);
 
-// 3.4 WebSocket 全双工流式同步模块 (支持流形图与点云直通数据)
-const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer);
+// 3.4 WebSocket 全双工流式同步模块 (支持流形图、局部代价地图与点云直通数据)
+const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, localCostmapVisualizer);
+
+// ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
+// 局部代价地图显隐控制
+document.getElementById('show-local-costmap')?.addEventListener('change', (e) => {
+    localCostmapVisualizer.setVisible(e.target.checked);
+});
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
 function bindLayerToggle(id, layerObj) {

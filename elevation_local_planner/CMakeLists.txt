@@ -6,6 +6,7 @@ add_compile_options(-std=c++14 -O3 -Wall)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   elevation_planner_core
+  elevation_global_planner
   grid_map_core
   grid_map_ros
   grid_map_msgs
@@ -22,7 +23,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES elevation_local_planner_lib
-  CATKIN_DEPENDS roscpp elevation_planner_core grid_map_core grid_map_ros grid_map_msgs geometry_msgs nav_msgs tf2_ros nav_core costmap_2d pluginlib pcl_ros pcl_conversions
+  CATKIN_DEPENDS roscpp elevation_planner_core elevation_global_planner grid_map_core grid_map_ros grid_map_msgs geometry_msgs nav_msgs tf2_ros nav_core costmap_2d pluginlib pcl_ros pcl_conversions
 )
 
 include_directories(
@@ -32,8 +33,8 @@ include_directories(
 
 add_library(elevation_local_planner_lib
   src/collision_checker.cpp
-  src/d1_velocity_smoother.cpp
-  src/elevation_local_planner_plugin.cpp
+  src/velocity_smoother.cpp
+  src/astar_local_planner.cpp
 )
 target_link_libraries(elevation_local_planner_lib
   ${catkin_LIBRARIES}

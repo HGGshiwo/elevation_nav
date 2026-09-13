@@ -1,10 +1,12 @@
 <launch>
-    <!-- move_base 节点: 全局 = 流形图 A* 插件, 局部 = D1 跟踪 + 融合图安全层插件 -->
+    <!-- move_base 节点: 全局 = 流形图 A* 插件; 局部 = 动态支持 astar (3D A*避障跟踪) 或 teb (原生TEB规划器) -->
     <arg name="pcd_file" default=""/>
     <arg name="map_frame" default="map"/>
     <arg name="base_frame" default="base_link"/>
     <arg name="point_cloud_topic" default="/lidar_points"/>
+    <arg name="local_planner" default="astar" doc="局部规划器选择: astar (3D A*避障跟踪) 或 teb (原生TEB时优避障)"/>
 
+    <!-- move_base 导航容器 (ManifoldCostmapLayer 作为内部插件运行，零拷贝共享 GraphStore) -->
     <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
         <rosparam file="$(find elevation_map_loader)/config/move_base/costmap_common_params.yaml" command="load" ns="global_costmap" />
         <rosparam file="$(find elevation_map_loader)/config/move_base/costmap_common_params.yaml" command="load" ns="local_costmap" />
@@ -13,23 +15,34 @@
         <rosparam file="$(find elevation_map_loader)/config/move_base/move_base_params.yaml" command="load" />
 
         <param name="base_global_planner" value="elevation_global_planner/ElevationGlobalPlanner"/>
-        <param name="base_local_planner"  value="elevation_local_planner/ElevationLocalPlannerPlugin"/>
 
-        <!-- explicitly define frame ids for move_base -->
+        <!-- 局部规划器动态切换 (astar 或 teb) -->
+        <param if="$(eval arg('local_planner') == 'astar')"
+               name="base_local_planner" value="elevation_local_planner/AStarLocalPlanner"/>
+        <param if="$(eval arg('local_planner') == 'teb')"
+               name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS"/>
+
+        <!-- 明确指定 frame ids -->
         <param name="global_costmap/global_frame"     value="$(arg map_frame)"/>
         <param name="global_costmap/robot_base_frame" value="$(arg base_frame)"/>
-        <param name="local_costmap/global_frame"      value="odom"/>
+        <param name="local_costmap/global_frame"      value="$(arg map_frame)"/>
         <param name="local_costmap/robot_base_frame"  value="$(arg base_frame)"/>
 
-        <!-- 全局插件: 离线 PCD 先验建图 (建图产物写入 GraphStore 供局部插件融合) -->
+        <!-- 局部流形图层插件配置: 注入点云话题与建图参数 -->
+        <param name="local_costmap/elevation_manifold_layer/cloud_topic" value="$(arg point_cloud_topic)"/>
+        <rosparam file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="local_costmap/elevation_manifold_layer"/>
+
+        <!-- 全局插件配置: 离线 PCD 先验建图 (建图产物写入同进程 GraphStore 供局部图层零拷贝访问) -->
         <param name="ElevationGlobalPlanner/map_frame" value="$(arg map_frame)"/>
         <param name="ElevationGlobalPlanner/pcd_file"  value="$(arg pcd_file)"/>
         <rosparam file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="ElevationGlobalPlanner"/>
 
-        <!-- 局部插件: D1 跟踪 + 实时点云 ROI 融合图 (建图参数与全局同源) -->
-        <param name="ElevationLocalPlannerPlugin/map_frame"   value="$(arg map_frame)"/>
-        <param name="ElevationLocalPlannerPlugin/cloud_topic" value="$(arg point_cloud_topic)"/>
-        <rosparam file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="ElevationLocalPlannerPlugin"/>
-        <rosparam file="$(find elevation_map_loader)/config/d1_local_params.yaml" command="load" ns="ElevationLocalPlannerPlugin"/>
+        <!-- 局部插件配置: AStarLocalPlanner 专用参数 -->
+        <rosparam if="$(eval arg('local_planner') == 'astar')"
+                  file="$(find elevation_map_loader)/config/move_base/astar_local_planner_params.yaml" command="load" ns="AStarLocalPlanner"/>
+
+        <!-- 局部插件配置: TEB 规划器专用参数 -->
+        <rosparam if="$(eval arg('local_planner') == 'teb')"
+                  file="$(find elevation_map_loader)/config/move_base/teb_local_planner_params.yaml" command="load"/>
     </node>
 </launch>

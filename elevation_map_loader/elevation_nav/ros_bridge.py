@@ -8,11 +8,12 @@ import json
 import math
 import random
 import threading
+import base64
 from typing import Dict, Any, Optional, List
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped, Twist, TransformStamped
-from nav_msgs.msg import Path as ROSPath, Odometry
+from nav_msgs.msg import Path as ROSPath, Odometry, OccupancyGrid
 from actionlib_msgs.msg import GoalID
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString
 from grid_map_msgs.msg import GridMap, GridMapInfo
@@ -63,6 +64,9 @@ class ElevationRosBridge:
         self.graph_nodes_version = 0
         self.graph_edges: List[List[float]] = []
         self.graph_edges_version = 0
+        # 局部代价地图缓存
+        self.local_costmap: Optional[Dict[str, Any]] = None
+        self.local_costmap_version = 0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -142,7 +146,16 @@ class ElevationRosBridge:
             # 订阅全局规划路径与局部规划路径 (优先使用 3D 流形全局路径)
             rospy.Subscriber("/elevation_global_plan", ROSPath, self._global_path_callback, queue_size=2)
             rospy.Subscriber("/move_base/plan", ROSPath, self._global_path_callback, queue_size=2)
+
+            # 订阅局部规划路径 (多源兼容: TEB, AStarLocalPlanner 及原生 local_plan)
+            rospy.Subscriber("/move_base/TebLocalPlannerROS/local_plan", ROSPath, self._local_path_callback, queue_size=2)
+            rospy.Subscriber("/move_base/AStarLocalPlanner/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/move_base/local_plan", ROSPath, self._local_path_callback, queue_size=2)
+            rospy.Subscriber("/elevation_local_plan", ROSPath, self._local_path_callback, queue_size=2)
+
+            # 订阅局部代价地图 (1:1 流形局部代价地图与原生 local_costmap)
+            rospy.Subscriber("/elevation_local_costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
+            rospy.Subscriber("/move_base/local_costmap/costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
 
             # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
@@ -206,9 +219,61 @@ class ElevationRosBridge:
             self.path_version += 1
 
     def _local_path_callback(self, msg: ROSPath):
-        pts = [[p.pose.position.x, p.pose.position.y, p.pose.position.z] for p in msg.poses]
+        with self._lock:
+            gpath = list(self.global_path) if self.global_path else []
+            robot_z = self.robot_pose.get("z", 0.0) if self.robot_pose else 0.0
+
+        pts = []
+        for p in msg.poses:
+            x = p.pose.position.x
+            y = p.pose.position.y
+            z = p.pose.position.z
+            # 若局部规划器(如 ROS 原生 2D TEB)输出写死 z=0, 但实际机器人与地表处于 3D 高程下
+            if abs(z) < 1e-3 and (gpath or abs(robot_z) > 0.05):
+                best_z = robot_z
+                best_d2 = 999.0
+                for gx, gy, gz in gpath:
+                    d2 = (x - gx)**2 + (y - gy)**2
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_z = gz
+                z = best_z
+            pts.append([round(x, 3), round(y, 3), round(z, 3)])
+
         with self._lock:
             self.local_path = pts
+
+    def _local_costmap_callback(self, msg: OccupancyGrid):
+        """解析 1:1 流形局部代价地图 (发布给 Web 前端渲染局部地毯)"""
+        try:
+            w = int(msg.info.width)
+            h = int(msg.info.height)
+            res = float(msg.info.resolution)
+            ox = float(msg.info.origin.position.x)
+            oy = float(msg.info.origin.position.y)
+            oz = float(msg.info.origin.position.z)
+
+            # 数据映射: 将 int8 数组转为无符号单字节 (255: 未知, 0: 自由, 1~99: 代价, 100: 致命障碍)
+            raw = bytearray(len(msg.data))
+            for i, val in enumerate(msg.data):
+                raw[i] = val if val >= 0 else 255
+            b64_str = base64.b64encode(raw).decode('ascii')
+
+            with self._lock:
+                self.local_costmap = {
+                    "width": w,
+                    "height": h,
+                    "resolution": round(res, 3),
+                    "origin": {
+                        "x": round(ox, 3),
+                        "y": round(oy, 3),
+                        "z": round(oz, 3)
+                    },
+                    "data": b64_str
+                }
+                self.local_costmap_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 local costmap 异常: {e}")
 
     # ------------------ 仿真运动学积分与 TF/Odom 高频广播 (移植自 jie_octomap) ------------------
     def _cmd_vel_callback(self, msg: Twist):
@@ -507,7 +572,9 @@ class ElevationRosBridge:
                 "graph_nodes": list(self.graph_nodes),
                 "graph_nodes_version": self.graph_nodes_version,
                 "graph_edges": list(self.graph_edges),
-                "graph_edges_version": self.graph_edges_version
+                "graph_edges_version": self.graph_edges_version,
+                "local_costmap": dict(self.local_costmap) if self.local_costmap else None,
+                "local_costmap_version": self.local_costmap_version
             }
 
 

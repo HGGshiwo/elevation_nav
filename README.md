@@ -157,8 +157,9 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 | :--- | :--- |
 | **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`，含柱表生成/逐柱融合/建边压平两段式管线)、进程级共享存储 (`GraphStore`)、跨层门户 (`LayerPortal`)、代价评估器 (`CostEvaluator`) |
 | **`elevation_map_loader`** | 点云加载、流形森林生成器 (`ManifoldForest`)、FastAPI 服务端与 Web 3D 可视化交互编辑器、仿真伪 TF 广播 |
-| **`elevation_global_planner`** | move_base 全局规划器插件 (`ElevationGlobalPlanner`)：离线 PCD 先验建图、跨层 A* (`ManifoldAStar`)、路径平滑 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
-| **`elevation_local_planner`** | move_base 局部规划器插件 (`ElevationLocalPlannerPlugin`)：D1 比例跟踪控制、实时点云融合图后台线程、融合图足印碰撞安全层、速度指令生成 (`/cmd_vel`) |
+| **`elevation_global_planner`** | move_base 全局规划器插件 (`ElevationGlobalPlanner`)：离线 PCD 先验建图、跨层 A* (`ManifoldAStar`)、防割角平滑 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
+| **`elevation_local_planner`** | move_base 局部规划器插件 (`AStarLocalPlanner`)：基于 3D 流形拓扑图的局部 A* 动态避障寻优与前瞻平滑跟踪控制，速度指令生成 (`/cmd_vel`) |
+| **`elevation_costmap`** | move_base 局部代价地图插件 (`ManifoldCostmapLayer`)：基于纯几何 1:1 地毯算法的高频局部流形代价地图生成器，零拷贝共享全局先验，供 TEB 原生消费 |
 
 ---
 
@@ -171,11 +172,11 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 | `max_stride_length` | `0.35` | 四足机器人单步最大水平跨步步长 (m) |
 | `dog_height` | `0.45` | 机器狗通行站立高度阈值，低于此净空标记为顶头避障 (m) |
 | `cluster_height_diff` | `0.08` | 垂直单柱点云聚类厚度间距，用于分离开重叠踏面 (m) |
-| `min_cluster_points` | `2` | 构成有效支撑踏面所需的最小点云数 |
+| `min_cluster_points` | `4` | 构成有效支撑踏面所需的最小点云数 (过滤悬浮噪点与离散残影) |
 | `sor_mean_k` | `16` | SOR 残影点过滤近邻统计点数 |
 | `sor_std_mul` | `1.5` | SOR 标准差倍数阈值，越大越保守，极大值等效关闭 |
-| `footprint_radius` | `0.30` | 机体足印外接半径 (m)，侧向障碍软代价膨胀边界 |
-| `body_hard_radius` | `0.20` | 机体硬阻挡半径 (m)，约半身宽+安全余量，侧向障碍进入此范围节点不可通行 |
+| `footprint_radius` | `0.24` | 机体足印外接半径 (m)，侧向障碍软代价膨胀边界，紧凑贴合机体 |
+| `body_hard_radius` | `0.15` | 机体硬阻挡半径 (m)，约为半身宽 0.14m + 最小安全余量，侧向障碍进入此范围节点不可通行 |
 | `sweep_penalty_weight` | `1.0` | 建边时机体扫掠区软代价权重 |
 | `foot_clearance` | `0.05` | 足底容差 (m)，行走面下方此深度内的禁行节点仍保守视为剐蹭，更深处视为脚下楼梯结构/其他层 |
 | `crop_radius_xy` | `1.5` | 实时点云融合的 ROI 滚动窗口半径 (m)，融合图边长 = 2 × crop_radius_xy |
@@ -221,20 +222,46 @@ flowchart TD
 | 插件 | 注册名 | 职责 |
 | :--- | :--- | :--- |
 | `ElevationGlobalPlanner` | `elevation_global_planner/ElevationGlobalPlanner` | 离线 PCD 建图（柱表+全局图写入 GraphStore）、`makePlan` = 起终点锚定 → 跨层 A* → 平滑；全局图保持纯先验，不订阅实时点云 |
-| `ElevationLocalPlannerPlugin` | `elevation_local_planner/ElevationLocalPlannerPlugin` | D1 比例跟踪（3D 前瞻投影选点 + 纵/横/航向三通道 + 加速度限幅）；后台融合线程按 `fusion_rate` 刷新融合图；控制周期入口先做融合图足印碰撞检查，命中禁行节点即零速停车 |
+| `AStarLocalPlanner` | `elevation_local_planner/AStarLocalPlanner` | 规划器 A (默认): 3D 流形局部 A* 动态避障与前瞻平滑跟踪控制（直接读取 GraphStore 融合图、遇阻实时重规划、速度平滑滤波） |
+| `TebLocalPlannerROS` | `teb_local_planner/TebLocalPlannerROS` | 规划器 B (可选): ROS 官方原生 TEB 局部规划器；直接消费 `elevation_costmap` 插件通过纯几何"地毯铺设"算法生成的 1:1 贴地局部 Costmap，实现时间最优轨迹优化与动态平滑避障 |
 
-costmap 仅保留空层维持 move_base 框架运转，3D 规划与避障完全由流形图承担。局部持续受阻时由 move_base 的恢复行为与 `planner_frequency` 周期重规划形成闭环。
+### 4. 1:1 流形代价地图插件 (ManifoldCostmapLayer)
 
-### 4. 仿真与实机启动
+由 `elevation_costmap` 包提供标准的 `costmap_2d::Layer` 内部插件 `ManifoldCostmapLayer`，直接运行在 `move_base` 进程内部：
+1. **零拷贝共享**：直接同进程零拷贝访问 `GraphStore::instance()` 获取全局先验图，无需重复加载 PCD 文件；
+2. **点云融合与地毯构建**：后台线程按 10Hz 高频维护点云融合图，执行纯几何“地毯铺设”算法，构建 1:1 绝对真实的平坦局部地图；
+3. **消除死等阻塞**：纯异步非阻塞设计，开机 0ms 顺畅启动；`updateCosts` 直接将 1:1 踏面与障碍写进 `local_costmap` 的 Master Grid，原生喂给 TEB 局部规划器；
+4. **调试可视化**：同步向 `/elevation_local_costmap` 发布话题，方便在 RViz 中直观监控。
+
+### 5. 仿真与实机启动
 
 ```bash
-# 仿真 (默认): Web 端伪 TF 广播 map->odom->base_link, /cmd_vel 积分运动
-roslaunch elevation_map_loader navigation.launch
+# 1. 默认 A* 跟踪局部规划器 (仿真模式)
+roslaunch elevation_map_loader navigation.launch local_planner:=astar
 
-# 实机: 关闭伪 TF, 位姿来自实机定位
-roslaunch elevation_map_loader navigation.launch sim:=false
+# 2. 原生 TEB 时优规划器 (仿真模式, 消费 1:1 地毯 Costmap)
+roslaunch elevation_map_loader navigation.launch local_planner:=teb
+
+# 3. 实机运行 (关闭伪 TF)
+roslaunch elevation_map_loader navigation.launch sim:=false local_planner:=teb
 ```
 
 - **设置起点 = 触发 TF 变换**：Web 端吸附踏面节点设置起点时，仿真模式下机器人位姿立即跳转该处（直接采用吸附节点的踏面高程，不在二次贴地探测中掉层）；实机模式下仅发布 `/initialpose`，不动 TF
 - **设置终点 = 触发 move_base 规划**：发布 `/move_base_simple/goal`，路径经 `/move_base/plan` 与 `/elevation_global_plan` (latched) 回传前端
 - 行进中地形跟随采用**分层带过滤**：优先 `|dz| ≤ max_step_height` 的同层踏面带，禁止经楼板边缘时跨层瞬移
+
+### 6. Web 端三维流形与局部规划可视化
+
+- **流形局部代价地图 (地毯模式)**：订阅 `/elevation_local_costmap`，通过 Three.js CanvasTexture 实时在机器狗脚下投影 6m×6m 贴地半透明地毯（0=自由青绿、1~99=软膨胀橙黄、100=致命红、255=空洞透明），直观展示局部可通行域。
+- **TEB 局部轨迹 3D 贴地渲染**：针对 2D 规划器默认输出 $Z=0$ 的问题，在 `ros_bridge.py` 中引入地表高程投影适配，将亮黄色 TEB 轨迹严密贴合至三维踏面与楼梯表面。
+- **动态图层显隐**：前端支持“☑ 局部地图(流形)”与“☑ 局部规划(黄)”独立切换控制。
+
+### 7. 狭窄通道通行与拐角主动大弧度外绕机制
+
+- **狭窄走廊通过性**：将 `body_hard_radius` 降至 `0.15m`（半机身宽 0.14m + 最小安全余量），彻底消除走廊北立柱等侧向凸起的虚假硬碰撞阻断；
+- **八边形倒角足印**：采用八边形贴合机体倒角模型替代锐利长方形，消除 90° 直角转弯时尾角外扫碰壁问题；
+- **全局 A\* 拐角主动外绕**：提高贴墙软代价权重（`0.5` $\to$ `2.5`），迫使 A\* 在转弯前主动向开阔区域拉开安全距离；
+- **平滑防内切保护**：平滑算法增加 `traversability >= 0.40` 软膨胀区保护门限，严禁平滑向内角割角；
+- **TEB 提前避让优化**：增大膨胀排斥距离至 `0.35m` 与权重 `3.0`，关闭朝向强制突变覆盖（`global_plan_overwrite_orientation: false`），全向机器狗以平滑大外弧线安全绕行。
+
+

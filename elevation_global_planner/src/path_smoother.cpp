@@ -18,7 +18,8 @@ bool inBlockedRegion(const elevation_planner::ManifoldGraph & graph, double x, d
 
   for (uint32_t nid : cell_nodes) {
     const auto & nd = graph.getNode(nid);
-    if (nd.traversability >= 0.95f && std::abs(nd.z - z) <= 0.35) return true;
+    // 贴墙软膨胀区 (traversability >= 0.40) 亦视为保护区, 严禁平滑算法内切内弯割角
+    if (nd.traversability >= 0.40f && std::abs(nd.z - z) <= 0.35) return true;
   }
   return false;
 }

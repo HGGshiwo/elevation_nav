@@ -450,9 +450,9 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
 
     float dz = std::abs(u.z - v.z);
     float dxy = std::hypot(u.x - v.x, u.y - v.y);
-    // 边代价：3D欧氏位移 + 高差势能惩罚 (鼓励走平地，但楼梯绝对连通)
+    // 边代价：3D欧氏位移 + 高差势能惩罚 + 侧向墙体膨胀惩罚 (高权重引导 A* 拐角主动大弧度外绕)
     float edge_len = std::sqrt(dxy * dxy + dz * dz);
-    float cost = edge_len + 2.0f * dz + 0.5f * (u.traversability + v.traversability);
+    float cost = edge_len + 2.0f * dz + 2.5f * (u.traversability + v.traversability);
     // 扫掠区软代价: 边身靠近墙体时提高代价, 引导 A* 居中绕行
     cost += static_cast<float>(config_.sweep_penalty_weight) * sweepSoftCost(u, v);
 

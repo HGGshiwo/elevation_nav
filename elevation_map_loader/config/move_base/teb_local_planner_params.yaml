@@ -1,0 +1,74 @@
+# TEB Local Planner 配置 (四足机器人 1:1 贴地地毯模式)
+TebLocalPlannerROS:
+
+  odom_topic: odom
+  map_frame: map
+
+  # ---- 机器人运动学极限 (与 AStarLocalPlanner 控制器统一) ----
+  max_vel_x: 0.60
+  max_vel_x_backwards: 0.15
+  max_vel_y: 0.30
+  max_vel_trans: 0.60
+  max_vel_theta: 1.00
+
+  acc_lim_x: 0.80
+  acc_lim_y: 0.40
+  acc_lim_theta: 1.20
+
+  # 全向移动模式 (四足狗支持侧向移动)
+  holonomic_robot: true
+
+  # ---- 机器人几何轮廓 (八边形贴合机体倒角, 避免直角转弯尾部扫墙) ----
+  footprint_model:
+    type: "polygon"
+    vertices: [[0.18, 0.08], [0.12, 0.13], [-0.12, 0.13], [-0.18, 0.08], [-0.18, -0.08], [-0.12, -0.13], [0.12, -0.13], [0.18, -0.08]]
+
+  # ---- 目标容差 ----
+  xy_goal_tolerance: 0.08
+  yaw_goal_tolerance: 0.12
+  free_goal_vel: false
+
+  # ---- 轨迹配置 ----
+  dt_ref: 0.20
+  dt_hysteresis: 0.05
+  min_samples: 3
+  max_samples: 25
+  global_plan_overwrite_orientation: false
+  global_plan_viapoint_sep: 0.50
+  max_global_plan_lookahead_dist: 2.5
+  force_reinit_new_goal_dist: 0.5
+  feasibility_check_no_poses: 1
+
+  # ---- 障碍物与代价地图避障 (主动提前外绕) ----
+  min_obstacle_dist: 0.04
+  include_costmap_obstacles: true
+  costmap_obstacles_behind_robot_dist: 1.0
+  obstacle_poses_affected: 15
+  inflation_dist: 0.35
+  costmap_converter_plugin: ""
+
+  # ---- 优化器权重 (增大避障斥力, 拐角主动提前外绕) ----
+  no_inner_iterations: 4
+  no_outer_iterations: 3
+  penalty_epsilon: 0.05
+  weight_max_vel_x: 1.0
+  weight_max_vel_y: 1.0
+  weight_max_vel_theta: 1.0
+  weight_acc_lim_x: 1.0
+  weight_acc_lim_y: 1.0
+  weight_acc_lim_theta: 1.0
+  weight_kinematics_nh: 1.0
+  weight_kinematics_forward_drive: 2.0
+  weight_kinematics_turning_radius: 0.0
+  weight_optimaltime: 0.5
+  weight_obstacle: 20.0
+  weight_viapoint: 0.2
+  weight_inflation: 3.0
+
+  # ---- 同伦类规划 (关闭以提升实时性与狭窄通道稳定性) ----
+  enable_homotopy_class_planning: false
+  enable_multithreading: true
+  max_number_classes: 2
+
+  # 调试可视化
+  publish_feedback: false

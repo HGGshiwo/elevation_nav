@@ -84,7 +84,7 @@ struct GraphBuildConfig
 
   // ---- 机体碰撞建模 (足印膨胀 + 建边扫掠) ----
   double footprint_radius{0.30};    ///< 机体足印外接半径 (m): 软代价膨胀边界
-  double body_hard_radius{0.20};    ///< 机体硬阻挡半径 (m): 约半身宽+安全余量, 侧向障碍进入此范围则节点不可通行
+  double body_hard_radius{0.15};    ///< 机体硬阻挡半径 (m): 约半身宽+安全余量, 侧向障碍进入此范围则节点不可通行
   double sweep_penalty_weight{1.0}; ///< 建边时机体扫掠区软代价权重
   double foot_clearance{0.05};      ///< 足底容差 (m): 行走面下方此深度内的禁行节点仍保守视为剐蹭, 更深的视为脚下楼梯结构/其他层
 };

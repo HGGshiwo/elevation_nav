@@ -1,0 +1,34 @@
+# AStarLocalPlanner 局部规划与跟踪控制参数
+# 支持 3D 流形局部 A* 动态避障与前瞻平滑控制
+
+# 坐标系与前瞻避障参数 (全部开放配置，杜绝硬编码)
+map_frame: map
+local_horizon_distance: 2.50       # 截取全局路径的最大前向视距 (m)
+lookahead_distance: 0.45           # 前瞻跟踪目标插值距离 (m)
+obstacle_check_distance: 1.50      # 前向路径障碍检测探测距离 (m)
+detour_clearance_margin: 0.20      # 动态绕障安全余量 (m)
+max_step_height: 0.25              # 单步踏步垂直高度极限/立体防穿层容差 (m)
+collision_footprint_radius: 0.08   # 机身核心紧贴硬防碰检测半径 (m)
+
+# 目标容差与控制增益
+tracking_point_reached_xy_tolerance: 0.20
+goal_position_tolerance: 0.05
+goal_yaw_tolerance: 0.10
+linear_gain: 1.2
+lateral_gain: 0.4
+heading_gain: 1.2
+final_yaw_gain: 0.5
+enable_lateral_motion: true
+align_final_yaw: true
+
+# 速度与加速度平滑限幅
+max_linear_speed: 0.60
+max_lateral_speed: 0.30
+max_angular_speed: 1.00
+max_linear_acc: 0.80
+max_lateral_acc: 0.40
+max_angular_acc: 1.20
+enable_lateral_decoupling: true
+linear_deadband: 0.05
+lateral_deadband: 0.05
+angular_deadband: 0.05

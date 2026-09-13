@@ -201,7 +201,7 @@ def get_robot_model():
         "dog_height": read_param(
             ["/move_base/ElevationGlobalPlanner/dog_height"], 0.45),
         "body_hard_radius": read_param(
-            ["/move_base/ElevationGlobalPlanner/body_hard_radius"], 0.20),
+            ["/move_base/ElevationGlobalPlanner/body_hard_radius"], 0.15),
         "footprint_radius": read_param(
             ["/move_base/ElevationGlobalPlanner/footprint_radius"], 0.30),
         "max_step_height": read_param(
@@ -239,6 +239,7 @@ async def websocket_live(websocket: WebSocket):
     last_path_v = -1
     last_nodes_v = -1
     last_edges_v = -1
+    last_costmap_v = -1
     try:
         while True:
             state = ros_bridge.get_live_state()
@@ -260,6 +261,11 @@ async def websocket_live(websocket: WebSocket):
                 frame["graph_edges"] = state["graph_edges"]
                 frame["graph_edges_version"] = state["graph_edges_version"]
                 last_edges_v = state["graph_edges_version"]
+
+            if state.get("local_costmap_version", 0) != last_costmap_v and state.get("local_costmap"):
+                frame["local_costmap"] = state["local_costmap"]
+                frame["local_costmap_version"] = state["local_costmap_version"]
+                last_costmap_v = state["local_costmap_version"]
 
             await websocket.send_text(json.dumps(frame))
             await asyncio.sleep(0.1)  # 10Hz 稳定推送

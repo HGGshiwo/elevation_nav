@@ -1,0 +1,7 @@
+<class_libraries>
+  <library path="lib/libmanifold_costmap_layer">
+    <class type="elevation_costmap::ManifoldCostmapLayer" base_class_type="costmap_2d::Layer">
+      <description>Non-blocking asynchronous layer for 1:1 Manifold Local Costmap.</description>
+    </class>
+  </library>
+</class_libraries>

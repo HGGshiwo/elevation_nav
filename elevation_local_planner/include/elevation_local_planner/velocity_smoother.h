@@ -1,8 +1,8 @@
-#ifndef ELEVATION_LOCAL_PLANNER_D1_VELOCITY_SMOOTHER_H_
-#define ELEVATION_LOCAL_PLANNER_D1_VELOCITY_SMOOTHER_H_
+#ifndef ELEVATION_LOCAL_PLANNER_VELOCITY_SMOOTHER_H_
+#define ELEVATION_LOCAL_PLANNER_VELOCITY_SMOOTHER_H_
 
 #include <geometry_msgs/Twist.h>
-#include "elevation_local_planner/d1_control_types.h"
+#include "elevation_local_planner/control_types.h"
 
 namespace elevation_local_planner
 {
@@ -24,11 +24,11 @@ struct VelocitySmootherParams
   double angular_deadband{0.05};
 };
 
-class D1VelocitySmoother
+class VelocitySmoother
 {
 public:
-  D1VelocitySmoother();
-  explicit D1VelocitySmoother(const VelocitySmootherParams & params);
+  VelocitySmoother();
+  explicit VelocitySmoother(const VelocitySmootherParams & params);
 
   void setParams(const VelocitySmootherParams & params);
   const VelocitySmootherParams & getParams() const { return params_; }
@@ -47,4 +47,4 @@ private:
 
 } // namespace elevation_local_planner
 
-#endif // ELEVATION_LOCAL_PLANNER_D1_VELOCITY_SMOOTHER_H_
+#endif // ELEVATION_LOCAL_PLANNER_VELOCITY_SMOOTHER_H_
