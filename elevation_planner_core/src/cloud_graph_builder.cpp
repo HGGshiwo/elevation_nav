@@ -199,9 +199,21 @@ bool CloudGraphBuilder::buildFromPointCloud(const pcl::PointCloud<pcl::PointXYZ>
 
         for (const auto & S : cell_surfaces[static_cast<size_t>(nr * cols + nc)]) {
           if (S.count < config_.min_cluster_points) continue;
-          // 侧向障碍判据: 结构底面贴近本层踏面、顶面超过踏步极限 (楼梯踢面高差 <= max_step_height, 不会误判)
+          // 侧向障碍判据: 结构底面贴近本层踏面 (根长在行走平面附近, 排除悬空板),
+          // 顶面超过 "攀爬包络" 才判墙。攀爬包络: 从本踏面出发每前进一格 (resolution)
+          // 最多再爬一级 max_step_height —— 与 8 邻域建边 `|dz| <= max_step_height` 的
+          // 运动学口径保持一致, 因此格距 k = max(|dr|,|dc|) 的结构顶面在
+          // tread_z + k * max_step_height 以内, 视为可逐级攀爬的楼梯本体, 不判墙。
+          // 注意阈值必须随格距缩放: max_step_height 的物理含义是 "相邻两个落足点之间"
+          // 的单步抬腿极限, 仅在 k=1 (贴身) 时等于踏步极限线 tread_z + 0.25;
+          // 若对远处格子沿用固定 +0.25, 坡度 > atan(max_step_height / body_hard_radius)
+          // (约 51°) 的楼梯段会因累计高差越线被误判成墙, 建边扫掠随之剪光周边全部边,
+          // 整段楼梯断连 (实测 map-segment 二楼楼梯 A-B 两点度数归零)。k=1 时本判据
+          // 与原单级踢面判据完全一致, 贴身墙/转角内切防护不受影响。
+          const int k = std::max(std::abs(dr), std::abs(dc));
+          const float top_limit = tread_z + static_cast<float>(k * config_.max_step_height);
           if (!(S.z_bottom < tread_z + config_.max_step_height &&
-                S.z_top > tread_z + config_.max_step_height)) continue;
+                S.z_top > top_limit)) continue;
 
           if (d <= config_.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
           float soft = 0.7f * (config_.footprint_radius - d) / soft_band; // 距离衰减软代价 (上限0.7, 低于前端0.8禁行显示阈值)
