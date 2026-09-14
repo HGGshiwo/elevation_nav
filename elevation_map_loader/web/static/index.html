@@ -31,6 +31,19 @@
             display: none;
             z-index: 10;
         }
+        #costmap-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(30,30,30,0.92);
+            padding: 15px;
+            border-radius: 8px;
+            width: 330px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            border: 1px solid #444;
+            display: none;
+            z-index: 10;
+        }
         .debug-title {
             margin: 0 0 10px 0;
             color: #2196F3;
@@ -72,6 +85,7 @@
             <label><input type="radio" name="tool" value="start"> 设起点</label>
             <label><input type="radio" name="tool" value="goal"> 设终点</label>
             <label><input type="radio" name="tool" value="debug"> 调试方块</label>
+            <label><input type="radio" name="tool" value="costmap_debug"> 调试代价地图</label>
         </div>
         <div class="row">
             <span>目标图层:</span>
@@ -93,6 +107,7 @@
             <label><input type="checkbox" id="show-emergency-stop"> 紧急制动探针</label>
             <label><input type="checkbox" id="show-robot" checked> 狗定位(蓝)</label>
             <label><input type="checkbox" id="show-local-costmap" checked> 局部地图(流形)</label>
+            <label><input type="checkbox" id="show-costmap-debug"> 地毯调试染色</label>
             <label><input type="checkbox" id="show-local-path" checked> 局部规划(黄)</label>
             <label><input type="checkbox" id="follow-robot"> 跟随视角</label>
         </div>
@@ -157,9 +172,43 @@
             <span id="debug-node-source">-</span>
         </div>
 
+        <hr style="border-color: #444; margin: 8px 0;">
+
         <div style="display: flex; gap: 8px; margin-top: 10px;">
             <button id="btn-copy-debug" style="flex: 1; background: #2196F3;">一键复制诊断</button>
             <button id="btn-clear-debug" style="background: #555;">清空选择</button>
+        </div>
+    </div>
+    <div id="costmap-panel">
+        <div class="debug-title">代价地图格子诊断</div>
+        <div style="font-size: 11px; color: #aaa; margin-bottom: 8px;">点击地毯任意格子，查询该格代价与成因（配合"地毯调试染色"开关按成因染色）</div>
+        <div style="font-size: 10px; color: #bbb; margin-bottom: 8px; line-height: 1.6;">
+            <span style="color:#c084fc;">■</span> 无节点盖章
+            <span style="color:#69f0ae;">■</span> 自由
+            <span style="color:#ffab40;">■</span> 软代价
+            <span style="color:#ff5722;">■</span> 净空不足
+            <span style="color:#ff5252;">■</span> 侧向阻挡
+            <span style="color:#ff00ff;">■</span> 拓扑缝
+            <span style="color:#ffeb3b;">■</span> 闭运算填充
+        </div>
+        <div class="row"><span>格子坐标 (r, c):</span> <span id="cm-cell-rc">-</span></div>
+        <div class="row"><span>世界坐标 (X, Y):</span> <span id="cm-cell-xy">-</span></div>
+        <div class="row"><span>代价值:</span> <span id="cm-cell-cost">-</span></div>
+        <div class="row"><span>成因分类:</span> <span id="cm-cell-reason">-</span></div>
+        <div class="row" style="align-items: flex-start;">
+            <span>实际盖章节点:</span>
+            <span id="cm-cell-winner" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #4dd0e1;">-</span>
+        </div>
+        <div class="row" style="align-items: flex-start;">
+            <span>成因说明:</span>
+            <span id="cm-cell-detail" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #c084fc;">-</span>
+        </div>
+        <div class="row" style="align-items: flex-start;">
+            <span>最近踏面节点:</span>
+            <span id="cm-cell-nearest" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word;">-</span>
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 10px;">
+            <button id="btn-copy-costmap" style="flex: 1; background: #2196F3;">一键复制诊断</button>
         </div>
     </div>
     <div id="canvas-container"></div>

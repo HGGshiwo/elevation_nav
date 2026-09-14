@@ -50,7 +50,6 @@ public:
     private_nh.param<double>("footprint_radius", cfg.footprint_radius, 0.30);
     private_nh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.15);
     private_nh.param<double>("sweep_penalty_weight", cfg.sweep_penalty_weight, 1.0);
-    private_nh.param<double>("foot_clearance", cfg.foot_clearance, 0.05);
     private_nh.param<int>("sor_mean_k", cfg.sor_mean_k, 16);
     private_nh.param<double>("sor_std_mul", cfg.sor_std_mul, 1.5);
     private_nh.param<double>("cluster_height_diff", cfg.cluster_height_diff, 0.08);
@@ -97,6 +96,25 @@ public:
     smoothed_path.header.frame_id = map_frame_;
     smoother_.smooth(raw_path, graph_, smoothed_path);
     plan = smoothed_path.poses;
+
+    // 朝向沿路径方向重算: A* 输出的单位四元数 (yaw=0) 会被 TEB
+    // (global_plan_overwrite_orientation=false) 当作各航点的目标航向,
+    // 行进方向与 yaw=0 夹角大时 TEB 优化出倒车进入目标的轨迹
+    // (max_vel_x_backwards 通道), 机器狗表现为倒着走。
+    // 按相邻航点差分计算行进方向并写入 yaw, 机头始终朝向前方。
+    for (size_t i = 0; i < plan.size(); ++i)
+    {
+      const size_t i0 = (i > 0) ? i - 1 : i;
+      const size_t i1 = (i + 1 < plan.size()) ? i + 1 : i;
+      const double dx = plan[i1].pose.position.x - plan[i0].pose.position.x;
+      const double dy = plan[i1].pose.position.y - plan[i0].pose.position.y;
+      if (std::hypot(dx, dy) < 1e-4) continue; // 垂直段 (楼梯井跨层) 保持上一朝向
+      const double yaw = std::atan2(dy, dx);
+      plan[i].pose.orientation.x = 0.0;
+      plan[i].pose.orientation.y = 0.0;
+      plan[i].pose.orientation.z = std::sin(yaw * 0.5);
+      plan[i].pose.orientation.w = std::cos(yaw * 0.5);
+    }
 
     // latched 兼容发布: Web 端与旧消费者订阅 /elevation_global_plan
     smoothed_path.header.stamp = ros::Time::now();

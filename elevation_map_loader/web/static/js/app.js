@@ -69,7 +69,7 @@ const mapStorage = initMapStorage(layers, () => {
 // 3.3 栅格与交互编辑模块 (接入 3D 流形吸附)
 const editor = initEditor(scene, camera, renderer, controls, layers, editPlane, (layerName) => {
     mapStorage.markDirty(layerName);
-}, graphVisualizer);
+}, graphVisualizer, localCostmapVisualizer, roamController);
 
 // 3.4 WebSocket 全双工流式同步模块 (支持流形图、局部代价地图与点云直通数据)
 const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, localCostmapVisualizer);
@@ -78,6 +78,11 @@ const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, gr
 // 局部代价地图显隐控制
 document.getElementById('show-local-costmap')?.addEventListener('change', (e) => {
     localCostmapVisualizer.setVisible(e.target.checked);
+});
+
+// 代价地图调试染色模式 (按逐格成因码染色, 配合"调试方块"工具点击格子诊断)
+document.getElementById('show-costmap-debug')?.addEventListener('change', (e) => {
+    localCostmapVisualizer.setDebugMode(e.target.checked);
 });
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----

@@ -6,6 +6,7 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/OccupancyGrid.h>
 #include <nav_msgs/Path.h>
+#include <std_msgs/Int32MultiArray.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <tf2_ros/transform_listener.h>
@@ -58,6 +59,8 @@ private:
   ros::Subscriber cloud_sub_;
   ros::Subscriber plan_sub_;
   ros::Publisher costmap_pub_; // 方便 RViz/Web 可视化
+  ros::Publisher debug_pub_;       // 逐格成因码调试图层 (与地毯同几何, data=CellReason)
+  ros::Publisher debug_nodes_pub_; // 逐格胜出节点 id (Int32MultiArray: [w, h, id...])
 
   std::string map_frame_{"map"};
   std::string base_frame_{"base_link"};
@@ -84,6 +87,8 @@ private:
 
   // 内部缓存的最新的 1:1 地图
   nav_msgs::OccupancyGrid cached_grid_;
+  nav_msgs::OccupancyGrid cached_debug_;
+  std_msgs::Int32MultiArray cached_debug_nodes_;
   bool has_cached_grid_{false};
   std::mutex grid_mutex_;
 

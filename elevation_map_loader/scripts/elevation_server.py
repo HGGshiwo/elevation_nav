@@ -240,6 +240,8 @@ async def websocket_live(websocket: WebSocket):
     last_nodes_v = -1
     last_edges_v = -1
     last_costmap_v = -1
+    last_costmap_debug_v = -1
+    last_costmap_debug_nodes_v = -1
     try:
         while True:
             state = ros_bridge.get_live_state()
@@ -266,6 +268,16 @@ async def websocket_live(websocket: WebSocket):
                 frame["local_costmap"] = state["local_costmap"]
                 frame["local_costmap_version"] = state["local_costmap_version"]
                 last_costmap_v = state["local_costmap_version"]
+
+            if state.get("local_costmap_debug_version", 0) != last_costmap_debug_v and state.get("local_costmap_debug"):
+                frame["local_costmap_debug"] = state["local_costmap_debug"]
+                frame["local_costmap_debug_version"] = state["local_costmap_debug_version"]
+                last_costmap_debug_v = state["local_costmap_debug_version"]
+
+            if state.get("local_costmap_debug_nodes_version", 0) != last_costmap_debug_nodes_v and state.get("local_costmap_debug_nodes"):
+                frame["local_costmap_debug_nodes"] = state["local_costmap_debug_nodes"]
+                frame["local_costmap_debug_nodes_version"] = state["local_costmap_debug_nodes_version"]
+                last_costmap_debug_nodes_v = state["local_costmap_debug_nodes_version"]
 
             await websocket.send_text(json.dumps(frame))
             await asyncio.sleep(0.1)  # 10Hz 稳定推送

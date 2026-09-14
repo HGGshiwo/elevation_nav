@@ -6,6 +6,9 @@
 #include <pcl/point_types.h>
 #include <tf2/utils.h>
 
+#include <cmath>
+#include <unordered_map>
+
 PLUGINLIB_EXPORT_CLASS(elevation_costmap::ManifoldCostmapLayer, costmap_2d::Layer)
 
 namespace elevation_costmap
@@ -61,7 +64,6 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<double>("footprint_radius",   build_cfg.footprint_radius, 0.30);
   private_nh.param<double>("body_hard_radius",   build_cfg.body_hard_radius, 0.15);
   private_nh.param<double>("sweep_penalty_weight", build_cfg.sweep_penalty_weight, 1.0);
-  private_nh.param<double>("foot_clearance",     build_cfg.foot_clearance, 0.05);
   private_nh.param<int>   ("sor_mean_k",         build_cfg.sor_mean_k, 16);
   private_nh.param<double>("sor_std_mul",        build_cfg.sor_std_mul, 1.5);
   private_nh.param<double>("cluster_height_diff", build_cfg.cluster_height_diff, 0.08);
@@ -78,6 +80,8 @@ void ManifoldCostmapLayer::onInitialize()
   cloud_sub_ = nh.subscribe(cloud_topic_, 1, &ManifoldCostmapLayer::cloudCallback, this);
   plan_sub_  = nh.subscribe(plan_topic_,  1, &ManifoldCostmapLayer::planCallback,  this);
   costmap_pub_ = nh.advertise<nav_msgs::OccupancyGrid>("/elevation_local_costmap", 1, /*latch=*/true);
+  debug_pub_ = nh.advertise<nav_msgs::OccupancyGrid>("/elevation_local_costmap_debug", 1, /*latch=*/true);
+  debug_nodes_pub_ = nh.advertise<std_msgs::Int32MultiArray>("/elevation_local_costmap_debug_nodes", 1, /*latch=*/true);
 
   // 启动后台高频融合与地毯构建线程 (10Hz)
   worker_running_ = true;
@@ -238,15 +242,48 @@ void ManifoldCostmapLayer::fusionAndCarpetLoop()
       }
 
       nav_msgs::OccupancyGrid grid;
+      std::vector<int8_t> reasons;
+      std::vector<int32_t> winner_ids;
       geometry_msgs::TransformStamped dummy_tf;
-      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf))
+      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf, &reasons, &winner_ids))
       {
+        // 成因码调试图层: 与地毯同几何, data 逐格 CellReason (供 Web 点击诊断)
+        nav_msgs::OccupancyGrid debug_grid = grid;
+        debug_grid.data.assign(reasons.begin(), reasons.end());
+
+        // 逐格胜出节点 id + 胜出节点坐标表 (供前端精确显示盖章节点):
+        // [w, h, 表条数T, 胜出id×(w*h), (id, x_mm, y_mm, z_mm, trav_x100)×T]
+        // 坐标以毫米整数编码, 融合图/全局图模式下均可精确对照
+        std::unordered_map<int32_t, const elevation_planner::GraphNode *> winner_table;
+        for (int32_t id : winner_ids)
+        {
+          if (id >= 0) winner_table.emplace(id, &active_graph->getNode(static_cast<uint32_t>(id)));
+        }
+        std_msgs::Int32MultiArray debug_nodes;
+        debug_nodes.data.reserve(3 + winner_ids.size() + 5 * winner_table.size());
+        debug_nodes.data.push_back(static_cast<int32_t>(grid.info.width));
+        debug_nodes.data.push_back(static_cast<int32_t>(grid.info.height));
+        debug_nodes.data.push_back(static_cast<int32_t>(winner_table.size()));
+        for (int32_t id : winner_ids) debug_nodes.data.push_back(id);
+        for (const auto & kv : winner_table)
+        {
+          const auto & nd = *kv.second;
+          debug_nodes.data.push_back(kv.first);
+          debug_nodes.data.push_back(static_cast<int32_t>(std::lround(nd.x * 1000.0)));
+          debug_nodes.data.push_back(static_cast<int32_t>(std::lround(nd.y * 1000.0)));
+          debug_nodes.data.push_back(static_cast<int32_t>(std::lround(nd.z * 1000.0)));
+          debug_nodes.data.push_back(static_cast<int32_t>(std::lround(nd.traversability * 100.0f)));
+        }
         {
           std::lock_guard<std::mutex> lock(grid_mutex_);
           cached_grid_ = grid;
+          cached_debug_ = debug_grid;
+          cached_debug_nodes_ = debug_nodes;
           has_cached_grid_ = true;
         }
         costmap_pub_.publish(grid);
+        debug_pub_.publish(debug_grid);
+        debug_nodes_pub_.publish(debug_nodes);
       }
     }
   }

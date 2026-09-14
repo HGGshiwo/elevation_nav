@@ -32,6 +32,14 @@ int main()
       graph.addNode(node);
     }
   }
+  // 相邻节点补边: 楼梯逐级可达 (无边则缝绘制会在整幅地毯上刻出致命格线)
+  for (int r = 0; r <= 30; ++r)
+    for (int c = -5; c <= 5; ++c)
+    {
+      const int id = r * 11 + (c + 5);
+      if (r < 30) { graph.addEdge(id, id + 11, 0.1f); graph.addEdge(id + 11, id, 0.1f); }
+      if (c < 5)  { graph.addEdge(id, id + 1, 0.1f);  graph.addEdge(id + 1, id, 0.1f); }
+    }
   graph.finalizeCSR();
 
   std::cout << "  Graph built with " << graph.numNodes() << " nodes." << std::endl;
@@ -141,6 +149,193 @@ int main()
             << static_cast<int>(grid_1f.data[idx_center])
             << " (Expected 0 for 1F floor)" << std::endl;
   assert(grid_1f.data[idx_center] == 0);
+
+  // 8. 形态学闭运算: 图节点缺失 1~2 格应被填充为自由, 大片真实空洞必须保留
+  //    (满铺踏面上挖掉 (50,50) 单节点 -> 伪影补丁; 挖掉 3x3 连片 -> 真实空洞)
+  {
+    elevation_planner::ManifoldGraph g2;
+    g2.initSpatialGrid(0.10, -5.0, -5.0, 100, 100);
+    for (int r = 40; r <= 60; ++r)
+      for (int c = 40; c <= 60; ++c)
+      {
+        if (r == 50 && c == 50) continue;                       // 单点缺失
+        if (r >= 55 && r <= 57 && c >= 55 && c <= 57) continue; // 3x3 连片缺失
+        elevation_planner::GraphNode n;
+        n.x = static_cast<float>(r * 0.10); n.y = static_cast<float>(c * 0.10);
+        n.z = 0.0f; n.traversability = 0.0f; n.headroom = 2.0f;
+        n.row = r; n.col = c; n.layer_id = 0;
+        g2.addNode(n);
+      }
+    // 相邻节点补边 (可通行点阵内部全部连通, 缝绘制只应由缺格边界触发)
+    for (int r = 40; r <= 60; ++r)
+      for (int c = 40; c <= 60; ++c)
+      {
+        if (r == 50 && c == 50) continue;
+        if (r >= 55 && r <= 57 && c >= 55 && c <= 57) continue;
+        const int id = (r - 40) * 21 + (c - 40);
+        auto present = [](int rr, int cc) {
+          return rr >= 40 && rr <= 60 && cc >= 40 && cc <= 60 &&
+                 !(rr == 50 && cc == 50) &&
+                 !(rr >= 55 && rr <= 57 && cc >= 55 && cc <= 57);
+        };
+        if (present(r + 1, c)) { g2.addEdge(id, id + 21, 0.1f); g2.addEdge(id + 21, id, 0.1f); }
+        if (present(r, c + 1)) { g2.addEdge(id, id + 1, 0.1f);  g2.addEdge(id + 1, id, 0.1f); }
+      }
+    g2.finalizeCSR();
+
+    elevation_costmap::ManifoldCostmapBuilderConfig cfg_h;
+    cfg_h.map_width = 3.0; cfg_h.map_length = 3.0; cfg_h.resolution = 0.05;
+    elevation_costmap::ManifoldCostmapBuilder builder_h(cfg_h);
+
+    geometry_msgs::Pose bot_h;
+    bot_h.position.x = 5.0; bot_h.position.y = 5.0; bot_h.position.z = 0.0;
+    bot_h.orientation.w = 1.0;
+
+    nav_msgs::OccupancyGrid grid_h;
+    geometry_msgs::TransformStamped tf_h;
+    bool ok_h = builder_h.buildCostmap(g2, bot_h, {}, grid_h, tf_h);
+    assert(ok_h);
+
+    auto cellCostAt = [&](double wx, double wy) -> int {
+      int cc = static_cast<int>(std::floor((wx - grid_h.info.origin.position.x) / 0.05));
+      int rr = static_cast<int>(std::floor((wy - grid_h.info.origin.position.y) / 0.05));
+      if (cc < 0 || cc >= static_cast<int>(grid_h.info.width) ||
+          rr < 0 || rr >= static_cast<int>(grid_h.info.height)) return -1;
+      return grid_h.data[static_cast<size_t>(rr * grid_h.info.width + cc)];
+    };
+    int single_hole_cost = cellCostAt(5.05, 5.05); // 单节点缺失中心
+    int real_void_cost = cellCostAt(5.60, 5.60);   // 3x3 连片缺失中心
+    std::cout << "  Closing test: single-hole cell = " << single_hole_cost
+              << " (expect <100, filled), 3x3 void cell = " << real_void_cost
+              << " (expect 100, preserved)" << std::endl;
+    assert(single_hole_cost >= 0 && single_hole_cost < 100);
+    assert(real_void_cost == 100);
+  }
+
+  // 9. 拓扑缝绘制: 相邻图格可通行但无边 -> 交界致命; 有边 -> 连续自由
+  {
+    auto buildPairGraph = [](bool with_edge) {
+      elevation_planner::ManifoldGraph g;
+      g.initSpatialGrid(0.10, -5.0, -5.0, 100, 100);
+      for (int k = 0; k < 2; ++k)
+      {
+        elevation_planner::GraphNode n;
+        n.x = 0.25f; n.y = 0.25f + 0.10f * k;  // 相邻两格 (52,52) 与 (52,53)
+        n.z = 0.0f; n.traversability = 0.0f; n.headroom = 2.0f;
+        n.row = 52; n.col = 52 + k; n.layer_id = 0;
+        g.addNode(n);
+      }
+      if (with_edge) { g.addEdge(0, 1, 0.1f); g.addEdge(1, 0, 0.1f); }
+      g.finalizeCSR();
+      return g;
+    };
+
+    elevation_costmap::ManifoldCostmapBuilderConfig cfg_s;
+    cfg_s.map_width = 3.0; cfg_s.map_length = 3.0; cfg_s.resolution = 0.05;
+    elevation_costmap::ManifoldCostmapBuilder builder_s(cfg_s);
+    geometry_msgs::Pose bot_s;
+    bot_s.position.x = 0.25; bot_s.position.y = 0.30; bot_s.position.z = 0.0;
+    bot_s.orientation.w = 1.0;
+
+    auto seamCellCost = [&](nav_msgs::OccupancyGrid & grid) -> int {
+      // 交界线 y = -5 + 53*0.1 = 0.3, 条带覆盖 y in [0.275, 0.325)
+      int ic = static_cast<int>(std::floor((0.25 - grid.info.origin.position.x) / 0.05));
+      int ir = static_cast<int>(std::floor((0.28 - grid.info.origin.position.y) / 0.05));
+      return grid.data[static_cast<size_t>(ir * grid.info.width + ic)];
+    };
+
+    nav_msgs::OccupancyGrid g_no_edge, g_with_edge;
+    geometry_msgs::TransformStamped tf_s;
+    std::vector<int8_t> reasons_no_edge, reasons_with_edge;
+    std::vector<int32_t> ids_no_edge, ids_with_edge;
+    assert(builder_s.buildCostmap(buildPairGraph(false), bot_s, {}, g_no_edge, tf_s, &reasons_no_edge, &ids_no_edge));
+    assert(builder_s.buildCostmap(buildPairGraph(true), bot_s, {}, g_with_edge, tf_s, &reasons_with_edge, &ids_with_edge));
+    const int no_edge_cost = seamCellCost(g_no_edge);
+    const int with_edge_cost = seamCellCost(g_with_edge);
+    std::cout << "  Seam test: no-edge boundary cell = " << no_edge_cost
+              << " (expect 100), with-edge cell = " << with_edge_cost
+              << " (expect 0)" << std::endl;
+    assert(no_edge_cost == 100);
+    assert(with_edge_cost == 0);
+
+    // 成因码追踪: 缝格=REASON_SEAM, 有边同格=REASON_FREE_NODE, 地图远角=REASON_NO_NODE
+    auto reasonAt = [&](std::vector<int8_t> & reasons, nav_msgs::OccupancyGrid & grid,
+                        double wx, double wy) -> int8_t {
+      int ic = static_cast<int>(std::floor((wx - grid.info.origin.position.x) / 0.05));
+      int ir = static_cast<int>(std::floor((wy - grid.info.origin.position.y) / 0.05));
+      return reasons[static_cast<size_t>(ir * grid.info.width + ic)];
+    };
+    const int8_t seam_reason = reasonAt(reasons_no_edge, g_no_edge, 0.25, 0.28);
+    const int8_t free_reason = reasonAt(reasons_with_edge, g_with_edge, 0.25, 0.28);
+    const int8_t far_reason = reasonAt(reasons_no_edge, g_no_edge, -1.2, -1.2);
+    std::cout << "  Reason test: seam=" << static_cast<int>(seam_reason)
+              << " (expect " << static_cast<int>(elevation_costmap::REASON_SEAM) << "), free=" << static_cast<int>(free_reason)
+              << " (expect " << static_cast<int>(elevation_costmap::REASON_FREE_NODE) << "), far=" << static_cast<int>(far_reason)
+              << " (expect " << static_cast<int>(elevation_costmap::REASON_NO_NODE) << ")" << std::endl;
+    assert(seam_reason == elevation_costmap::REASON_SEAM);
+    assert(free_reason == elevation_costmap::REASON_FREE_NODE);
+    assert(far_reason == elevation_costmap::REASON_NO_NODE);
+
+    // 胜出节点 id: 自由格=实际盖章节点(0或1), 缝格=-1, 远角=-1
+    auto idAt = [&](std::vector<int32_t> & ids, nav_msgs::OccupancyGrid & grid,
+                    double wx, double wy) -> int32_t {
+      int ic = static_cast<int>(std::floor((wx - grid.info.origin.position.x) / 0.05));
+      int ir = static_cast<int>(std::floor((wy - grid.info.origin.position.y) / 0.05));
+      return ids[static_cast<size_t>(ir * grid.info.width + ic)];
+    };
+    const int32_t free_id = idAt(ids_with_edge, g_with_edge, 0.25, 0.28);
+    const int32_t seam_id = idAt(ids_no_edge, g_no_edge, 0.25, 0.28);
+    const int32_t far_id = idAt(ids_no_edge, g_no_edge, -1.2, -1.2);
+    std::cout << "  NodeId test: free_id=" << free_id << " (expect 0/1), seam_id=" << seam_id
+              << " (expect -1), far_id=" << far_id << " (expect -1)" << std::endl;
+    assert(free_id == 0 || free_id == 1);
+    assert(seam_id == -1);
+    assert(far_id == -1);
+  }
+
+  // 10. 地毯连通性验证: 图上联通但地毯上不连通的自由区 (绕道图外到达的透印) 转致命
+  {
+    // 机器人踩在节点 0 (0,0,0); 节点 1 (1.5,0,0) 与节点 0 有边 (桥),
+    // 但两者之间的地毯格无任何节点覆盖 —— 自由区在地毯上互不连通
+    elevation_planner::ManifoldGraph g3;
+    g3.initSpatialGrid(0.10, -5.0, -5.0, 100, 100);
+    for (int k = 0; k < 2; ++k)
+    {
+      elevation_planner::GraphNode n;
+      n.x = k == 0 ? 0.0f : 1.5f;
+      n.y = 0.0f; n.z = 0.0f;
+      n.traversability = 0.0f; n.headroom = 2.0f;
+      n.row = 50; n.col = 50 + k * 15; n.layer_id = 0;
+      g3.addNode(n);
+    }
+    g3.addEdge(0, 1, 0.1f); g3.addEdge(1, 0, 0.1f);
+    g3.finalizeCSR();
+
+    elevation_costmap::ManifoldCostmapBuilderConfig cfg_u;
+    cfg_u.map_width = 3.0; cfg_u.map_length = 3.0; cfg_u.resolution = 0.05;
+    elevation_costmap::ManifoldCostmapBuilder builder_u(cfg_u);
+    geometry_msgs::Pose bot_u;
+    bot_u.position.x = 0.0; bot_u.position.y = 0.0; bot_u.position.z = 0.0;
+    bot_u.orientation.w = 1.0;
+
+    nav_msgs::OccupancyGrid grid_u;
+    geometry_msgs::TransformStamped tf_u;
+    std::vector<int8_t> reasons_u;
+    assert(builder_u.buildCostmap(g3, bot_u, {}, grid_u, tf_u, &reasons_u));
+
+    auto costAtU = [&](double wx, double wy) -> int {
+      int ic = static_cast<int>(std::floor((wx - grid_u.info.origin.position.x) / 0.05));
+      int ir = static_cast<int>(std::floor((wy - grid_u.info.origin.position.y) / 0.05));
+      return grid_u.data[static_cast<size_t>(ir * grid_u.info.width + ic)];
+    };
+    const int near_robot = costAtU(0.05, 0.0);   // 机器人区域: 保持自由
+    const int far_island = costAtU(1.5, 0.0);    // 桥对端孤立区: 透印, 转致命
+    std::cout << "  Unreached test: robot-region cell = " << near_robot
+              << " (expect 0), isolated bridge-end cell = " << far_island
+              << " (expect 100)" << std::endl;
+    assert(near_robot == 0);
+    assert(far_island == 100);
+  }
 
   std::cout << "[TestManifoldCostmapBuilder] ALL ASSERTIONS PASSED!" << std::endl;
   return 0;

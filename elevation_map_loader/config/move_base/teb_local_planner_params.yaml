@@ -40,7 +40,10 @@ TebLocalPlannerROS:
   feasibility_check_no_poses: 1
 
   # ---- 障碍物与代价地图避障 (主动提前外绕) ----
-  min_obstacle_dist: 0.04
+  # min_obstacle_dist 为轨迹到障碍的硬下限 (从八边形轮廓边界量起):
+  # 0.04 属贴脸距离, 无任何误差缓冲; 0.08 给出安全余量同时保持窄通道可通过
+  # (机身宽 0.26m + 2*0.08 = 0.42m 净走廊需求)
+  min_obstacle_dist: 0.08
   include_costmap_obstacles: true
   costmap_obstacles_behind_robot_dist: 1.0
   obstacle_poses_affected: 15
@@ -58,7 +61,9 @@ TebLocalPlannerROS:
   weight_acc_lim_y: 1.0
   weight_acc_lim_theta: 1.0
   weight_kinematics_nh: 1.0
-  weight_kinematics_forward_drive: 2.0
+  # 前进偏好: 路径朝向已按行进方向重算 (全局规划器), 此权重保证目标点接近段
+  # 始终正脸进入而非倒车 (倒车通道 max_vel_x_backwards 仍作紧急退出用)
+  weight_kinematics_forward_drive: 5.0
   weight_kinematics_turning_radius: 0.0
   weight_optimaltime: 0.5
   weight_obstacle: 20.0

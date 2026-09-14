@@ -42,11 +42,12 @@ bool findNearestNodeAny(const ManifoldGraph & graph, double qx, double qy, doubl
 }
 
 // 机体胶囊扫掠硬碰撞: 沿 u->v 线段采样, 硬半径内出现 "本行走层" 的禁行节点即剐蹭。
-// 垂直方向仅做选层切一刀: 只算 [sz - foot_clearance, sz + dog_height] 内的禁行节点——
-// 脚平面以下的禁行节点是被踩的楼梯结构/其他层, 不参与水平胶囊判定
+// 垂直方向仅做选层切一刀: 只算 [sz, sz + dog_height] 内的禁行节点——
+// 身体在脚平面以上, 行走面以下的点 (被踩的台阶/下层楼板/矮沿) 碰不到身体;
+// 与行走面同高的禁行点仍算碰撞 (低顶通道以同高禁行点标记)
 // (建边丢弃与诊断报因共用同一判据, 保证口径一致)
 bool segmentHitsHardInflation(const ManifoldGraph & graph, const GraphNode & u, const GraphNode & v,
-                              double hard_radius, double dog_height, double foot_clearance, double res)
+                              double hard_radius, double dog_height, double res)
 {
   const int rad = std::max(1, static_cast<int>(std::ceil(hard_radius / res)));
   const float seg_len = std::hypot(v.x - u.x, v.y - u.y);
@@ -63,8 +64,9 @@ bool segmentHitsHardInflation(const ManifoldGraph & graph, const GraphNode & u, 
         if (std::hypot(dr, dc) * res > hard_radius) continue;
         for (uint32_t nid : graph.getSpatialCellNodes(r + dr, c + dc)) {
           const auto & nd = graph.getNode(nid);
-          if (nd.traversability >= 0.95f &&
-              nd.z >= sz - foot_clearance && nd.z <= sz + dog_height) return true;
+          if (nd.traversability < 0.95f ||
+              nd.z < sz || nd.z > sz + dog_height) continue;
+          return true;
         }
       }
     }
@@ -324,9 +326,14 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
       for (size_t s = 0; s < surfaces.size(); ++s) {
         if (surfaces[s].count < config_.min_cluster_points) continue;
 
+        // 净空只对 "达到最小点数门槛" 的面层计算: 相邻踏面边缘溢入的杂散点
+        // 会形成 n=1 的假面层, 若不过滤, 单个噪声点即可在本踏面上方 0.1~0.2m 处
+        // 伪装出 "天花板", 把节点误判为顶头禁行, 并经建边胶囊扫掠剪光周边全部边
         float headroom = 3.0f; // 默认室外无上顶
-        if (s + 1 < surfaces.size()) {
-          headroom = surfaces[s + 1].z_bottom - surfaces[s].z_top;
+        for (size_t up = s + 1; up < surfaces.size(); ++up) {
+          if (surfaces[up].count < config_.min_cluster_points) continue;
+          headroom = surfaces[up].z_bottom - surfaces[s].z_top;
+          break;
         }
 
         GraphNode node;
@@ -408,8 +415,7 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
   // 机体胶囊扫掠检查: 沿 u->v 线段采样, 硬半径内出现本行走层禁行节点则该步会剐蹭, 丢弃此边
   auto sweepHardCollision = [&](const GraphNode & u, const GraphNode & v) -> bool {
     return segmentHitsHardInflation(out_graph, u, v,
-                                    config_.body_hard_radius, config_.dog_height,
-                                    config_.foot_clearance, res);
+                                    config_.body_hard_radius, config_.dog_height, res);
   };
 
   // 机体扫掠软代价: 线段附近足印半径内的软膨胀区越多, 该边代价越高 (引导路径远离墙体)
@@ -431,7 +437,7 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
           for (uint32_t nid : out_graph.getSpatialCellNodes(r + dr, c + dc)) {
             const auto & nd = out_graph.getNode(nid);
             if (nd.traversability > 0.05f && nd.traversability < 0.95f &&
-                nd.z >= sz - config_.foot_clearance && nd.z <= sz + config_.dog_height) {
+                nd.z >= sz && nd.z <= sz + config_.dog_height) {
               worst = std::max(worst, nd.traversability);
             }
           }
@@ -666,7 +672,7 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
       if (reachable) {
         reasons.push_back("两点在同一连通域内, 经多跳短边链可达 (稀疏图无直连边属正常, A* 可正常规划)");
       } else if (segmentHitsHardInflation(graph, u, v, config_.body_hard_radius, config_.dog_height,
-                                          config_.foot_clearance, config_.resolution)) {
+                                          config_.resolution)) {
         reasons.push_back("机体扫掠碰撞: 两端虽可站立, 但连线剐蹭硬膨胀禁行区 (典型为转角内切)");
       } else {
         reasons.push_back("两踏面不属于同一层簇或不在搜索窗口内");

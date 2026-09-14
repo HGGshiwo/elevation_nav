@@ -84,6 +84,16 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             localCostmapVisualizer.update(frame.local_costmap);
         }
 
+        // 3.5 逐格成因码调试图层更新
+        if (frame.local_costmap_debug && localCostmapVisualizer) {
+            localCostmapVisualizer.updateDebug(frame.local_costmap_debug);
+        }
+
+        // 3.6 逐格胜出节点 id 调试图层更新
+        if (frame.local_costmap_debug_nodes && localCostmapVisualizer) {
+            localCostmapVisualizer.updateDebugNodes(frame.local_costmap_debug_nodes);
+        }
+
         // 4. 增量图层更新
         if (frame.layers) {
             Object.keys(frame.layers).forEach(layerName => {

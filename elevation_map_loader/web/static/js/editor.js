@@ -1,15 +1,17 @@
 import * as THREE from 'three';
+import { CELL_REASON_TEXT } from './local_costmap_visualizer.js';
 
 /**
  * 栅格地图交互与编辑模块 (Editor)
  * 完整实现：画笔、橡皮擦、设起点、设终点、Z轴编辑平面、游标拾取与体素增删
  * 按照要求：调试体素(debug)与调试空地(debug_air)保留完整面板切换与接口桩，待进一步确定
  */
-export function initEditor(scene, camera, renderer, controls, layers, editPlane, onDirty, graphVisualizer = null) {
+export function initEditor(scene, camera, renderer, controls, layers, editPlane, onDirty, graphVisualizer = null, costmapVisualizer = null, roamController = null) {
     const statusEl = document.getElementById('status');
     const brushSizeInput = document.getElementById('brush-size');
     const editLayerSelect = document.getElementById('edit-layer');
     const debugPanelDiv = document.getElementById('debug-panel');
+    const costmapPanelDiv = document.getElementById('costmap-panel');
     const btnCopyDebug = document.getElementById('btn-copy-debug');
 
     let currentTool = 'view';
@@ -39,20 +41,31 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             currentTool = e.target.value;
             if (currentTool === 'view') {
                 controls.enabled = true;
-                if (controls.mouseButtons) controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+                // 左键 = MC 式第一人称视角旋转 (RoamController 接管), 不再用 OrbitControls 环绕
+                if (controls.mouseButtons) controls.mouseButtons.LEFT = null;
             } else if (currentTool === 'brush' || currentTool === 'eraser') {
                 controls.enabled = false;
-            } else { // start, goal, debug: 左键用于交互拾取，右键保留视角旋转
+            } else { // start, goal, debug, costmap_debug: 左键用于交互拾取，右键保留视角旋转
                 controls.enabled = true;
                 if (controls.mouseButtons) controls.mouseButtons.LEFT = null;
             }
 
+            // MC 式视角旋转仅在拖动视角工具下启用, 其余工具左键留给拾取/绘制
+            if (roamController) roamController.cameraLookEnabled = (currentTool === 'view');
+
             if (currentTool === 'view') {
                 cursor.visible = false;
+            }
+            if (currentTool !== 'costmap_debug') {
+                // 离开代价地图调试工具时清除格子高亮
+                if (costmapVisualizer) costmapVisualizer.clearHighlight();
             }
             if (graphVisualizer) graphVisualizer.clearHoveredNode();
             if (debugPanelDiv) {
                 debugPanelDiv.style.display = (currentTool === 'debug') ? 'block' : 'none';
+            }
+            if (costmapPanelDiv) {
+                costmapPanelDiv.style.display = (currentTool === 'costmap_debug') ? 'block' : 'none';
             }
         });
     });
@@ -71,6 +84,16 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     // 射线拾取交互目标
     function getInteractionTarget() {
         raycaster.setFromCamera(mouse, camera);
+
+        // -1. 代价地图调试工具: 交互目标仅为贴地地毯格子
+        if (currentTool === 'costmap_debug') {
+            if (!costmapVisualizer || !costmapVisualizer.planeMesh) return null;
+            const carpetHits = raycaster.intersectObject(costmapVisualizer.planeMesh);
+            if (carpetHits.length > 0) {
+                return { type: 'costmap_cell', point: carpetHits[0].point };
+            }
+            return null;
+        }
 
         // 0. 若当前为设起点、设终点或调试方块，交互目标严格限制在 3D 流形踏面方块上！
         if (currentTool === 'start' || currentTool === 'goal' || currentTool === 'debug') {
@@ -360,6 +383,84 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         }
     }
 
+    // 代价地图格子诊断: 点击地毯空白处, 显示该格代价与成因 (成因码由 C++ 地毯构建器逐格记录)
+    function handleCostmapCellInspection(worldPoint) {
+        if (!costmapVisualizer) return;
+        const info = costmapVisualizer.highlightCell(worldPoint.x, worldPoint.y);
+        if (!info) {
+            if (statusEl) statusEl.innerText = '点击位置不在局部代价地图窗口内';
+            return;
+        }
+        const reasonInfo = CELL_REASON_TEXT ? CELL_REASON_TEXT[info.reason] : null;
+
+        const set = (id, text, color) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.innerText = text;
+            if (color) el.style.color = color;
+        };
+
+        set('cm-cell-rc', `(${info.r}, ${info.c})`);
+        set('cm-cell-xy', `(${info.x.toFixed(2)}, ${info.y.toFixed(2)})`);
+
+        let costText = String(info.cost);
+        let costColor = '#ddd';
+        if (info.cost === 100) { costText += ' (致命)'; costColor = '#ff5252'; }
+        else if (info.cost > 0) { costText += ' (软代价)'; costColor = '#ffab40'; }
+        else if (info.cost === 0) { costText += ' (自由)'; costColor = '#69f0ae'; }
+        set('cm-cell-cost', costText, costColor);
+
+        if (info.reason === null || info.reason === undefined) {
+            set('cm-cell-reason', '无调试图层数据', '#ffab40');
+            set('cm-cell-detail', '未收到 /elevation_local_costmap_debug, 请确认 elevation_costmap 已更新并重启', '#ffab40');
+        } else {
+            set('cm-cell-reason', reasonInfo ? reasonInfo.label : `未知 (${info.reason})`, reasonInfo ? reasonInfo.color : '#ddd');
+            set('cm-cell-detail', reasonInfo ? reasonInfo.detail : '-');
+        }
+
+        // 实际盖章节点 (C++ 地毯构建器逐格记录的胜出节点 id)
+        // 优先走 C++ 下发的胜出节点坐标表 (融合图/全局图模式均精确);
+        // 表缺失时降级用 allNodeList 下标对照 (仅全局图模式成立, 且要求节点在格子 15cm 内)
+        let winnerText = '-';
+        if (info.nodeId === null || info.nodeId === undefined) {
+            winnerText = '无节点图层数据';
+        } else if (info.nodeId < 0) {
+            winnerText = '无单一归属节点 (默认致命 / 拓扑缝 / 闭运算填充)';
+        } else {
+            const viaTable = costmapVisualizer.getWinnerNode ? costmapVisualizer.getWinnerNode(info.nodeId) : null;
+            if (viaTable) {
+                winnerText = `#${info.nodeId} (${viaTable.x.toFixed(2)}, ${viaTable.y.toFixed(2)}, z=${viaTable.z.toFixed(2)}) trav=${viaTable.trav.toFixed(2)}`;
+            } else {
+                const wn = (graphVisualizer && graphVisualizer.allNodeList &&
+                            info.nodeId < graphVisualizer.allNodeList.length)
+                    ? graphVisualizer.allNodeList[info.nodeId] : null;
+                if (wn && Math.hypot(wn.x - info.x, wn.y - info.y) <= 0.15) {
+                    winnerText = `#${info.nodeId} (${wn.x.toFixed(2)}, ${wn.y.toFixed(2)}, z=${wn.z.toFixed(2)}) trav=${Number(wn.traversability).toFixed(2)}`;
+                } else {
+                    winnerText = `#${info.nodeId} (坐标表缺失, 坐标不可对照)`;
+                }
+            }
+        }
+        set('cm-cell-winner', winnerText);
+
+        // 最近踏面节点 (从流形图节点缓存中查找, 附盖章半径判读)
+        let nearestText = '-';
+        if (graphVisualizer && graphVisualizer.allNodeList && graphVisualizer.allNodeList.length > 0) {
+            let best = null, bestD = Infinity;
+            for (const n of graphVisualizer.allNodeList) {
+                const d = Math.hypot(n.x - info.x, n.y - info.y);
+                if (d < bestD) { bestD = d; best = n; }
+            }
+            if (best) {
+                const stampR = 0.08;
+                const tag = bestD <= stampR ? '在盖章半径内' : `超出盖章半径 ${stampR}m`;
+                nearestText = `(${best.x.toFixed(2)}, ${best.y.toFixed(2)}, z=${best.z.toFixed(2)}) ` +
+                    `trav=${Number(best.traversability).toFixed(2)}, 距离 ${bestD.toFixed(3)}m (${tag})`;
+            }
+        }
+        set('cm-cell-nearest', nearestText);
+    }
+
     // 事件监听
     renderer.domElement.addEventListener('mousemove', (e) => {
         if (currentTool === 'view') {
@@ -379,6 +480,22 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 if (graphVisualizer) graphVisualizer.highlightHoveredNode(target.node);
             } else {
                 if (graphVisualizer) graphVisualizer.clearHoveredNode();
+            }
+            return;
+        }
+
+        // 代价地图调试模式: 悬停实时高亮对应格子, 点击时在 mousedown 中诊断
+        if (currentTool === 'costmap_debug') {
+            cursor.visible = false;
+            if (graphVisualizer) graphVisualizer.clearHoveredNode();
+            if (costmapVisualizer && costmapVisualizer.planeMesh) {
+                raycaster.setFromCamera(mouse, camera);
+                const carpetHits = raycaster.intersectObject(costmapVisualizer.planeMesh);
+                if (carpetHits.length > 0) {
+                    costmapVisualizer.highlightCell(carpetHits[0].point.x, carpetHits[0].point.y);
+                } else {
+                    costmapVisualizer.clearHighlight();
+                }
             }
             return;
         }
@@ -405,6 +522,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         cursor.visible = false;
         isPainting = false;
         if (graphVisualizer) graphVisualizer.clearHoveredNode();
+        if (costmapVisualizer) costmapVisualizer.clearHighlight();
     });
 
     renderer.domElement.addEventListener('mousedown', (e) => {
@@ -453,6 +571,10 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             if (target.type === 'snapped_node') {
                 handleDebugInspection(target.node);
             }
+        } else if (currentTool === 'costmap_debug') {
+            if (target && target.type === 'costmap_cell') {
+                handleCostmapCellInspection(target.point);
+            }
         }
     });
 
@@ -482,6 +604,26 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             }).catch(() => {});
         });
     }
+
+    // 代价地图格子诊断一键复制
+    document.getElementById('btn-copy-costmap')?.addEventListener('click', () => {
+        const get = (id) => document.getElementById(id)?.innerText.trim() || '-';
+        const text = [
+            '=== 代价地图格子诊断 ===',
+            `格子坐标 (r, c): ${get('cm-cell-rc')}`,
+            `世界坐标 (X, Y): ${get('cm-cell-xy')}`,
+            `代价值: ${get('cm-cell-cost')}`,
+            `成因分类: ${get('cm-cell-reason')}`,
+            `实际盖章节点: ${get('cm-cell-winner')}`,
+            `成因说明: ${get('cm-cell-detail')}`,
+            `最近踏面节点: ${get('cm-cell-nearest')}`
+        ].join('\n');
+        navigator.clipboard.writeText(text).then(() => {
+            if (statusEl) statusEl.innerText = '已复制代价地图诊断信息到剪贴板';
+        }).catch(() => {
+            alert('复制失败, 请手动选择文本复制');
+        });
+    });
 
     return {
         getCurrentTool: () => currentTool,

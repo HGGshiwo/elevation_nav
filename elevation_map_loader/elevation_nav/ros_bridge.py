@@ -9,13 +9,14 @@ import math
 import random
 import threading
 import base64
+from array import array
 from typing import Dict, Any, Optional, List
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped, Twist, TransformStamped
 from nav_msgs.msg import Path as ROSPath, Odometry, OccupancyGrid
 from actionlib_msgs.msg import GoalID
-from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString, Int32MultiArray
 from grid_map_msgs.msg import GridMap, GridMapInfo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
@@ -67,6 +68,12 @@ class ElevationRosBridge:
         # 局部代价地图缓存
         self.local_costmap: Optional[Dict[str, Any]] = None
         self.local_costmap_version = 0
+        # 局部代价地图逐格成因码 (调试图层)
+        self.local_costmap_debug: Optional[Dict[str, Any]] = None
+        self.local_costmap_debug_version = 0
+        # 局部代价地图逐格胜出节点 id (调试图层)
+        self.local_costmap_debug_nodes: Optional[Dict[str, Any]] = None
+        self.local_costmap_debug_nodes_version = 0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -156,6 +163,10 @@ class ElevationRosBridge:
             # 订阅局部代价地图 (1:1 流形局部代价地图与原生 local_costmap)
             rospy.Subscriber("/elevation_local_costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
             rospy.Subscriber("/move_base/local_costmap/costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
+            # 逐格成因码调试图层 (Web 点击诊断 "看不见的障碍")
+            rospy.Subscriber("/elevation_local_costmap_debug", OccupancyGrid, self._local_costmap_debug_callback, queue_size=1)
+            # 逐格胜出节点 id 调试图层 ([w, h, id...], id=-1 表示无节点)
+            rospy.Subscriber("/elevation_local_costmap_debug_nodes", Int32MultiArray, self._local_costmap_debug_nodes_callback, queue_size=1)
 
             # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
@@ -196,6 +207,26 @@ class ElevationRosBridge:
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 graph edges 异常: {e}")
 
+    def _local_costmap_debug_nodes_callback(self, msg: Int32MultiArray):
+        """解析逐格胜出节点 id 调试图层
+        新格式 [width, height, 表条数T, id×(w*h), (id, x_mm, y_mm, z_mm, trav_x100)×T]
+        整包透传给前端 (含宽高), 前端按相同布局解析"""
+        try:
+            if len(msg.data) < 3:
+                return
+            w, h = int(msg.data[0]), int(msg.data[1])
+            packed = array('i', msg.data).tobytes()
+            b64_str = base64.b64encode(packed).decode('ascii')
+            with self._lock:
+                self.local_costmap_debug_nodes = {
+                    "width": w,
+                    "height": h,
+                    "data": b64_str
+                }
+                self.local_costmap_debug_nodes_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 costmap debug nodes 异常: {e}")
+
     def _odom_callback(self, msg: Odometry):
         pos = msg.pose.pose.position
         ori = msg.pose.pose.orientation
@@ -230,13 +261,24 @@ class ElevationRosBridge:
             z = p.pose.position.z
             # 若局部规划器(如 ROS 原生 2D TEB)输出写死 z=0, 但实际机器人与地表处于 3D 高程下
             if abs(z) < 1e-3 and (gpath or abs(robot_z) > 0.05):
+                # 分层带过滤: 优先在机器人当前层 |dz| <= max_step_height 的航点里取 2D 最近。
+                # 跨层路径 (楼梯井/坡道) 在 2D 上重叠堆叠 —— 水平 0.4m 内可叠着 0.6m 与
+                # 4.5m 两层踏面, 无脑取 2D 最近会把局部轨迹投影到楼上/楼下的航点上,
+                # 黄线瞬移到完全错误的踏面高度。
                 best_z = robot_z
                 best_d2 = 999.0
-                for gx, gy, gz in gpath:
-                    d2 = (x - gx)**2 + (y - gy)**2
-                    if d2 < best_d2:
-                        best_d2 = d2
-                        best_z = gz
+                for band_only in (True, False):  # 先同层带, 带内无候选再放宽到全部航点
+                    found = False
+                    for gx, gy, gz in gpath:
+                        if band_only and abs(gz - robot_z) > self.max_step_height:
+                            continue
+                        d2 = (x - gx)**2 + (y - gy)**2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_z = gz
+                            found = True
+                    if found:
+                        break
                 z = best_z
             pts.append([round(x, 3), round(y, 3), round(z, 3)])
 
@@ -275,6 +317,31 @@ class ElevationRosBridge:
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 local costmap 异常: {e}")
 
+    def _local_costmap_debug_callback(self, msg: OccupancyGrid):
+        """解析逐格成因码调试图层 (与地毯同几何, 每格 CellReason 0~7)"""
+        try:
+            w = int(msg.info.width)
+            h = int(msg.info.height)
+            raw = bytearray(len(msg.data))
+            for i, val in enumerate(msg.data):
+                raw[i] = val if val >= 0 else 255
+            b64_str = base64.b64encode(raw).decode('ascii')
+            with self._lock:
+                self.local_costmap_debug = {
+                    "width": w,
+                    "height": h,
+                    "resolution": round(float(msg.info.resolution), 3),
+                    "origin": {
+                        "x": round(float(msg.info.origin.position.x), 3),
+                        "y": round(float(msg.info.origin.position.y), 3),
+                        "z": round(float(msg.info.origin.position.z), 3)
+                    },
+                    "data": b64_str
+                }
+                self.local_costmap_debug_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 costmap debug 异常: {e}")
+
     # ------------------ 仿真运动学积分与 TF/Odom 高频广播 (移植自 jie_octomap) ------------------
     def _cmd_vel_callback(self, msg: Twist):
         self.cmd_vx = msg.linear.x
@@ -294,6 +361,8 @@ class ElevationRosBridge:
 
         # 第一带: 机体当前层附近 (|dz| <= max_step_height)
         for p in nodes:
+            if p[3] >= 0.95:  # 禁行节点 (顶头净空/侧向阻挡) 不可作为贴地依据
+                continue
             dz = p[2] - fallback_z
             if abs(dz) > self.max_step_height:
                 continue
@@ -310,6 +379,8 @@ class ElevationRosBridge:
         # 第二带 (放宽): 当前层附近无踏面节点时, 扩大到机体上下活动窗口
         min_sq = 0.35 * 0.35
         for p in nodes:
+            if p[3] >= 0.95:
+                continue
             # 过滤掉远高于机体/天花板或深坑
             if p[2] > fallback_z + 0.5 or p[2] < fallback_z - 1.8:
                 continue
@@ -574,7 +645,11 @@ class ElevationRosBridge:
                 "graph_edges": list(self.graph_edges),
                 "graph_edges_version": self.graph_edges_version,
                 "local_costmap": dict(self.local_costmap) if self.local_costmap else None,
-                "local_costmap_version": self.local_costmap_version
+                "local_costmap_version": self.local_costmap_version,
+                "local_costmap_debug": dict(self.local_costmap_debug) if self.local_costmap_debug else None,
+                "local_costmap_debug_version": self.local_costmap_debug_version,
+                "local_costmap_debug_nodes": dict(self.local_costmap_debug_nodes) if self.local_costmap_debug_nodes else None,
+                "local_costmap_debug_nodes_version": self.local_costmap_debug_nodes_version
             }
 
 
