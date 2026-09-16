@@ -348,11 +348,13 @@ void ManifoldObstacleExtractor::extractIsolatedCircularObstacles(const elevation
            !(nd.flags & elevation_planner::node_flags::BLOCK_HEADROOM);
   };
 
-  // 方案 3：区分实体立柱与低净空地板
-  // 仅因头顶净空不足被阻挡的踏面（如楼梯下方、桌底）是负向不可走区域，而非突起的实体立柱
+  // 纯净立柱提取规则：
+  // 1. 排除仅因头顶净空不足标记禁行的踏面 (如楼梯下方、桌底是负向不可走区域，而非突起的实体立柱)
+  // 2. 排除贴墙侧向膨胀标记的地面/台阶节点 (BLOCK_LATERAL 已由 LineObstacle3D 沿边界防护，严禁重复生成假立柱)
   auto isSolidObstacle = [&](const elevation_planner::GraphNode & nd) -> bool {
     if (nd.flags & elevation_planner::node_flags::BLOCK_HEADROOM) return false;
-    return (nd.flags & elevation_planner::node_flags::BLOCK_LATERAL) || (nd.traversability >= 0.8f);
+    if (nd.flags & elevation_planner::node_flags::BLOCK_LATERAL) return false;
+    return (nd.traversability >= 0.8f);
   };
 
   // 方案 2：同格已有踏面遮盖屏蔽

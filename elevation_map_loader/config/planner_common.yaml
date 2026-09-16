@@ -1,12 +1,24 @@
-# 全局/局部插件共用的建图配置 (CloudGraphBuilder GraphBuildConfig, 保证融合图与全局图口径一致)
-resolution: 0.10
-max_step_height: 0.25
-max_stride_length: 0.35
-dog_height: 0.45
-cluster_height_diff: 0.08
-min_cluster_points: 2
-sor_mean_k: 16
-sor_std_mul: 4
-footprint_radius: 0.24
-body_hard_radius: 0.15
-sweep_penalty_weight: 1.0
+# ==============================================================================
+# 机器人机体物理参数与安全余量 (A* 全局/局部规划器与 TEB 局部规划器单点统一配置)
+# 机器狗通过任一缝隙的理论最小通道宽度 = robot_width + 2 * obstacle_safety_margin
+# ==============================================================================
+robot_length: 0.36             # 机身长 (m)
+robot_width: 0.26              # 机身宽 (m)
+dog_height: 0.45               # 机器狗站立垂直净空要求 (m)
+obstacle_safety_margin: 0.04   # 障碍物安全缓冲余量 (m)
+
+# 运动越障几何极限
+max_step_height: 0.25          # 最大单步步高 (m)
+max_stride_length: 0.35        # 最大单步跨距 (m)
+
+# 流形图建图算法底层参数 (CloudGraphBuilder GraphBuildConfig, 保证融合图与全局图口径一致)
+resolution: 0.10               # 2D 空间栅格投影分辨率 (m)
+cluster_height_diff: 0.08      # 垂直单柱点云聚类厚度间距 (m)
+min_cluster_points: 2          # 形成踏面的最少激光点数
+sor_mean_k: 16                 # SOR 近邻统计点数
+sor_std_mul: 4                 # SOR 标准差倍数
+sweep_penalty_weight: 1.0      # 机体扫掠区软代价权重
+
+# 派生碰撞半径 (若未显式指定 robot_width/robot_length 则以此默认值生效; 若指定则由节点自适应几何推导)
+body_hard_radius: 0.17         # = robot_width / 2 + obstacle_safety_margin
+footprint_radius: 0.26         # = hypot(robot_length/2, robot_width/2) + obstacle_safety_margin

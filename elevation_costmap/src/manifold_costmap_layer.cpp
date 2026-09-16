@@ -62,13 +62,24 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<double>("max_step_height",    build_cfg.max_step_height, 0.25);
   private_nh.param<double>("max_stride_length",  build_cfg.max_stride_length, 0.35);
   private_nh.param<double>("dog_height",         build_cfg.dog_height, 0.45);
-  private_nh.param<double>("footprint_radius",   build_cfg.footprint_radius, 0.30);
-  private_nh.param<double>("body_hard_radius",   build_cfg.body_hard_radius, 0.15);
+  private_nh.param<double>("footprint_radius",   build_cfg.footprint_radius, 0.26);
+  private_nh.param<double>("body_hard_radius",   build_cfg.body_hard_radius, 0.17);
   private_nh.param<double>("sweep_penalty_weight", build_cfg.sweep_penalty_weight, 1.0);
   private_nh.param<int>   ("sor_mean_k",         build_cfg.sor_mean_k, 16);
   private_nh.param<double>("sor_std_mul",        build_cfg.sor_std_mul, 1.5);
   private_nh.param<double>("cluster_height_diff", build_cfg.cluster_height_diff, 0.08);
   private_nh.param<int>   ("min_cluster_points", build_cfg.min_cluster_points, 2);
+
+  double robot_length = 0.0, robot_width = 0.0, margin = 0.04;
+  private_nh.param<double>("obstacle_safety_margin", margin, 0.04);
+  if (private_nh.getParam("robot_width", robot_width) && robot_width > 0.0) {
+    build_cfg.body_hard_radius = robot_width * 0.5 + margin;
+    if (private_nh.getParam("robot_length", robot_length) && robot_length > 0.0) {
+      build_cfg.footprint_radius = std::hypot(robot_length * 0.5, robot_width * 0.5) + margin;
+    }
+    ROS_INFO("[ManifoldCostmapLayer] Unified robot geometry: body_hard_radius=%.3fm, footprint_radius=%.3fm (W=%.2f, L=%.2f, margin=%.2f)",
+             build_cfg.body_hard_radius, build_cfg.footprint_radius, robot_width, robot_length, margin);
+  }
   graph_builder_.setConfig(build_cfg);
 
   current_ = true;

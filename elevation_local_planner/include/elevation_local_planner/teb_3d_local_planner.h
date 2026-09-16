@@ -60,6 +60,9 @@ private:
                            double max_plan_length,
                            std::vector<geometry_msgs::PoseStamped>& transformed_plan);
 
+  void updateViaPointsSafe(const std::vector<geometry_msgs::PoseStamped>& transformed_plan,
+                          double min_separation);
+
 private:
   bool initialized_{false};
   std::string name_;
@@ -88,6 +91,7 @@ private:
 
   double max_step_height_{0.25};
   double plan_slice_horizon_{2.5};
+  double dog_height_{0.45};
 };
 
 } // namespace elevation_local_planner

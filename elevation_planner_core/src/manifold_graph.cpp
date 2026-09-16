@@ -119,6 +119,65 @@ bool ManifoldGraph::findClosestNode(double x, double y, double z,
   return found;
 }
 
+bool ManifoldGraph::findStartNode(double x, double y, double z,
+                                 double heading_x, double heading_y,
+                                 uint32_t & out_node_id,
+                                 double max_dist_xy,
+                                 double max_dist_z) const
+{
+  if (nodes_.empty() || rows_ <= 0 || cols_ <= 0) return false;
+
+  int center_r = 0, center_c = 0;
+  if (!toGridIndex(x, y, center_r, center_c)) {
+    center_r = std::max(0, std::min(rows_ - 1, static_cast<int>(std::floor((x - min_x_) / resolution_))));
+    center_c = std::max(0, std::min(cols_ - 1, static_cast<int>(std::floor((y - min_y_) / resolution_))));
+  }
+
+  int search_radius = std::max(1, static_cast<int>(std::ceil(max_dist_xy / resolution_)));
+  double best_cost = std::numeric_limits<double>::max();
+  bool found = false;
+  bool check_heading = (std::hypot(heading_x, heading_y) > 0.1);
+
+  // 第一轮：严格前向搜索 (proj >= -0.05m)，严禁把起点吸附到机器人屁股身后
+  if (check_heading) {
+    for (int dr = -search_radius; dr <= search_radius; ++dr) {
+      int r = center_r + dr;
+      if (r < 0 || r >= rows_) continue;
+      for (int dc = -search_radius; dc <= search_radius; ++dc) {
+        int c = center_c + dc;
+        if (c < 0 || c >= cols_) continue;
+
+        const auto & cell_nodes = spatial_grid_[static_cast<size_t>(r * cols_ + c)];
+        for (uint32_t nid : cell_nodes) {
+          const auto & nd = nodes_[nid];
+          if (nd.traversability >= 0.95f) continue;
+          double dxy = std::hypot(nd.x - x, nd.y - y);
+          if (dxy > max_dist_xy) continue;
+          double dz = std::abs(nd.z - z);
+          if (dz > max_dist_z) continue;
+
+          double proj = (nd.x - x) * heading_x + (nd.y - y) * heading_y;
+          if (proj < -0.05) continue; // 坚决剔除身后的倒退节点
+
+          double score = dxy + 1.0 * dz + nd.traversability * 2.0;
+          if (score < best_cost) {
+            best_cost = score;
+            out_node_id = nid;
+            found = true;
+          }
+        }
+      }
+    }
+  }
+
+  // 第二轮兜底：若前方无合法节点，回退到普通就近查找
+  if (!found) {
+    return findClosestNode(x, y, z, out_node_id, max_dist_xy, max_dist_z);
+  }
+
+  return true;
+}
+
 void ManifoldGraph::initializeFromGridMap(const grid_map::GridMap & map, int num_layers)
 {
   clear();
@@ -217,6 +276,45 @@ bool ManifoldGraph::getNeighbors(const ManifoldNode & curr, std::vector<Manifold
     neighbors.push_back(nodes_[edges[i].target_id]);
   }
   return !neighbors.empty();
+}
+
+bool ManifoldGraph::isConnected(uint32_t from_id, uint32_t to_id, int max_hops) const
+{
+  if (from_id == to_id) return true;
+  if (from_id >= nodes_.size() || to_id >= nodes_.size()) return false;
+
+  if (max_hops <= 1) {
+    uint16_t count = 0;
+    const auto * es = getEdges(from_id, count);
+    for (uint16_t i = 0; i < count; ++i) {
+      if (es[i].target_id == to_id) return true;
+    }
+    return false;
+  }
+
+  // 小半径广度优先搜索 (max_hops 2~4, 探索节点数通常 < 50)
+  std::vector<uint32_t> frontier{from_id};
+  std::vector<uint32_t> next_frontier;
+  std::vector<uint32_t> visited{from_id};
+
+  for (int h = 0; h < max_hops; ++h) {
+    next_frontier.clear();
+    for (uint32_t curr : frontier) {
+      uint16_t count = 0;
+      const auto * es = getEdges(curr, count);
+      for (uint16_t i = 0; i < count; ++i) {
+        uint32_t next = es[i].target_id;
+        if (next == to_id) return true;
+        if (std::find(visited.begin(), visited.end(), next) == visited.end()) {
+          visited.push_back(next);
+          next_frontier.push_back(next);
+        }
+      }
+    }
+    if (next_frontier.empty()) break;
+    frontier = next_frontier;
+  }
+  return false;
 }
 
 } // namespace elevation_planner

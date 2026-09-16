@@ -12,6 +12,7 @@
 #include <pcl/filters/crop_box.h>
 #include <yaml-cpp/yaml.h>
 #include <string>
+#include <cmath>
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include "elevation_planner_core/graph_store.hpp"
@@ -82,13 +83,24 @@ public:
     private_nh.param<double>("max_step_height", cfg.max_step_height, 0.25);
     private_nh.param<double>("max_stride_length", cfg.max_stride_length, 0.35);
     private_nh.param<double>("dog_height", cfg.dog_height, 0.45);
-    private_nh.param<double>("footprint_radius", cfg.footprint_radius, 0.30);
-    private_nh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.15);
+    private_nh.param<double>("footprint_radius", cfg.footprint_radius, 0.26);
+    private_nh.param<double>("body_hard_radius", cfg.body_hard_radius, 0.17);
     private_nh.param<double>("sweep_penalty_weight", cfg.sweep_penalty_weight, 1.0);
     private_nh.param<int>("sor_mean_k", cfg.sor_mean_k, 16);
     private_nh.param<double>("sor_std_mul", cfg.sor_std_mul, 1.5);
     private_nh.param<double>("cluster_height_diff", cfg.cluster_height_diff, 0.08);
     private_nh.param<int>("min_cluster_points", cfg.min_cluster_points, 2);
+
+    double robot_length = 0.0, robot_width = 0.0, margin = 0.04;
+    private_nh.param<double>("obstacle_safety_margin", margin, 0.04);
+    if (private_nh.getParam("robot_width", robot_width) && robot_width > 0.0) {
+      cfg.body_hard_radius = robot_width * 0.5 + margin;
+      if (private_nh.getParam("robot_length", robot_length) && robot_length > 0.0) {
+        cfg.footprint_radius = std::hypot(robot_length * 0.5, robot_width * 0.5) + margin;
+      }
+      ROS_INFO("[ElevationGlobalPlanner] Unified robot geometry: body_hard_radius=%.3fm, footprint_radius=%.3fm (W=%.2f, L=%.2f, margin=%.2f)",
+               cfg.body_hard_radius, cfg.footprint_radius, robot_width, robot_length, margin);
+    }
     builder_.setConfig(cfg);
 
     ros::NodeHandle nh;

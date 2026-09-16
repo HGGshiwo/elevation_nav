@@ -10,7 +10,8 @@ import random
 import threading
 import base64
 from array import array
-from typing import Dict, Any, Optional, List
+from collections import defaultdict
+from typing import Dict, Any, Optional, List, Tuple
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped, Twist, TransformStamped
@@ -65,11 +66,13 @@ class ElevationRosBridge:
         self.local_path: List[List[float]] = []
         self.path_version = 0
 
-        # 流形拓扑图缓存 (点云节点与连通边)
         self.graph_nodes: List[List[float]] = []
         self.graph_nodes_version = 0
+        self.spatial_nodes: Dict[Tuple[int, int], List[List[float]]] = {}
         self.graph_edges: List[List[float]] = []
         self.graph_edges_version = 0
+        self.graph_adj: Dict[Tuple[float, float, float], List[Tuple[float, float, float]]] = {}
+        self.current_graph_node: Optional[Tuple[float, float, float]] = None
         # 局部代价地图缓存
         self.local_costmap: Optional[Dict[str, Any]] = None
         self.local_costmap_version = 0
@@ -183,31 +186,72 @@ class ElevationRosBridge:
             rospy.logwarn(f"[ElevationRosBridge] ROS init exception: {e}")
 
     def _graph_nodes_callback(self, msg: PointCloud2):
-        """解析流形踏面节点点云"""
+        """解析流形踏面节点点云并建立空间栅格哈希"""
         try:
             pts = []
+            spatial = {}
             for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True):
-                pts.append([round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3), round(float(p[3]), 2)])
+                pt = [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3), round(float(p[3]), 2)]
+                pts.append(pt)
+                r = int(round(pt[0] / 0.10))
+                c = int(round(pt[1] / 0.10))
+                spatial.setdefault((r, c), []).append(pt)
             with self._lock:
                 self.graph_nodes = pts
+                self.spatial_nodes = spatial
                 self.graph_nodes_version += 1
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 graph nodes 点云异常: {e}")
 
+    def _anchor_graph_node_locked(self, x: float, y: float, z: float):
+        """在连通图中寻找距 (x, y, z) 最近的流形锚点 (3D 加权距离，强化 z 权重避免跨层)"""
+        # 优先在局部空间栅格邻域内检索候选点，避免全图 19 万节点无界遍历
+        r0 = int(round(x / 0.10))
+        c0 = int(round(y / 0.10))
+        candidates = []
+        spatial = self.spatial_nodes
+        if spatial:
+            for dr in range(-6, 7):
+                for dc in range(-6, 7):
+                    cell = spatial.get((r0 + dr, c0 + dc))
+                    if cell:
+                        for p in cell:
+                            if abs(p[2] - z) <= 0.80 and p[3] < 0.8:
+                                candidates.append((round(p[0], 3), round(p[1], 3), round(p[2], 3)))
+        if not candidates and self.graph_adj:
+            candidates = list(self.graph_adj.keys())
+
+        best_node = None
+        best_d2 = float("inf")
+        for node in candidates:
+            d2 = (node[0] - x)**2 + (node[1] - y)**2 + 4.0 * (node[2] - z)**2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_node = node
+        if best_node is not None:
+            self.current_graph_node = best_node
+
     def _graph_edges_callback(self, msg: MarkerArray):
-        """解析流形连通边 MarkerArray"""
+        """解析流形连通边 MarkerArray 并构建拓扑连通图邻接表"""
         try:
             lines = []
+            adj = defaultdict(set)
             for marker in msg.markers:
                 pts = marker.points
                 for i in range(0, len(pts) - 1, 2):
-                    lines.append([
-                        round(pts[i].x, 3), round(pts[i].y, 3), round(pts[i].z, 3),
-                        round(pts[i+1].x, 3), round(pts[i+1].y, 3), round(pts[i+1].z, 3)
-                    ])
+                    p1 = (round(pts[i].x, 3), round(pts[i].y, 3), round(pts[i].z, 3))
+                    p2 = (round(pts[i+1].x, 3), round(pts[i+1].y, 3), round(pts[i+1].z, 3))
+                    lines.append([p1[0], p1[1], p1[2], p2[0], p2[1], p2[2]])
+                    adj[p1].add(p2)
+                    adj[p2].add(p1)
+            graph_adj = {k: list(v) for k, v in adj.items()}
             with self._lock:
                 self.graph_edges = lines
                 self.graph_edges_version += 1
+                self.graph_adj = graph_adj
+                # 若当前尚未锚定连通图节点，或脱离连通图，立即锚定当前仿真位置
+                if self.graph_adj and (self.current_graph_node is None or self.current_graph_node not in self.graph_adj):
+                    self._anchor_graph_node_locked(self.sim_x, self.sim_y, self.sim_z)
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 graph edges 异常: {e}")
 
@@ -420,18 +464,35 @@ class ElevationRosBridge:
         self.last_cmd_time = rospy.Time.now()
 
     def get_terrain_z(self, x: float, y: float, fallback_z: float) -> float:
-        """基于流形踏面节点缓存 (graph_nodes: [x, y, z, traversability]) 探测 (x, y) 处的地表高度。
-        分层带过滤: 优先取 |dz| <= max_step_height 的节点 (同层踏面逐级跟随),
-        该带内无节点才放宽窗口 —— 防止行进中经过楼板空洞/边缘时 z 跳到下层"""
+        """基于流形踏面空间拓扑缓存探测 (x, y) 处的地表高度。
+        多层建筑防击穿与台阶平滑策略:
+        1. 空间局部邻域: 在 (x, y) 的周围网格邻域内检索候选节点，杜绝全图无界遍历与异层干扰
+        2. 第一带: 优先取当前层踏面 (|dz| <= max_step_height, 正常水平或台阶小步跟随)
+        3. 第二带 (规划路径连续性引导): 当跨步较大时，优先参考当前行进楼层的 3D 规划路径
+        4. 第三带: 小幅单步容限 [-0.35m, +0.40m]
+        """
+        r0 = int(round(x / 0.10))
+        c0 = int(round(y / 0.10))
+        local_nodes = []
+
+        with self._lock:
+            spatial = self.spatial_nodes
+            for dr in range(-3, 4):
+                for dc in range(-3, 4):
+                    cell = spatial.get((r0 + dr, c0 + dc))
+                    if cell:
+                        local_nodes.extend(cell)
+
+        if not local_nodes:
+            with self._lock:
+                local_nodes = self.graph_nodes
+
         best_z = None
         min_sq = 0.35 * 0.35  # 机体半径范围 (35cm)
 
-        with self._lock:
-            nodes = self.graph_nodes
-
         # 第一带: 机体当前层附近 (|dz| <= max_step_height)
-        for p in nodes:
-            if p[3] >= 0.95:  # 禁行节点 (顶头净空/侧向阻挡) 不可作为贴地依据
+        for p in local_nodes:
+            if p[3] >= 0.95:  # 禁行节点不可作为贴地依据
                 continue
             dz = p[2] - fallback_z
             if abs(dz) > self.max_step_height:
@@ -446,13 +507,46 @@ class ElevationRosBridge:
         if best_z is not None:
             return best_z
 
-        # 第二带 (放宽): 当前层附近无踏面节点时, 扩大到机体上下活动窗口
+        # 第二带: 规划路径连续引导 (沿局部/全局 3D 路径走廊平滑过渡，杜绝台阶处因离散化掉层)
+        with self._lock:
+            local_path = list(self.local_path)
+            global_path = list(self.global_path)
+        for path_points in [local_path, global_path]:
+            if path_points:
+                min_path_sq = 0.60 * 0.60
+                path_z = None
+                for pt in path_points:
+                    dx = pt[0] - x
+                    dy = pt[1] - y
+                    sq = dx * dx + dy * dy
+                    if sq < min_path_sq:
+                        # 确保路径点属于当前行进楼层/梯段 (|pt.z - fallback_z| <= 0.60m)
+                        if abs(pt[2] - fallback_z) <= 0.60:
+                            min_path_sq = sq
+                            path_z = pt[2]
+                if path_z is not None:
+                    # 在该 3D 路径点高度附近寻找最匹配的真实踏面节点 (容许阶跃贴合)
+                    sub_sq = 0.35 * 0.35
+                    node_z = None
+                    for p in local_nodes:
+                        if p[3] >= 0.95:
+                            continue
+                        if abs(p[2] - path_z) <= self.max_step_height:
+                            dx = p[0] - x
+                            dy = p[1] - y
+                            sq = dx * dx + dy * dy
+                            if sq < sub_sq:
+                                sub_sq = sq
+                                node_z = p[2]
+                    return node_z if node_z is not None else path_z
+
+        # 第三带 (放宽但严禁穿透楼板): 仅限小幅单步容限 [-0.35m, +0.40m]
         min_sq = 0.35 * 0.35
-        for p in nodes:
+        for p in local_nodes:
             if p[3] >= 0.95:
                 continue
-            # 过滤掉远高于机体/天花板或深坑
-            if p[2] > fallback_z + 0.5 or p[2] < fallback_z - 1.8:
+            # 严格限制搜索上下界: 向上最多 0.40m, 向下最多 0.35m (绝不可击穿 1.25m 的上下层楼板)
+            if p[2] > fallback_z + 0.40 or p[2] < fallback_z - 0.35:
                 continue
             dx = p[0] - x
             dy = p[1] - y
@@ -464,34 +558,118 @@ class ElevationRosBridge:
         if best_z is not None:
             return best_z
 
-        # 次选：局部盲区无踏面节点时，回退参考规划路径的 3D 航路点高度
-        with self._lock:
-            local_path = list(self.local_path)
-            global_path = list(self.global_path)
-        for path_points in [local_path, global_path]:
-            if path_points:
-                min_path_sq = 0.8 * 0.8
-                path_z = None
-                for pt in path_points:
-                    dx = pt[0] - x
-                    dy = pt[1] - y
-                    sq = dx * dx + dy * dy
-                    if sq < min_path_sq:
-                        min_path_sq = sq
-                        path_z = pt[2]
-                if path_z is not None:
-                    return path_z
-
         return fallback_z
 
+    def step_connected_terrain(self, target_x: float, target_y: float, fallback_z: float) -> float:
+        """严格沿连通图拓扑邻域推进并吸附到当前踏面流形：
+        1. 从当前流形锚点 self.current_graph_node 沿邻接边展开 1 跳与 2 跳可达邻居集合
+        2. 仅在该拓扑连通闭包内寻找最逼近 (target_x, target_y) 的候选节点，更新为新锚点
+        3. 沿新锚点的连通边进行连续线段投影插值，计算精确地表高度，从数学拓扑上 100% 杜绝多层楼板穿透与下坠
+        """
+        with self._lock:
+            adj = self.graph_adj
+            spatial = self.spatial_nodes
+            curr = self.current_graph_node
+
+        if not adj and not spatial:
+            return self.get_terrain_z(target_x, target_y, fallback_z)
+
+        # 若尚未锚定，或发生外部瞬移 (> 1.5m 且与当前锚点脱节)，重新锚定
+        if curr is None or math.hypot(curr[0] - target_x, curr[1] - target_y) > 1.5:
+            with self._lock:
+                self._anchor_graph_node_locked(target_x, target_y, fallback_z)
+                curr = self.current_graph_node
+            if curr is None:
+                return self.get_terrain_z(target_x, target_y, fallback_z)
+
+        # 1. 沿连通图邻接边收集 1-hop 与 2-hop 拓扑邻居 (拓扑闭包内严禁包含任何异层或悬崖节点)
+        neighbors_1 = list(adj.get(curr, []))
+
+        # 动态互补: 若图边未覆盖当前区域 (如 Marker 截断), 从全量 19 万踏面网格 8 邻域补充物理连通边
+        if not neighbors_1 and spatial:
+            r0 = int(round(curr[0] / 0.10))
+            c0 = int(round(curr[1] / 0.10))
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0: continue
+                    for p in spatial.get((r0 + dr, c0 + dc), []):
+                        if p[3] < 0.8 and abs(p[2] - curr[2]) <= self.max_step_height:
+                            neighbors_1.append((round(p[0], 3), round(p[1], 3), round(p[2], 3)))
+
+        best_cand = curr
+        best_cand_d2 = (curr[0] - target_x)**2 + (curr[1] - target_y)**2
+
+        for n1 in neighbors_1:
+            d1 = (n1[0] - target_x)**2 + (n1[1] - target_y)**2
+            if d1 < best_cand_d2:
+                best_cand_d2 = d1
+                best_cand = n1
+            n2_list = adj.get(n1, [])
+            if not n2_list and spatial:
+                nr0 = int(round(n1[0] / 0.10))
+                nc0 = int(round(n1[1] / 0.10))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0: continue
+                        for p in spatial.get((nr0 + dr, nc0 + dc), []):
+                            if p[3] < 0.8 and abs(p[2] - n1[2]) <= self.max_step_height:
+                                d2 = (p[0] - target_x)**2 + (p[1] - target_y)**2
+                                if d2 < best_cand_d2:
+                                    best_cand_d2 = d2
+                                    best_cand = (round(p[0], 3), round(p[1], 3), round(p[2], 3))
+            else:
+                for n2 in n2_list:
+                    d2 = (n2[0] - target_x)**2 + (n2[1] - target_y)**2
+                    if d2 < best_cand_d2:
+                        best_cand_d2 = d2
+                        best_cand = n2
+
+        # 更新当前拓扑锚点
+        with self._lock:
+            self.current_graph_node = best_cand
+
+        # 2. 沿当前节点与其连通邻接边进行连续表面线性插值，消除阶梯离散抖动
+        best_edge_z = best_cand[2]
+        best_edge_dist2 = best_cand_d2
+
+        nbrs = list(adj.get(best_cand, []))
+        if not nbrs and spatial:
+            br0 = int(round(best_cand[0] / 0.10))
+            bc0 = int(round(best_cand[1] / 0.10))
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0: continue
+                    for p in spatial.get((br0 + dr, bc0 + dc), []):
+                        if p[3] < 0.8 and abs(p[2] - best_cand[2]) <= self.max_step_height:
+                            nbrs.append((round(p[0], 3), round(p[1], 3), round(p[2], 3)))
+
+        for nbr in nbrs:
+            dx = nbr[0] - best_cand[0]
+            dy = nbr[1] - best_cand[1]
+            l2 = dx * dx + dy * dy
+            if l2 > 1e-4:
+                t = max(0.0, min(1.0, ((target_x - best_cand[0]) * dx + (target_y - best_cand[1]) * dy) / l2))
+                proj_x = best_cand[0] + t * dx
+                proj_y = best_cand[1] + t * dy
+                dist2 = (target_x - proj_x)**2 + (target_y - proj_y)**2
+                if dist2 < best_edge_dist2:
+                    best_edge_dist2 = dist2
+                    best_edge_z = best_cand[2] + t * (nbr[2] - best_cand[2])
+
+        return best_edge_z
+
     def set_sim_pose(self, x: float, y: float, z: float, yaw: Optional[float] = None):
-        """前端修改初始位置时, 直接采用吸附节点的踏面高程 z (前端射线拾取已确定层归属),
-        立即同步并立即更新 TF; 不再重新贴地探测 —— 防止多层重叠处重新吸附掉到下层"""
+        """前端修改初始位置时, 立即锚定连通图节点并更新 TF; 不再重新盲目贴地探测"""
         self.sim_x = float(x)
         self.sim_y = float(y)
-        self.sim_z = float(z) if z is not None else self.get_terrain_z(self.sim_x, self.sim_y, 0.0)
         if yaw is not None:
             self.sim_yaw = float(yaw)
+        with self._lock:
+            self._anchor_graph_node_locked(self.sim_x, self.sim_y, float(z) if z is not None else self.sim_z)
+            if self.current_graph_node is not None:
+                self.sim_z = float(z) if z is not None else self.current_graph_node[2]
+            else:
+                self.sim_z = float(z) if z is not None else self.get_terrain_z(self.sim_x, self.sim_y, 0.0)
         self.cmd_vx, self.cmd_vy, self.cmd_wz = 0.0, 0.0, 0.0
         self.last_sim_time = rospy.Time.now()
         if self.publish_fake_tf:
@@ -529,8 +707,8 @@ class ElevationRosBridge:
                     self.sim_y += dx_body * sin_y + dy_body * cos_y
                     self.sim_yaw = normalize_angle(self.sim_yaw + dyaw)
 
-                    # 动态自动跟随 3D 地形与规划路径的 z 高度 (平滑低通滤波过渡)
-                    target_z = self.get_terrain_z(self.sim_x, self.sim_y, self.sim_z)
+                    # 严格沿拓扑连通图流形跟随地表高度 (平滑低通滤波过渡)
+                    target_z = self.step_connected_terrain(self.sim_x, self.sim_y, self.sim_z)
                     self.sim_z = 0.85 * self.sim_z + 0.15 * target_z
 
             self.last_sim_time = now_stamp

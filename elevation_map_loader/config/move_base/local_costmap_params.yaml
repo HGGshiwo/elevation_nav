@@ -17,6 +17,9 @@ local_costmap:
     map_width: 6.0
     map_length: 6.0
     forward_offset: 3.0
+    crop_radius_xy: 3.5       # 实时点云融合裁剪半径 (m), 适配 6x6 局部代价地图与 TEB 3m 前瞻
+    crop_height_above: 2.0    # 机体上方净空高度截取范围 (m)
+    crop_height_below: 1.5    # 机体下方脚底高度截取范围 (m)
   # 膨胀层: 地毯致命点 (真实空洞/墙体) 周围生成梯度代价带, 供 TEB 与恢复行为提前感知;
   # 与 TEB 自身 inflation_dist (0.35, 软斥力) 叠加, 闭运算清除的伪影雷区不参与膨胀
   inflation_layer:

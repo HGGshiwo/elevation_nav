@@ -124,7 +124,7 @@ public:
   static void toMarkerArray(const ManifoldGraph & graph,
                             const std::string & frame_id,
                             visualization_msgs::MarkerArray & out_markers,
-                            size_t max_edges = 200000);
+                            size_t max_edges = 2000000);
 
   /// @brief 权威诊断两点之间的拓扑连通性及未建边物理原因 (输出 JSON 字符串)
   std::string diagnoseEdge(const ManifoldGraph & graph,

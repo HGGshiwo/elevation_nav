@@ -321,3 +321,31 @@ roslaunch elevation_map_loader navigation.launch sim:=false local_planner:=teb
 ### 4. 障碍物提取器 Z 轴保护集修复 (manifold_obstacle_extractor.cpp)
 - **保护集高程感知**：修复原提取器使用 2D 网格哈希导致一楼平坦连续通道错误豁免二楼及楼梯侧缘断崖的缺陷。引入带高程判断的 `horiz_protected` 与 `vert_protected`，确保悬空边缘稳定生成带真实 Z 的 `LineObstacle3D`。
 
+---
+
+## 八、2026-09-16 晚间更新：物理踏面连续性校验重构、图源截断修复与控制频率优化
+
+针对平地启动卡死、楼梯起步断开与多层前瞻截断问题，对局部规划与流形校验体系进行了深度排查与物理第一性重构：
+
+### 1. 轨迹合法性检验器重构 (TrajectoryValidator)
+- **摒弃脆弱的图跳数搜索 (BFS)**：彻底移除了依赖网格拓扑连通性的 `isConnected` 搜索，避免了因对角线间隙、台阶立板等微观网格空隙造成的误判卡死（如第一级台阶接缝处）。
+- **$O(1)$ 瞬时地表踏面反查 (`querySurface`)**：沿 TEB 规划线以 $0.08\text{m}$ 密集步长采样，在空间桶中利用真实坐标与参考高程极速匹配物理支撑面，无有效踏面时秒级判定踏空（`surface_support_lost`）。
+- **单步攀爬高差物理连续性累加**：逐点约束相邻步进垂直高差 $\Delta z = |z_{\text{curr}} - z_{\text{prev}}| \le \text{allowed\_step}$（统一门限 $0.35\text{m}$，充分包容楼梯起步与转角过渡的陡坡测量噪声），平地与楼梯爬升畅通无阻，数米断崖或跨层跌落瞬间熔断拦截（`step_height_exceeded`）。
+- **终点与全局目标层级匹配**：终点接近前瞻目标时，严格验证终点实际足底高度与目标高度偏差（$\le 0.40\text{m}$），彻底杜绝跨层穿模抄近道（`target_z_mismatch`）。
+- **精准失败成因追踪**：将详细拒绝原因注入 `ROS_WARN_THROTTLE`，实现黑盒故障的秒级可视化定位。
+
+### 2. 全局图源优先级纠正与局部滑动窗口参数化
+- **消除局部融合图截断缺陷**：纠正 `TrajectoryValidator` 与 `updateViaPointsSafe` 中优先使用局部图的缺陷。此前 `fused_graph` 作为滑动窗口默认半径仅 $2.0\text{m}$，导致 TEB 在 $2.5\text{m} \sim 3.0\text{m}$ 前瞻距离处的轨迹末端走出边界踏空。统一修正为优先采用具备 19.2 万全图节点完整覆盖的 `GlobalGraph`。
+- **代价地图裁剪参数化配置**：在 `local_costmap_params.yaml` 中显式开放 `crop_radius_xy: 3.5`、`crop_height_above: 2.0`、`crop_height_below: 1.5`，使实时点云融合窗口与 $6\text{m} \times 6\text{m}$ 局部代价地图及 TEB 3m 前瞻完全适配。
+
+### 3. MoveBase 控制器频率优化
+- **控制循环提速至 20Hz**：在 `move_base_params.yaml` 中将 `controller_frequency` 由默认的 10.0Hz 提升至 20.0Hz，与 `teb_local_planner_params.yaml` 严格对齐，控制指令响应延迟减半，底盘跟踪更细腻。
+
+### 4. 拓扑边可视化大地图完整呈现 (cloud_graph_builder.hpp & ros_bridge.py)
+- **解除边数量截断极限**：将拓扑边 MarkerArray 发布截断限制由 20 万大幅提升至 200 万，并在 `ros_bridge.py` 中引入完整空间保真回退机制，确保数万平米立体建筑的八十万条空间拓扑边 100% 完整加载渲染，彻底根除高层东侧地图被裁断的问题。
+
+### 5. 全局规划器前向朝向约束与机体几何统一 (elevation_global_planner)
+- **前向朝向约束查找起点 (`findStartNode`)**：在 `ManifoldGraph` 中引入 `findStartNode`，重规划时沿机器人车头朝向引入前向投影过滤（$\text{proj} \ge -0.05\text{m}$），彻底根除原地掉头时全局路径向身后倒退吸附的恶性 Bug。
+- **机体几何尺寸统一配置**：支持从参数服务器直接读取 `robot_width` 与 `robot_length`，自动换算硬半径 `body_hard_radius = width*0.5 + margin` 与外包半径 `footprint_radius = hypot(length*0.5, width*0.5) + margin`，保证全局建图、局部地毯与代价地图几何口径 100% 统一。
+
+

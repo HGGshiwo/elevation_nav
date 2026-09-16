@@ -18,7 +18,7 @@ TebLocalPlannerROS:
   # 全向移动模式 (四足狗支持侧向移动)
   holonomic_robot: true
 
-  # ---- 机器人几何轮廓 (八边形贴合机体倒角, 避免直角转弯尾部扫墙) ----
+  # ---- 机器人几何轮廓 (八边形贴合机体倒角, 优先由 planner_common.yaml 统一几何参数驱动) ----
   footprint_model:
     type: "polygon"
     vertices: [[0.18, 0.08], [0.12, 0.13], [-0.12, 0.13], [-0.18, 0.08], [-0.18, -0.08], [-0.12, -0.13], [0.12, -0.13], [0.18, -0.08]]
@@ -40,8 +40,8 @@ TebLocalPlannerROS:
   feasibility_check_no_poses: 1
 
   # ---- 障碍物与三维流形几何避障 (正障碍圆柱 + 楼梯边缘护栏折线) ----
-  # min_obstacle_dist 为轨迹到障碍的硬下限 (从八边形轮廓边界量起):
-  min_obstacle_dist: 0.08
+  # min_obstacle_dist 为轨迹到障碍的硬下限 (若 planner_common.yaml 提供 obstacle_safety_margin 则以此单点配置为准):
+  min_obstacle_dist: 0.04
   # 关闭从代价地图读取海量离散点，直接消费 ManifoldObstacleExtractor 发布的结构化几何障碍物
   include_costmap_obstacles: false
   costmap_obstacles_behind_robot_dist: 1.0

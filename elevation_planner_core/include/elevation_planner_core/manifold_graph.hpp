@@ -88,6 +88,13 @@ public:
                        double max_dist_xy = 0.5,
                        double max_dist_z = 0.6) const;
 
+  /// @brief 结合车头朝向约束查找起点踏面节点 (严格防止向身后倒退吸附)
+  bool findStartNode(double x, double y, double z,
+                     double heading_x, double heading_y,
+                     uint32_t & out_node_id,
+                     double max_dist_xy = 2.5,
+                     double max_dist_z = 2.5) const;
+
   /// @brief 访问节点与邻居边 (零开销)
   inline const GraphNode & getNode(uint32_t id) const { return nodes_[id]; }
   inline const GraphEdge * getEdges(uint32_t id, uint16_t & count) const
@@ -95,6 +102,9 @@ public:
     count = nodes_[id].edge_count;
     return &edges_[nodes_[id].edge_offset];
   }
+
+  /// @brief 检查两节点在拓扑图中是否连通 (基于有限跳数的 BFS 极速探测)
+  bool isConnected(uint32_t from_id, uint32_t to_id, int max_hops = 3) const;
 
   inline size_t numNodes() const { return nodes_.size(); }
   inline size_t numEdges() const { return edges_.size(); }

@@ -16,7 +16,7 @@ namespace elevation_local_planner
 /**
  * @brief 在流形图中根据 (x, y) 和参考高度快速查询真实地表踏面高度 z
  */
-inline double querySurfaceZ(double x, double y, double ref_z)
+inline double querySurfaceZ(double x, double y, double ref_z, double max_dz = 0.25)
 {
   auto graph = elevation_planner::GraphStore::instance().getFusedGraph();
   if (!graph || graph->numNodes() == 0)
@@ -48,7 +48,7 @@ inline double querySurfaceZ(double x, double y, double ref_z)
     }
   }
 
-  if (best_dz < 1.0)
+  if (best_dz <= max_dz)
   {
     return best_z;
   }
@@ -72,7 +72,7 @@ inline double querySurfaceZ(double x, double y, double ref_z)
     }
   }
 
-  return best_z;
+  return (best_dz <= max_dz) ? best_z : ref_z;
 }
 
 /**

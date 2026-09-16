@@ -1,5 +1,6 @@
 #include "elevation_global_planner/manifold_astar.hpp"
 #include <ros/ros.h>
+#include <tf2/utils.h>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -60,7 +61,27 @@ bool ManifoldAStarPlanner::plan(const geometry_msgs::PoseStamped & start,
   }
 
   uint32_t start_id = 0, goal_id = 0;
-  if (!graph_.findClosestNode(start.pose.position.x, start.pose.position.y, start.pose.position.z, start_id, 2.5, 2.5)) {
+
+  // 提取机器人前向矢量 (优先车头朝向，缺省则使用目标方向)
+  double hx = 0.0, hy = 0.0;
+  const auto & q = start.pose.orientation;
+  if (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w > 0.1) {
+    double yaw = tf2::getYaw(q);
+    hx = std::cos(yaw);
+    hy = std::sin(yaw);
+  } else {
+    hx = goal.pose.position.x - start.pose.position.x;
+    hy = goal.pose.position.y - start.pose.position.y;
+    double len = std::hypot(hx, hy);
+    if (len > 1e-3) {
+      hx /= len;
+      hy /= len;
+    }
+  }
+
+  // 采用严格前向约束查找起点，杜绝重规划将起点倒退吸附到身后
+  if (!graph_.findStartNode(start.pose.position.x, start.pose.position.y, start.pose.position.z,
+                            hx, hy, start_id, 2.5, 2.5)) {
     ROS_ERROR("[ManifoldAStarPlanner] Cannot find valid node near start: (%.2f, %.2f, %.2f)",
               start.pose.position.x, start.pose.position.y, start.pose.position.z);
     return false;

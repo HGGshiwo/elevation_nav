@@ -42,9 +42,15 @@
         <!-- 局部插件配置: AStarLocalPlanner 专用参数 -->
         <rosparam if="$(eval arg('local_planner') == 'astar')"
                   file="$(find elevation_map_loader)/config/move_base/astar_local_planner_params.yaml" command="load" ns="AStarLocalPlanner"/>
+        <rosparam if="$(eval arg('local_planner') == 'astar')"
+                  file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="AStarLocalPlanner"/>
 
         <!-- 局部插件配置: TEB 规划器专用参数 -->
         <rosparam if="$(eval arg('local_planner') == 'teb')"
                   file="$(find elevation_map_loader)/config/move_base/teb_local_planner_params.yaml" command="load"/>
+        <rosparam if="$(eval arg('local_planner') == 'teb')"
+                  file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="TebLocalPlannerROS"/>
+        <rosparam if="$(eval arg('local_planner') == 'teb')"
+                  file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="Teb3DLocalPlanner"/>
     </node>
 </launch>
