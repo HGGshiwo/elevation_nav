@@ -3,6 +3,7 @@
 #include <nav_msgs/OccupancyGrid.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <costmap_converter/ObstacleArrayMsg.h>
 #include <elevation_planner_core/manifold_graph.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -75,7 +76,7 @@ public:
   const ManifoldCostmapBuilderConfig & getConfig() const { return config_; }
 
   /**
-   * @brief 从流形图构建局部 1:1 代价地图
+   * @brief 从流形图构建局部 1:1 代价地图与几何障碍物
    * @param graph 3D流形图 (融合图或全局先验图)
    * @param robot_pose 机器人当前3D世界位姿
    * @param global_plan 全局参考规划路径 (3D)
@@ -83,6 +84,7 @@ public:
    * @param out_tf 输出的局部切空间坐标系到世界坐标系的变换
    * @param out_reasons 可选输出: 与 out_grid.data 同布局的逐格成因码 (CellReason), 供调试图层
    * @param out_node_ids 可选输出: 与 out_grid.data 同布局的逐格胜出节点 id (-1=无, 如默认致命/拓扑缝)
+   * @param out_obstacles 可选输出: 结构化 3D 正障碍物与悬空边界线 ObstacleArrayMsg (供给 TEB 原生同伦规划)
    * @return true 构建成功, false 失败
    */
   bool buildCostmap(const elevation_planner::ManifoldGraph & graph,
@@ -91,7 +93,8 @@ public:
                     nav_msgs::OccupancyGrid & out_grid,
                     geometry_msgs::TransformStamped & out_tf,
                     std::vector<int8_t> * out_reasons = nullptr,
-                    std::vector<int32_t> * out_node_ids = nullptr) const;
+                    std::vector<int32_t> * out_node_ids = nullptr,
+                    costmap_converter::ObstacleArrayMsg * out_obstacles = nullptr) const;
 
 private:
   ManifoldCostmapBuilderConfig config_;

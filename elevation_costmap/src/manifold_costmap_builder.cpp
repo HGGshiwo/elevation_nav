@@ -6,6 +6,8 @@
 #include <queue>
 #include <unordered_set>
 
+#include "elevation_costmap/manifold_obstacle_extractor.h"
+
 namespace elevation_costmap
 {
 
@@ -20,7 +22,8 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
                                          nav_msgs::OccupancyGrid & out_grid,
                                          geometry_msgs::TransformStamped & out_tf,
                                          std::vector<int8_t> * out_reasons,
-                                         std::vector<int32_t> * out_node_ids) const
+                                         std::vector<int32_t> * out_node_ids,
+                                         costmap_converter::ObstacleArrayMsg * out_obstacles) const
 {
   (void)global_plan;
   if (graph.numNodes() == 0) return false;
@@ -442,6 +445,20 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
   out_tf.transform.translation.y = p0.y();
   out_tf.transform.translation.z = p0.z();
   out_tf.transform.rotation = out_grid.info.origin.orientation;
+
+  // -------------------------------------------------------------
+  // 第六步: 提取稀疏 3D 几何障碍物与悬空边界 (供给 TEB 原生同伦规划)
+  // -------------------------------------------------------------
+  if (out_obstacles)
+  {
+    ObstacleExtractorConfig ext_cfg;
+    ext_cfg.window_radius = std::max(config_.map_width, config_.map_length) * 0.5;
+    ext_cfg.dog_height = config_.dog_height;
+    ext_cfg.height_tolerance = config_.height_tolerance;
+    ext_cfg.map_frame = config_.map_frame;
+    ManifoldObstacleExtractor extractor(ext_cfg);
+    extractor.extractObstacles(graph, robot_pose, candidate_nodes, is_candidate, *out_obstacles);
+  }
 
   return true;
 }

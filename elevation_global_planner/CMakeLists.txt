@@ -19,6 +19,8 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(PCL REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(YAML_CPP REQUIRED yaml-cpp)
 
 catkin_package(
   INCLUDE_DIRS include
@@ -31,6 +33,7 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${YAML_CPP_INCLUDE_DIRS}
 )
 
 add_library(elevation_global_planner_lib
@@ -48,6 +51,7 @@ add_library(elevation_global_planner_plugin
 target_link_libraries(elevation_global_planner_plugin
   elevation_global_planner_lib
   ${catkin_LIBRARIES}
+  ${YAML_CPP_LIBRARIES}
 )
 
 # ---- 离线验证工具 (test/) ----

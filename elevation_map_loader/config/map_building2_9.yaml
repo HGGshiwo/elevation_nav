@@ -1,0 +1,40 @@
+# 默认非裁剪地图配置 (标准全图载入，无物理裁切)
+crop_box:
+  enable: false                     # 显式关闭空间裁剪，载入全图
+
+# 标准点云高程提取配置 (包含全部 5 个必需模块)
+pcl_grid_map_extraction:
+  num_processing_threads: 4
+  cloud_transform:
+    translation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+    rotation: # intrinsic rotation X-Y-Z (r-p-y) sequence
+      r: 0.0
+      p: 0.0
+      y: 0.0
+  cluster_extraction:
+    cluster_tolerance: 0.08
+    min_num_points: 3
+    max_num_points: 1000000
+    use_max_height_as_cell_elevation: false
+  outlier_removal:
+    is_remove_outliers: false       # 关闭离群滤波，防止稀疏单层表面被误删掏空
+    mean_K: 10
+    stddev_threshold: 1.0
+  downsampling:
+    is_downsample_cloud: false      # 稀疏点云不额外降采样
+    voxel_size:
+      x: 0.03
+      y: 0.03
+      z: 0.03
+  grid_map:
+    min_num_points_per_cell: 1      # 点云数量阈值改为 1，单点即成有效网格，消除空洞
+    resolution: 0.10
+
+# 标准流形拓扑图参数
+manifold_graph:
+  sor_mean_k: 0                     # 流形图同步关闭离群滤波
+  min_cluster_points: 1             # 单柱 1 个点即可提取踏面
+

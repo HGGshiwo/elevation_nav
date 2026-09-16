@@ -18,12 +18,14 @@ find_package(catkin REQUIRED COMPONENTS
   pluginlib
   pcl_ros
   pcl_conversions
+  teb_local_planner
+  costmap_converter
 )
 
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES elevation_local_planner_lib
-  CATKIN_DEPENDS roscpp elevation_planner_core elevation_global_planner grid_map_core grid_map_ros grid_map_msgs geometry_msgs nav_msgs tf2_ros nav_core costmap_2d pluginlib pcl_ros pcl_conversions
+  CATKIN_DEPENDS roscpp elevation_planner_core elevation_global_planner grid_map_core grid_map_ros grid_map_msgs geometry_msgs nav_msgs tf2_ros nav_core costmap_2d pluginlib pcl_ros pcl_conversions teb_local_planner costmap_converter
 )
 
 include_directories(
@@ -35,6 +37,7 @@ add_library(elevation_local_planner_lib
   src/collision_checker.cpp
   src/velocity_smoother.cpp
   src/astar_local_planner.cpp
+  src/teb_3d_local_planner.cpp
 )
 target_link_libraries(elevation_local_planner_lib
   ${catkin_LIBRARIES}

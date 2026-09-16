@@ -87,6 +87,7 @@ class NavGoalRequest(BaseModel):
 
 class LoadPcdRequest(BaseModel):
     pcd_path: str
+    map_config_path: Optional[str] = None
 
 
 @app.on_event("startup")
@@ -228,8 +229,13 @@ def load_pcd(req: LoadPcdRequest):
     """向 C++ 节点发送加载 PCD 文件指令并自动提取高程图"""
     if not os.path.exists(req.pcd_path):
         raise HTTPException(status_code=400, detail=f"PCD 文件不存在: {req.pcd_path}")
-    ros_bridge.publish_pcd_cmd(req.pcd_path)
-    return {"status": "ok", "message": f"已向 C++ 节点发送 PCD 加载指令: {req.pcd_path}"}
+    cmd = req.pcd_path
+    if req.map_config_path:
+        if not os.path.exists(req.map_config_path):
+            raise HTTPException(status_code=400, detail=f"地图配置文件不存在: {req.map_config_path}")
+        cmd = f"{req.pcd_path};{req.map_config_path}"
+    ros_bridge.publish_pcd_cmd(cmd)
+    return {"status": "ok", "message": f"已向 C++ 节点发送 PCD 加载指令: {cmd}"}
 
 
 @app.websocket("/ws/live")
@@ -239,9 +245,7 @@ async def websocket_live(websocket: WebSocket):
     last_path_v = -1
     last_nodes_v = -1
     last_edges_v = -1
-    last_costmap_v = -1
-    last_costmap_debug_v = -1
-    last_costmap_debug_nodes_v = -1
+    last_teb_obstacles_v = -1
     try:
         while True:
             state = ros_bridge.get_live_state()
@@ -264,20 +268,10 @@ async def websocket_live(websocket: WebSocket):
                 frame["graph_edges_version"] = state["graph_edges_version"]
                 last_edges_v = state["graph_edges_version"]
 
-            if state.get("local_costmap_version", 0) != last_costmap_v and state.get("local_costmap"):
-                frame["local_costmap"] = state["local_costmap"]
-                frame["local_costmap_version"] = state["local_costmap_version"]
-                last_costmap_v = state["local_costmap_version"]
-
-            if state.get("local_costmap_debug_version", 0) != last_costmap_debug_v and state.get("local_costmap_debug"):
-                frame["local_costmap_debug"] = state["local_costmap_debug"]
-                frame["local_costmap_debug_version"] = state["local_costmap_debug_version"]
-                last_costmap_debug_v = state["local_costmap_debug_version"]
-
-            if state.get("local_costmap_debug_nodes_version", 0) != last_costmap_debug_nodes_v and state.get("local_costmap_debug_nodes"):
-                frame["local_costmap_debug_nodes"] = state["local_costmap_debug_nodes"]
-                frame["local_costmap_debug_nodes_version"] = state["local_costmap_debug_nodes_version"]
-                last_costmap_debug_nodes_v = state["local_costmap_debug_nodes_version"]
+            if state.get("teb_obstacles_version", 0) != last_teb_obstacles_v:
+                frame["teb_obstacles"] = state.get("teb_obstacles", [])
+                frame["teb_obstacles_version"] = state["teb_obstacles_version"]
+                last_teb_obstacles_v = state["teb_obstacles_version"]
 
             await websocket.send_text(json.dumps(frame))
             await asyncio.sleep(0.1)  # 10Hz 稳定推送

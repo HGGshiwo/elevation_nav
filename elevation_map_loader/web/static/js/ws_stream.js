@@ -79,19 +79,9 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             }
         }
 
-        // 3. 1:1 流形局部代价地图更新
-        if (frame.local_costmap && localCostmapVisualizer) {
-            localCostmapVisualizer.update(frame.local_costmap);
-        }
-
-        // 3.5 逐格成因码调试图层更新
-        if (frame.local_costmap_debug && localCostmapVisualizer) {
-            localCostmapVisualizer.updateDebug(frame.local_costmap_debug);
-        }
-
-        // 3.6 逐格胜出节点 id 调试图层更新
-        if (frame.local_costmap_debug_nodes && localCostmapVisualizer) {
-            localCostmapVisualizer.updateDebugNodes(frame.local_costmap_debug_nodes);
+        // 3. 供给 TEB 的几何障碍物更新 (替代原 2D costmap 像素点)
+        if (frame.teb_obstacles !== undefined && localCostmapVisualizer) {
+            localCostmapVisualizer.updateTebObstacles(frame.teb_obstacles);
         }
 
         // 4. 增量图层更新

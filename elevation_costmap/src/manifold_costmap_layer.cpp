@@ -35,8 +35,9 @@ void ManifoldCostmapLayer::onInitialize()
 
   private_nh.param<std::string>("map_frame",   map_frame_,   "map");
   private_nh.param<std::string>("base_frame",  base_frame_,  "base_link");
-  private_nh.param<std::string>("cloud_topic", cloud_topic_, "/lidar_points");
-  private_nh.param<std::string>("plan_topic",  plan_topic_,  "/move_base/ElevationGlobalPlanner/global_plan");
+  private_nh.param<std::string>("cloud_topic",     cloud_topic_,     "/lidar_points");
+  private_nh.param<std::string>("plan_topic",      plan_topic_,      "/move_base/ElevationGlobalPlanner/global_plan");
+  private_nh.param<std::string>("obstacles_topic", obstacles_topic_, "/move_base/TebLocalPlannerROS/obstacles");
   private_nh.param<double>("fusion_rate",        fusion_rate_, 10.0);
   private_nh.param<double>("crop_radius_xy",     crop_radius_xy_, 2.0);
   private_nh.param<double>("crop_height_above",  crop_height_above_, 2.0);
@@ -80,6 +81,7 @@ void ManifoldCostmapLayer::onInitialize()
   cloud_sub_ = nh.subscribe(cloud_topic_, 1, &ManifoldCostmapLayer::cloudCallback, this);
   plan_sub_  = nh.subscribe(plan_topic_,  1, &ManifoldCostmapLayer::planCallback,  this);
   costmap_pub_ = nh.advertise<nav_msgs::OccupancyGrid>("/elevation_local_costmap", 1, /*latch=*/true);
+  obstacles_pub_ = nh.advertise<costmap_converter::ObstacleArrayMsg>(obstacles_topic_, 1, /*latch=*/false);
   debug_pub_ = nh.advertise<nav_msgs::OccupancyGrid>("/elevation_local_costmap_debug", 1, /*latch=*/true);
   debug_nodes_pub_ = nh.advertise<std_msgs::Int32MultiArray>("/elevation_local_costmap_debug_nodes", 1, /*latch=*/true);
 
@@ -245,7 +247,8 @@ void ManifoldCostmapLayer::fusionAndCarpetLoop()
       std::vector<int8_t> reasons;
       std::vector<int32_t> winner_ids;
       geometry_msgs::TransformStamped dummy_tf;
-      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf, &reasons, &winner_ids))
+      costmap_converter::ObstacleArrayMsg obstacles_msg;
+      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf, &reasons, &winner_ids, &obstacles_msg))
       {
         // 成因码调试图层: 与地毯同几何, data 逐格 CellReason (供 Web 点击诊断)
         nav_msgs::OccupancyGrid debug_grid = grid;
@@ -277,11 +280,13 @@ void ManifoldCostmapLayer::fusionAndCarpetLoop()
         {
           std::lock_guard<std::mutex> lock(grid_mutex_);
           cached_grid_ = grid;
+          cached_obstacles_ = obstacles_msg;
           cached_debug_ = debug_grid;
           cached_debug_nodes_ = debug_nodes;
           has_cached_grid_ = true;
         }
         costmap_pub_.publish(grid);
+        obstacles_pub_.publish(obstacles_msg);
         debug_pub_.publish(debug_grid);
         debug_nodes_pub_.publish(debug_nodes);
       }

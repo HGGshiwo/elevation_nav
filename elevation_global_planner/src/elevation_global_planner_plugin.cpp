@@ -9,6 +9,8 @@
 #include <pluginlib/class_list_macros.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/crop_box.h>
+#include <yaml-cpp/yaml.h>
 #include <string>
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
@@ -18,6 +20,38 @@
 
 namespace elevation_global_planner
 {
+
+struct CropBoxConfig {
+  bool enable{false};
+  float min_x{-100.0f};
+  float max_x{100.0f};
+  float min_y{-100.0f};
+  float max_y{100.0f};
+  float min_z{-100.0f};
+  float max_z{100.0f};
+};
+
+static CropBoxConfig parseCropBoxConfig(const std::string & yaml_file)
+{
+  CropBoxConfig cfg;
+  if (yaml_file.empty()) return cfg;
+  try {
+    YAML::Node root = YAML::LoadFile(yaml_file);
+    if (root["crop_box"] && root["crop_box"].IsMap()) {
+      auto node = root["crop_box"];
+      if (node["enable"]) cfg.enable = node["enable"].as<bool>();
+      if (node["min_x"]) cfg.min_x = node["min_x"].as<float>();
+      if (node["max_x"]) cfg.max_x = node["max_x"].as<float>();
+      if (node["min_y"]) cfg.min_y = node["min_y"].as<float>();
+      if (node["max_y"]) cfg.max_y = node["max_y"].as<float>();
+      if (node["min_z"]) cfg.min_z = node["min_z"].as<float>();
+      if (node["max_z"]) cfg.max_z = node["max_z"].as<float>();
+    }
+  } catch (const std::exception & e) {
+    ROS_WARN("[ElevationGlobalPlanner] Failed to parse crop_box from %s: %s", yaml_file.c_str(), e.what());
+  }
+  return cfg;
+}
 
 /**
  * @brief move_base 全局规划器插件: 离线 PCD -> 多层流形拓扑图 -> 跨层 A* + 平滑。
@@ -41,6 +75,7 @@ public:
 
     ros::NodeHandle private_nh("~/" + name);
     private_nh.param<std::string>("map_frame", map_frame_, "map");
+    private_nh.param<std::string>("map_config_file", map_config_file_, "");
 
     elevation_planner::GraphBuildConfig cfg;
     private_nh.param<double>("resolution", cfg.resolution, 0.10);
@@ -68,7 +103,7 @@ public:
     std::string pcd_file;
     private_nh.param<std::string>("pcd_file", pcd_file, "");
     if (!pcd_file.empty()) {
-      loadMap(pcd_file);
+      loadMap(pcd_file, map_config_file_);
     }
 
     initialized_ = true;
@@ -127,14 +162,53 @@ public:
   }
 
 private:
-  void loadMap(const std::string & path)
+  void loadMap(const std::string & path, const std::string & override_map_config = "")
   {
+    std::string active_map_config = override_map_config.empty() ? map_config_file_ : override_map_config;
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
     if (pcl::io::loadPCDFile<pcl::PointXYZ>(path, *cloud) == -1) {
       ROS_ERROR("[ElevationGlobalPlanner] Failed to read PCD file: %s", path.c_str());
       return;
     }
-    ROS_INFO("[ElevationGlobalPlanner] Loaded PCD with %zu points, building manifold graph...", cloud->size());
+    ROS_INFO("[ElevationGlobalPlanner] Loaded raw PCD with %zu points", cloud->size());
+
+    // 1. 点云空间三维裁剪 (CropBox)
+    if (!active_map_config.empty()) {
+      CropBoxConfig crop = parseCropBoxConfig(active_map_config);
+      if (crop.enable) {
+        pcl::CropBox<pcl::PointXYZ> box;
+        box.setInputCloud(cloud);
+        box.setMin(Eigen::Vector4f(crop.min_x, crop.min_y, crop.min_z, 1.0f));
+        box.setMax(Eigen::Vector4f(crop.max_x, crop.max_y, crop.max_z, 1.0f));
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cropped(new pcl::PointCloud<pcl::PointXYZ>);
+        box.filter(*cropped);
+        ROS_INFO("[ElevationGlobalPlanner] CropBox applied: %zu -> %zu points ([%.2f, %.2f] x [%.2f, %.2f] x [%.2f, %.2f])",
+                 cloud->size(), cropped->size(),
+                 crop.min_x, crop.max_x, crop.min_y, crop.max_y, crop.min_z, crop.max_z);
+        cloud = cropped;
+      }
+
+      // 2. 覆盖流形拓扑图构建参数 (抗空洞: min_cluster_points, sor_mean_k)
+      try {
+        YAML::Node root = YAML::LoadFile(active_map_config);
+        if (root["manifold_graph"]) {
+          auto mg = root["manifold_graph"];
+          auto cfg = builder_.getConfig();
+          if (mg["sor_mean_k"]) cfg.sor_mean_k = mg["sor_mean_k"].as<int>();
+          if (mg["min_cluster_points"]) cfg.min_cluster_points = mg["min_cluster_points"].as<int>();
+          builder_.setConfig(cfg);
+          ROS_INFO("[ElevationGlobalPlanner] Overrode manifold_graph params: sor_mean_k=%d, min_cluster_points=%d",
+                   cfg.sor_mean_k, cfg.min_cluster_points);
+        }
+      } catch (...) {}
+    }
+
+    if (cloud->empty()) {
+      ROS_ERROR("[ElevationGlobalPlanner] Point cloud is empty after cropping!");
+      return;
+    }
+
+    ROS_INFO("[ElevationGlobalPlanner] Building manifold graph from %zu points...", cloud->size());
 
     ros::Time t0 = ros::Time::now();
     auto table = std::make_shared<elevation_planner::ColumnTable>();
@@ -176,8 +250,16 @@ private:
   void onPcdCmd(const std_msgs::String::ConstPtr & msg)
   {
     if (msg && !msg->data.empty()) {
-      ROS_INFO("[ElevationGlobalPlanner] Received PCD switch command: %s", msg->data.c_str());
-      loadMap(msg->data);
+      std::string pcd_path = msg->data;
+      std::string custom_config = "";
+      size_t sep = pcd_path.find(';');
+      if (sep != std::string::npos) {
+        custom_config = pcd_path.substr(sep + 1);
+        pcd_path = pcd_path.substr(0, sep);
+      }
+      ROS_INFO("[ElevationGlobalPlanner] Received PCD switch command: %s (map_config: %s)",
+               pcd_path.c_str(), custom_config.empty() ? "(default)" : custom_config.c_str());
+      loadMap(pcd_path, custom_config);
     }
   }
 
@@ -215,6 +297,7 @@ private:
   }
 
   std::string map_frame_;
+  std::string map_config_file_;
   bool initialized_{false};
   bool has_map_{false};
 

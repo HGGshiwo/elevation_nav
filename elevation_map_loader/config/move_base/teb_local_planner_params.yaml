@@ -39,20 +39,19 @@ TebLocalPlannerROS:
   force_reinit_new_goal_dist: 0.5
   feasibility_check_no_poses: 1
 
-  # ---- 障碍物与代价地图避障 (主动提前外绕) ----
+  # ---- 障碍物与三维流形几何避障 (正障碍圆柱 + 楼梯边缘护栏折线) ----
   # min_obstacle_dist 为轨迹到障碍的硬下限 (从八边形轮廓边界量起):
-  # 0.04 属贴脸距离, 无任何误差缓冲; 0.08 给出安全余量同时保持窄通道可通过
-  # (机身宽 0.26m + 2*0.08 = 0.42m 净走廊需求)
   min_obstacle_dist: 0.08
-  include_costmap_obstacles: true
+  # 关闭从代价地图读取海量离散点，直接消费 ManifoldObstacleExtractor 发布的结构化几何障碍物
+  include_costmap_obstacles: false
   costmap_obstacles_behind_robot_dist: 1.0
   obstacle_poses_affected: 15
-  inflation_dist: 0.35
+  inflation_dist: 0.30
   costmap_converter_plugin: ""
 
   # ---- 优化器权重 (增大避障斥力, 拐角主动提前外绕) ----
-  no_inner_iterations: 4
-  no_outer_iterations: 3
+  no_inner_iterations: 5
+  no_outer_iterations: 4
   penalty_epsilon: 0.05
   weight_max_vel_x: 1.0
   weight_max_vel_y: 1.0
@@ -66,14 +65,22 @@ TebLocalPlannerROS:
   weight_kinematics_forward_drive: 5.0
   weight_kinematics_turning_radius: 0.0
   weight_optimaltime: 0.5
-  weight_obstacle: 20.0
+  weight_obstacle: 15.0
   weight_viapoint: 0.2
-  weight_inflation: 3.0
+  weight_inflation: 2.0
 
-  # ---- 同伦类规划 (关闭以提升实时性与狭窄通道稳定性) ----
-  enable_homotopy_class_planning: false
+  # ---- 同伦类规划 (基于稀疏流形障碍物的拓扑多路径并行探索) ----
+  enable_homotopy_class_planning: true
   enable_multithreading: true
-  max_number_classes: 2
+  max_number_classes: 4
+  selection_cost_hysteresis: 1.0
+  selection_prefer_initial_plan: 0.95
+  selection_obst_cost_scale: 1.0
+  selection_viapoint_cost_scale: 1.0
+  roadmap_graph_no_samples: 15
+  roadmap_graph_area_width: 5
+  h_signature_prescaler: 1.0
+  h_signature_threshold: 0.1
 
   # 调试可视化
   publish_feedback: false

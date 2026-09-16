@@ -2,6 +2,7 @@
 <launch>
     <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/map-segment.pcd"/>
     <arg name="config_file" default="$(find elevation_map_loader)/config/parameters.yaml"/>
+    <arg name="map_config_file" default="$(find elevation_map_loader)/config/map_crop_config.yaml"/>
     <arg name="resolution" default="0.10"/>
     <arg name="web_port" default="8080"/>
 
@@ -9,6 +10,7 @@
     <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
         <param name="pcd_file" value="$(arg pcd_file)"/>
         <param name="config_file" value="$(arg config_file)"/>
+        <param name="map_config_file" value="$(arg map_config_file)"/>
         <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
         <param name="grid_map_topic" value="/grid_map"/>
         <param name="frame_id" value="map"/>
@@ -24,6 +26,7 @@
         <param name="map_frame" value="map"/>
         <param name="base_frame" value="base_link"/>
         <param name="max_layers" value="3"/>
+        <param name="map_config_file" value="$(arg map_config_file)"/>
     </node>
 
     <!-- 3. 局部轨迹优化与机体控制 (elevation_local_planner) -->

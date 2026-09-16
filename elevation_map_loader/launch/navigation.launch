@@ -14,6 +14,7 @@
 
     <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/map-segment.pcd"/>
     <arg name="config_file" default="$(find elevation_map_loader)/config/parameters.yaml"/>
+    <arg name="map_config_file" default="$(find elevation_map_loader)/config/map_crop_config.yaml"/>
     <arg name="resolution" default="0.10"/>
     <arg name="web_port" default="8080"/>
     <arg name="point_cloud_topic" default="/lidar_points"/>
@@ -23,6 +24,7 @@
     <node pkg="elevation_map_loader" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
         <param name="pcd_file" value="$(arg pcd_file)"/>
         <param name="config_file" value="$(arg config_file)"/>
+        <param name="map_config_file" value="$(arg map_config_file)"/>
         <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
         <param name="grid_map_topic" value="/grid_map"/>
         <param name="frame_id" value="map"/>
@@ -36,6 +38,7 @@
     <!-- 2. move_base: 全局流形 A* 插件 + 局部规划器 (astar / teb 可选) -->
     <include file="$(find elevation_map_loader)/launch/move_base.launch">
         <arg name="pcd_file" value="$(arg pcd_file)"/>
+        <arg name="map_config_file" value="$(arg map_config_file)"/>
         <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
         <arg name="local_planner" value="$(arg local_planner)"/>
     </include>

@@ -75,14 +75,9 @@ const editor = initEditor(scene, camera, renderer, controls, layers, editPlane, 
 const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, localCostmapVisualizer);
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
-// 局部代价地图显隐控制
-document.getElementById('show-local-costmap')?.addEventListener('change', (e) => {
-    localCostmapVisualizer.setVisible(e.target.checked);
-});
-
-// 代价地图调试染色模式 (按逐格成因码染色, 配合"调试方块"工具点击格子诊断)
-document.getElementById('show-costmap-debug')?.addEventListener('change', (e) => {
-    localCostmapVisualizer.setDebugMode(e.target.checked);
+// TEB 结构化几何障碍物显隐控制 (替代原 2D 稠密 costmap 地毯)
+document.getElementById('show-teb-obstacles')?.addEventListener('change', (e) => {
+    localCostmapVisualizer.setObstaclesVisible(e.target.checked);
 });
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----

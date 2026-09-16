@@ -42,12 +42,12 @@ bool findNearestNodeAny(const ManifoldGraph & graph, double qx, double qy, doubl
 }
 
 // 机体胶囊扫掠硬碰撞: 沿 u->v 线段采样, 硬半径内出现 "本行走层" 的禁行节点即剐蹭。
-// 垂直方向仅做选层切一刀: 只算 [sz, sz + dog_height] 内的禁行节点——
-// 身体在脚平面以上, 行走面以下的点 (被踩的台阶/下层楼板/矮沿) 碰不到身体;
-// 与行走面同高的禁行点仍算碰撞 (低顶通道以同高禁行点标记)
-// (建边丢弃与诊断报因共用同一判据, 保证口径一致)
+// 垂直方向障碍碰撞判据:
+// 1. 结构高出当前踏面超过单步攀爬极限 (nd.z > sz + max_step_height) 才算撞墙, 允许逐级台阶正常架边;
+// 2. 结构落入机体垂直高度包络内 (nd.z <= sz + dog_height);
+// 3. 排除仅因头顶净空不足标记禁行的下层地面 (BLOCK_HEADROOM 并非实心直立墙体)
 bool segmentHitsHardInflation(const ManifoldGraph & graph, const GraphNode & u, const GraphNode & v,
-                              double hard_radius, double dog_height, double res)
+                              double hard_radius, double dog_height, double res, double max_step_height = 0.25)
 {
   const int rad = std::max(1, static_cast<int>(std::ceil(hard_radius / res)));
   const float seg_len = std::hypot(v.x - u.x, v.y - u.y);
@@ -65,7 +65,9 @@ bool segmentHitsHardInflation(const ManifoldGraph & graph, const GraphNode & u, 
         for (uint32_t nid : graph.getSpatialCellNodes(r + dr, c + dc)) {
           const auto & nd = graph.getNode(nid);
           if (nd.traversability < 0.95f ||
-              nd.z < sz || nd.z > sz + dog_height) continue;
+              (nd.flags & node_flags::BLOCK_HEADROOM) ||
+              nd.z <= sz + static_cast<float>(max_step_height) ||
+              nd.z > sz + dog_height) continue;
           return true;
         }
       }
@@ -415,7 +417,7 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
   // 机体胶囊扫掠检查: 沿 u->v 线段采样, 硬半径内出现本行走层禁行节点则该步会剐蹭, 丢弃此边
   auto sweepHardCollision = [&](const GraphNode & u, const GraphNode & v) -> bool {
     return segmentHitsHardInflation(out_graph, u, v,
-                                    config_.body_hard_radius, config_.dog_height, res);
+                                    config_.body_hard_radius, config_.dog_height, res, config_.max_step_height);
   };
 
   // 机体扫掠软代价: 线段附近足印半径内的软膨胀区越多, 该边代价越高 (引导路径远离墙体)
@@ -672,7 +674,7 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
       if (reachable) {
         reasons.push_back("两点在同一连通域内, 经多跳短边链可达 (稀疏图无直连边属正常, A* 可正常规划)");
       } else if (segmentHitsHardInflation(graph, u, v, config_.body_hard_radius, config_.dog_height,
-                                          config_.resolution)) {
+                                          config_.resolution, config_.max_step_height)) {
         reasons.push_back("机体扫掠碰撞: 两端虽可站立, 但连线剐蹭硬膨胀禁行区 (典型为转角内切)");
       } else {
         reasons.push_back("两踏面不属于同一层簇或不在搜索窗口内");

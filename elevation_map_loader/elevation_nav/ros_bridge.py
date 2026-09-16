@@ -21,6 +21,11 @@ from grid_map_msgs.msg import GridMap, GridMapInfo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import MarkerArray
+try:
+    from costmap_converter.msg import ObstacleArrayMsg
+    HAS_COSTMAP_CONVERTER = True
+except ImportError:
+    HAS_COSTMAP_CONVERTER = False
 import numpy as np
 
 def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -74,6 +79,9 @@ class ElevationRosBridge:
         # 局部代价地图逐格胜出节点 id (调试图层)
         self.local_costmap_debug_nodes: Optional[Dict[str, Any]] = None
         self.local_costmap_debug_nodes_version = 0
+        # 供给 TEB 局部规划器的结构化几何障碍物 (替代稠密 costmap)
+        self.teb_obstacles: List[Dict[str, Any]] = []
+        self.teb_obstacles_version = 0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -160,13 +168,9 @@ class ElevationRosBridge:
             rospy.Subscriber("/move_base/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/elevation_local_plan", ROSPath, self._local_path_callback, queue_size=2)
 
-            # 订阅局部代价地图 (1:1 流形局部代价地图与原生 local_costmap)
-            rospy.Subscriber("/elevation_local_costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
-            rospy.Subscriber("/move_base/local_costmap/costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
-            # 逐格成因码调试图层 (Web 点击诊断 "看不见的障碍")
-            rospy.Subscriber("/elevation_local_costmap_debug", OccupancyGrid, self._local_costmap_debug_callback, queue_size=1)
-            # 逐格胜出节点 id 调试图层 ([w, h, id...], id=-1 表示无节点)
-            rospy.Subscriber("/elevation_local_costmap_debug_nodes", Int32MultiArray, self._local_costmap_debug_nodes_callback, queue_size=1)
+            # 订阅供给 TEB 局部规划器的结构化几何障碍物 (替代原 2D 稠密 costmap)
+            if HAS_COSTMAP_CONVERTER:
+                rospy.Subscriber("/move_base/TebLocalPlannerROS/obstacles", ObstacleArrayMsg, self._teb_obstacles_callback, queue_size=2)
 
             # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
@@ -341,6 +345,72 @@ class ElevationRosBridge:
                 self.local_costmap_debug_version += 1
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 costmap debug 异常: {e}")
+
+    def _teb_obstacles_callback(self, msg: ObstacleArrayMsg):
+        """解析供给 TEB 的结构化几何障碍物 (替代稠密 costmap 像素点)"""
+        try:
+            obstacles_data = []
+            for idx, obs in enumerate(msg.obstacles):
+                pts = [[round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)] for p in obs.polygon.points]
+                radius = round(float(obs.radius), 3)
+                obs_id = int(obs.id) if obs.id > 0 else (idx + 1)
+
+                if radius > 0 and len(pts) >= 1:
+                    # 圆形障碍物 (柱体/聚类实体)
+                    obstacles_data.append({
+                        "id": obs_id,
+                        "type": "circle",
+                        "x": pts[0][0],
+                        "y": pts[0][1],
+                        "z": pts[0][2],
+                        "radius": radius,
+                        "source": "3D 空间正障碍聚类 (Physical Obstacle)",
+                        "reason": f"在机器狗垂直净空高度带内检测到激光点云实体（如立柱/障碍物），经欧氏聚类拟合为半径 {radius}m 的圆柱避障原语。",
+                        "teb_effect": "作为 CircularObstacle 激活 TEB 柯西积分同伦类规划 (HCP)，使机器狗能够从左侧或右侧探索多条拓扑等价路径并选出最优解。"
+                    })
+                elif radius == 0 and len(pts) == 2:
+                    # 线段障碍物 (楼梯断坎/无边界面边缘)
+                    dx = pts[1][0] - pts[0][0]
+                    dy = pts[1][1] - pts[0][1]
+                    length = round(math.hypot(dx, dy), 3)
+                    obstacles_data.append({
+                        "id": obs_id,
+                        "type": "line",
+                        "start": pts[0],
+                        "end": pts[1],
+                        "length": length,
+                        "source": "踏面断坎 / 悬空边缘 (Drop-off Boundary)",
+                        "reason": f"该线段外侧相邻网格无连通踏面（断坎或台阶高差跌落）。流形提取器沿台沿建立长 {length}m 的 3D 护栏，防止机体踏空跌落。",
+                        "teb_effect": "作为 LineObstacle 注入 TEB 优化图，利用解析线段投影距离施加斥力梯度惩罚，严格禁止局部轨迹穿越台沿边缘。"
+                    })
+                elif radius == 0 and len(pts) > 2:
+                    # 多边形障碍物 (大墙体凸包)
+                    obstacles_data.append({
+                        "id": obs_id,
+                        "type": "polygon",
+                        "points": pts,
+                        "source": "大型凸多边形墙体 (Convex Wall)",
+                        "reason": f"检测到由 {len(pts)} 个顶点围成的连续障碍实体，凸包算法拟合为刚性阻挡区域。",
+                        "teb_effect": "作为 PolygonObstacle 施加全足印多边形分离轴间距约束，引导机器狗在墙体外侧平滑绕行。"
+                    })
+                elif len(pts) == 1:
+                    obstacles_data.append({
+                        "id": obs_id,
+                        "type": "circle",
+                        "x": pts[0][0],
+                        "y": pts[0][1],
+                        "z": pts[0][2],
+                        "radius": radius if radius > 0 else 0.15,
+                        "source": "3D 空间单点障碍 (Point Obstacle)",
+                        "reason": "孤立小体积点云阻挡，拟合为紧凑圆形障碍物。",
+                        "teb_effect": "作为点/小圆避障体计算局部欧氏斥力势场。"
+                    })
+
+            with self._lock:
+                self.teb_obstacles = obstacles_data
+                self.teb_obstacles_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 teb obstacles 异常: {e}")
 
     # ------------------ 仿真运动学积分与 TF/Odom 高频广播 (移植自 jie_octomap) ------------------
     def _cmd_vel_callback(self, msg: Twist):
@@ -649,7 +719,9 @@ class ElevationRosBridge:
                 "local_costmap_debug": dict(self.local_costmap_debug) if self.local_costmap_debug else None,
                 "local_costmap_debug_version": self.local_costmap_debug_version,
                 "local_costmap_debug_nodes": dict(self.local_costmap_debug_nodes) if self.local_costmap_debug_nodes else None,
-                "local_costmap_debug_nodes_version": self.local_costmap_debug_nodes_version
+                "local_costmap_debug_nodes_version": self.local_costmap_debug_nodes_version,
+                "teb_obstacles": list(self.teb_obstacles) if self.teb_obstacles else [],
+                "teb_obstacles_version": self.teb_obstacles_version
             }
 
 

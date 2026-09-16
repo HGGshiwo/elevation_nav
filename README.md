@@ -222,7 +222,7 @@ flowchart TD
 | :--- | :--- | :--- |
 | `ElevationGlobalPlanner` | `elevation_global_planner/ElevationGlobalPlanner` | 离线 PCD 建图（柱表+全局图写入 GraphStore）、`makePlan` = 起终点锚定 → 跨层 A* → 平滑；全局图保持纯先验，不订阅实时点云 |
 | `AStarLocalPlanner` | `elevation_local_planner/AStarLocalPlanner` | 规划器 A (默认): 3D 流形局部 A* 动态避障与前瞻平滑跟踪控制（直接读取 GraphStore 融合图、遇阻实时重规划、速度平滑滤波） |
-| `TebLocalPlannerROS` | `teb_local_planner/TebLocalPlannerROS` | 规划器 B (可选): ROS 官方原生 TEB 局部规划器；直接消费 `elevation_costmap` 插件通过纯几何"地毯铺设"算法生成的 1:1 贴地局部 Costmap，实现时间最优轨迹优化与动态平滑避障 |
+| `Teb3DLocalPlanner` | `elevation_local_planner/Teb3DLocalPlanner` | 规划器 B (推荐): 深度融合 3D 流形连通图与真实三维空间几何障碍物体系的 TEB 局部规划器插件；原生复用 TEB 时空弹性带优化，接入 `LineObstacle3D`/`CylinderObstacle3D` 真实空间几何距离，并在多同伦探索阶段通过 `TrajectoryValidator` 执行流形图步高连续性与终点 Z 优选，彻底解决楼梯悬空切角与跨楼层混叠 |
 
 ### 4. 1:1 流形代价地图插件 (ManifoldCostmapLayer)
 
@@ -292,3 +292,32 @@ roslaunch elevation_map_loader navigation.launch sim:=false local_planner:=teb
 - **"调试代价地图"独立工具与面板**：点击地毯任意格子显示格子坐标、代价值、成因分类与说明、实际盖章节点（id/坐标/高度，含融合图降级显示）、最近踏面节点及距离；支持按成因染色（紫=无节点盖章、品红=拓扑缝、橙红=净空、红=侧向、黄=闭运算填充）、悬停实时高亮、一键复制诊断。
 - **纹理采样改为 NearestFilter**：移除格间双线性插值——插值产生的中间色不属于任何真实格子，掩盖格子级真相。
 - **漫游视角**：左键拖动改为 MC 式第一人称视角旋转（原地转头，位置不动），右键保留环绕旋转，WASD 跟随视线方向。
+
+---
+
+## 七、2026-09-16 更新：3D 流形局部规划器 (Teb3DLocalPlanner) 与空间三维几何障碍物体系
+
+### 1. 非侵入式解耦设计 (Non-intrusive Architecture)
+- **外部 TEB 纯净性**：保持官方 `teb_local_planner` 仓库 100% 原生纯净，无任何源码修改，通过 ROS 插件扩展机制（`nav_core::BaseLocalPlanner`）在 `elevation_local_planner` 中新增 `Teb3DLocalPlanner`。
+- **职责清晰**：TEB 原生库负责底盘运动学、动力学约束与弹性带优化求解；`elevation_local_planner` 负责注入三维流形图物理连续性、空间 3D 几何障碍物距离与候选轨迹优选。
+
+### 2. 空间三维几何障碍物体系 (manifold_obstacles_3d.h)
+传统 TEB 默认将所有障碍物通过 `.head(2)` 强制截断为 2D 平面点/线，导致楼下一层障碍物错误排斥楼上机器狗，且无法感知断崖。新体系重写了多态距离计算虚函数：
+- **`LineObstacle3D`（空间三维线段障碍物）**：
+  携带三维空间端点 $\mathbf{p}_1(x_1, y_1, z_1)$ 与 $\mathbf{p}_2(x_2, y_2, z_2)$。在求解器迭代时，实时计算机器狗采样点到三维空间线段的精确 3D 欧氏最短几何距离，对楼梯边缘与二楼悬崖提供刚性防护。
+- **`CylinderObstacle3D`（空间三维有限高圆柱体）**：
+  携带底面中心、半径与纵向高度区间 $[z_{min}, z_{max}]$。计算水平距离与垂直高度差的几何合成 $d_{3D} = \sqrt{d_{xy}^2 + d_z^2}$。上下楼层障碍物因空间高差垂直距离天然远离，零误排斥、零死锁。
+- **`PolygonObstacle3D`（空间三维多棱柱体）**：
+  提供空间异形多边形实体的三维欧氏距离计算。
+- **流形地表查询 `querySurfaceZ`**：
+  通过 `GraphStore::instance()` 零拷贝直接索引底层流形图，以 $O(1)$ 网格桶检索与近邻查找瞬时返回查询点对应的真实地表踏面高度。
+
+### 3. 基于三维流形图的多同伦候选轨迹优选 (TrajectoryValidator)
+- **根除平面拉直悬空切角**：原生 TEB 在二维平面上计算两点距离，楼梯台阶到悬空外侧仅 0.1m，极易因“时间最优/最短路径”将弹性带拉出楼梯外侧。
+- **流形物理连续性与步高检验**：
+  在 TEB 并行同伦类探索（HCP）生成多条候选等价轨迹后，`TrajectoryValidator` 遍历轨迹点，在流形图上逐段验证单步攀爬步高（$|dz| \le k \times \text{max\_step\_height}$）、途经中间踏面连续支撑以及终点 Z 匹配度。
+- **真 3D 优选**：跨楼层跳跃、坠落悬崖或终点高度不符的候选轨迹直接被剔除，仅在合规轨迹中根据综合代价值选出最优解下发速度指令。
+
+### 4. 障碍物提取器 Z 轴保护集修复 (manifold_obstacle_extractor.cpp)
+- **保护集高程感知**：修复原提取器使用 2D 网格哈希导致一楼平坦连续通道错误豁免二楼及楼梯侧缘断崖的缺陷。引入带高程判断的 `horiz_protected` 与 `vert_protected`，确保悬空边缘稳定生成带真实 Z 的 `LineObstacle3D`。
+

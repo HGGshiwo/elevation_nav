@@ -1,0 +1,46 @@
+# Configuration for map-specific point cloud cropping and synthetic/sparse map extraction
+# 空间点云裁剪 (CropBox) - 针对 map-segment.pcd 默认启用并配置实际三维边界
+crop_box:
+  enable: true
+  min_x: -15.0
+  max_x: -5.0
+  min_y: -17.0
+  max_y: -12.0
+  min_z: -3.0
+  max_z: 3.5                        # 精准裁掉 3.5m ~ 8.5m 的顶棚/天花板无用点云
+
+# grid_map_pcl 完整参数结构（包含全部 5 个必需模块）
+pcl_grid_map_extraction:
+  num_processing_threads: 4
+  cloud_transform:
+    translation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+    rotation: # intrinsic rotation X-Y-Z (r-p-y) sequence
+      r: 0.0
+      p: 0.0
+      y: 0.0
+  cluster_extraction:
+    cluster_tolerance: 0.08
+    min_num_points: 3
+    max_num_points: 1000000
+    use_max_height_as_cell_elevation: false
+  outlier_removal:
+    is_remove_outliers: false       # 关闭离群滤波，防止稀疏表面被误当噪点挖孔
+    mean_K: 10
+    stddev_threshold: 1.0
+  downsampling:
+    is_downsample_cloud: false      # 稀疏点云不额外降采样
+    voxel_size:
+      x: 0.03
+      y: 0.03
+      z: 0.03
+  grid_map:
+    min_num_points_per_cell: 1      # 最小点数设为 1，解决生成地图空洞问题
+    resolution: 0.10
+
+# 覆盖流形拓扑图参数
+manifold_graph:
+  sor_mean_k: 0                     # 流形图同步关闭离群滤波
+  min_cluster_points: 1             # 踏面单点成格

@@ -1,6 +1,7 @@
 <launch>
     <!-- move_base 节点: 全局 = 流形图 A* 插件; 局部 = 动态支持 astar (3D A*避障跟踪) 或 teb (原生TEB规划器) -->
     <arg name="pcd_file" default=""/>
+    <arg name="map_config_file" default=""/>
     <arg name="map_frame" default="map"/>
     <arg name="base_frame" default="base_link"/>
     <arg name="point_cloud_topic" default="/lidar_points"/>
@@ -20,7 +21,7 @@
         <param if="$(eval arg('local_planner') == 'astar')"
                name="base_local_planner" value="elevation_local_planner/AStarLocalPlanner"/>
         <param if="$(eval arg('local_planner') == 'teb')"
-               name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS"/>
+               name="base_local_planner" value="elevation_local_planner/Teb3DLocalPlanner"/>
 
         <!-- 明确指定 frame ids -->
         <param name="global_costmap/global_frame"     value="$(arg map_frame)"/>
@@ -35,6 +36,7 @@
         <!-- 全局插件配置: 离线 PCD 先验建图 (建图产物写入同进程 GraphStore 供局部图层零拷贝访问) -->
         <param name="ElevationGlobalPlanner/map_frame" value="$(arg map_frame)"/>
         <param name="ElevationGlobalPlanner/pcd_file"  value="$(arg pcd_file)"/>
+        <param name="ElevationGlobalPlanner/map_config_file" value="$(arg map_config_file)"/>
         <rosparam file="$(find elevation_map_loader)/config/planner_common.yaml" command="load" ns="ElevationGlobalPlanner"/>
 
         <!-- 局部插件配置: AStarLocalPlanner 专用参数 -->

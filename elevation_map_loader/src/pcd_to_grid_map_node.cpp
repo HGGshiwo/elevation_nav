@@ -7,8 +7,42 @@
 #include <std_msgs/String.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/crop_box.h>
+#include <yaml-cpp/yaml.h>
 
 #include "elevation_map_loader/manifold_forest.hpp"
+
+struct CropBoxConfig {
+  bool enable{false};
+  float min_x{-100.0f};
+  float max_x{100.0f};
+  float min_y{-100.0f};
+  float max_y{100.0f};
+  float min_z{-100.0f};
+  float max_z{100.0f};
+};
+
+static CropBoxConfig parseCropBoxConfig(const std::string & yaml_file)
+{
+  CropBoxConfig cfg;
+  if (yaml_file.empty()) return cfg;
+  try {
+    YAML::Node root = YAML::LoadFile(yaml_file);
+    if (root["crop_box"] && root["crop_box"].IsMap()) {
+      auto node = root["crop_box"];
+      if (node["enable"]) cfg.enable = node["enable"].as<bool>();
+      if (node["min_x"]) cfg.min_x = node["min_x"].as<float>();
+      if (node["max_x"]) cfg.max_x = node["max_x"].as<float>();
+      if (node["min_y"]) cfg.min_y = node["min_y"].as<float>();
+      if (node["max_y"]) cfg.max_y = node["max_y"].as<float>();
+      if (node["min_z"]) cfg.min_z = node["min_z"].as<float>();
+      if (node["max_z"]) cfg.max_z = node["max_z"].as<float>();
+    }
+  } catch (const std::exception & e) {
+    ROS_WARN("[PcdToGridMapNode] Failed to parse crop_box from %s: %s", yaml_file.c_str(), e.what());
+  }
+  return cfg;
+}
 
 class PcdToGridMapNode
 {
@@ -21,6 +55,7 @@ public:
     pnh.param<std::string>("grid_map_topic", grid_map_topic, "/grid_map");
     pnh.param<std::string>("frame_id", frame_id_, "map");
     pnh.param<std::string>("config_file", config_file_, "");
+    pnh.param<std::string>("map_config_file", map_config_file_, "");
 
     elevation_map_loader::ExtractorConfig cfg;
     pnh.param<double>("resolution", cfg.resolution, 0.10);
@@ -52,8 +87,16 @@ public:
   void onPcdFileCmd(const std_msgs::String::ConstPtr & msg)
   {
     if (msg && !msg->data.empty()) {
-      ROS_INFO("[PcdToGridMapNode] Received PCD switch command: %s", msg->data.c_str());
-      loadPcdAndProcess(msg->data);
+      std::string pcd_path = msg->data;
+      std::string custom_config = "";
+      size_t sep = pcd_path.find(';');
+      if (sep != std::string::npos) {
+        custom_config = pcd_path.substr(sep + 1);
+        pcd_path = pcd_path.substr(0, sep);
+      }
+      ROS_INFO("[PcdToGridMapNode] Received PCD switch command: %s (map_config: %s)",
+               pcd_path.c_str(), custom_config.empty() ? "(default)" : custom_config.c_str());
+      loadPcdAndProcess(pcd_path, custom_config);
     }
   }
 
@@ -62,14 +105,57 @@ public:
     publishMap();
   }
 
-  void loadPcdAndProcess(const std::string & pcd_path)
+  void loadPcdAndProcess(const std::string & pcd_path, const std::string & override_map_config = "")
   {
     ROS_INFO("[PcdToGridMapNode] Loading PCD file: %s", pcd_path.c_str());
+    std::string active_map_config = override_map_config.empty() ? map_config_file_ : override_map_config;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_path, *cloud) == -1) {
+      ROS_ERROR("[PcdToGridMapNode] Failed to read PCD file: %s", pcd_path.c_str());
+      return;
+    }
+    ROS_INFO("[PcdToGridMapNode] Loaded raw PCD: %zu points", cloud->size());
+
+    // 1. 点云空间三维裁剪 (CropBox)
+    if (!active_map_config.empty()) {
+      CropBoxConfig crop = parseCropBoxConfig(active_map_config);
+      if (crop.enable) {
+        pcl::CropBox<pcl::PointXYZ> box;
+        box.setInputCloud(cloud);
+        box.setMin(Eigen::Vector4f(crop.min_x, crop.min_y, crop.min_z, 1.0f));
+        box.setMax(Eigen::Vector4f(crop.max_x, crop.max_y, crop.max_z, 1.0f));
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cropped(new pcl::PointCloud<pcl::PointXYZ>);
+        box.filter(*cropped);
+        ROS_INFO("[PcdToGridMapNode] CropBox applied: %zu -> %zu points ([%.2f, %.2f] x [%.2f, %.2f] x [%.2f, %.2f])",
+                 cloud->size(), cropped->size(),
+                 crop.min_x, crop.max_x, crop.min_y, crop.max_y, crop.min_z, crop.max_z);
+        cloud = cropped;
+      }
+    }
+
+    if (cloud->empty()) {
+      ROS_ERROR("[PcdToGridMapNode] Point cloud is empty after cropping!");
+      return;
+    }
+
+    // 2. 网格与高程图提取参数：专属配置优先，缺省回退基础配置
+    std::string config_to_load = config_file_;
+    if (!active_map_config.empty()) {
+      try {
+        YAML::Node root = YAML::LoadFile(active_map_config);
+        if (root["pcl_grid_map_extraction"]) {
+          config_to_load = active_map_config;
+        }
+      } catch (...) {}
+    }
+    ROS_INFO("[PcdToGridMapNode] Applying grid map parameters from: %s", config_to_load.c_str());
+
     grid_map::GridMapPclLoader loader;
-    loader.loadParameters(config_file_);
+    loader.loadParameters(config_to_load);
 
     try {
-      loader.loadCloudFromPcdFile(pcd_path);
+      loader.setInputCloud(cloud);
       loader.preProcessInputCloud();
       loader.initializeGridMapGeometryFromInputCloud();
       loader.addLayerFromInputCloud("elevation");
@@ -102,6 +188,7 @@ public:
 private:
   std::string frame_id_;
   std::string config_file_;
+  std::string map_config_file_;
   elevation_map_loader::ManifoldForestExtractor extractor_;
 
   grid_map::GridMap grid_map_;

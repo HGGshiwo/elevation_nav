@@ -59,6 +59,7 @@ private:
   ros::Subscriber cloud_sub_;
   ros::Subscriber plan_sub_;
   ros::Publisher costmap_pub_; // 方便 RViz/Web 可视化
+  ros::Publisher obstacles_pub_;   // 供给 TEB 原生同伦类消费的稀疏几何障碍物
   ros::Publisher debug_pub_;       // 逐格成因码调试图层 (与地毯同几何, data=CellReason)
   ros::Publisher debug_nodes_pub_; // 逐格胜出节点 id (Int32MultiArray: [w, h, id...])
 
@@ -66,6 +67,7 @@ private:
   std::string base_frame_{"base_link"};
   std::string cloud_topic_{"/lidar_points"};
   std::string plan_topic_{"/move_base/ElevationGlobalPlanner/global_plan"};
+  std::string obstacles_topic_{"/move_base/TebLocalPlannerROS/obstacles"};
 
   double fusion_rate_{10.0};
   double crop_radius_xy_{2.0};
@@ -85,8 +87,9 @@ private:
   std::shared_ptr<elevation_planner::ManifoldGraph> fused_graph_;
   std::mutex fused_graph_mutex_;
 
-  // 内部缓存的最新的 1:1 地图
+  // 内部缓存的最新的 1:1 地图与结构化障碍物
   nav_msgs::OccupancyGrid cached_grid_;
+  costmap_converter::ObstacleArrayMsg cached_obstacles_;
   nav_msgs::OccupancyGrid cached_debug_;
   std_msgs::Int32MultiArray cached_debug_nodes_;
   bool has_cached_grid_{false};

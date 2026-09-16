@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   costmap_2d
+  costmap_converter
   elevation_planner_core
 )
 
@@ -34,6 +35,7 @@ catkin_package(
     tf2_ros
     tf2_geometry_msgs
     costmap_2d
+    costmap_converter
     elevation_planner_core
   DEPENDS PCL EIGEN3
 )
@@ -45,9 +47,10 @@ include_directories(
   ${EIGEN3_INCLUDE_DIRS}
 )
 
-# 1. 核心构建库
+# 1. 核心构建与几何障碍物提取库
 add_library(manifold_costmap_builder
   src/manifold_costmap_builder.cpp
+  src/manifold_obstacle_extractor.cpp
 )
 target_link_libraries(manifold_costmap_builder
   ${catkin_LIBRARIES}

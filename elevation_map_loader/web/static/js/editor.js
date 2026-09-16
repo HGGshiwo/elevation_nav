@@ -1,18 +1,18 @@
 import * as THREE from 'three';
-import { CELL_REASON_TEXT } from './local_costmap_visualizer.js';
 
 /**
  * 栅格地图交互与编辑模块 (Editor)
  * 完整实现：画笔、橡皮擦、设起点、设终点、Z轴编辑平面、游标拾取与体素增删
- * 按照要求：调试体素(debug)与调试空地(debug_air)保留完整面板切换与接口桩，待进一步确定
  */
 export function initEditor(scene, camera, renderer, controls, layers, editPlane, onDirty, graphVisualizer = null, costmapVisualizer = null, roamController = null) {
     const statusEl = document.getElementById('status');
     const brushSizeInput = document.getElementById('brush-size');
     const editLayerSelect = document.getElementById('edit-layer');
     const debugPanelDiv = document.getElementById('debug-panel');
-    const costmapPanelDiv = document.getElementById('costmap-panel');
     const btnCopyDebug = document.getElementById('btn-copy-debug');
+    const obsDebugPanelDiv = document.getElementById('obstacle-debug-panel');
+    const btnCopyObsDebug = document.getElementById('btn-copy-obs-debug');
+    const btnClearObsDebug = document.getElementById('btn-clear-obs-debug');
 
     let currentTool = 'view';
     let currentLayer = 'occupied';
@@ -45,7 +45,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 if (controls.mouseButtons) controls.mouseButtons.LEFT = null;
             } else if (currentTool === 'brush' || currentTool === 'eraser') {
                 controls.enabled = false;
-            } else { // start, goal, debug, costmap_debug: 左键用于交互拾取，右键保留视角旋转
+            } else { // start, goal, debug, obstacle_debug: 左键用于交互拾取，右键保留视角旋转
                 controls.enabled = true;
                 if (controls.mouseButtons) controls.mouseButtons.LEFT = null;
             }
@@ -56,17 +56,21 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             if (currentTool === 'view') {
                 cursor.visible = false;
             }
-            if (currentTool !== 'costmap_debug') {
-                // 离开代价地图调试工具时清除格子高亮
-                if (costmapVisualizer) costmapVisualizer.clearHighlight();
-            }
             if (graphVisualizer) graphVisualizer.clearHoveredNode();
             if (debugPanelDiv) {
                 debugPanelDiv.style.display = (currentTool === 'debug') ? 'block' : 'none';
             }
-            if (costmapPanelDiv) {
-                costmapPanelDiv.style.display = (currentTool === 'costmap_debug') ? 'block' : 'none';
+            if (obsDebugPanelDiv) {
+                // 点击后才显示调试信息，未点击选中时不显示
+                if (currentTool !== 'obstacle_debug' || !costmapVisualizer?.selectedObstacleId) {
+                    obsDebugPanelDiv.style.display = 'none';
+                }
             }
+            if (currentTool !== 'obstacle_debug' && costmapVisualizer) {
+                costmapVisualizer.clearSelection();
+                costmapVisualizer.clearHoveredObstacle();
+            }
+            renderer.domElement.style.cursor = 'default';
         });
     });
 
@@ -84,16 +88,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     // 射线拾取交互目标
     function getInteractionTarget() {
         raycaster.setFromCamera(mouse, camera);
-
-        // -1. 代价地图调试工具: 交互目标仅为贴地地毯格子
-        if (currentTool === 'costmap_debug') {
-            if (!costmapVisualizer || !costmapVisualizer.planeMesh) return null;
-            const carpetHits = raycaster.intersectObject(costmapVisualizer.planeMesh);
-            if (carpetHits.length > 0) {
-                return { type: 'costmap_cell', point: carpetHits[0].point };
-            }
-            return null;
-        }
 
         // 0. 若当前为设起点、设终点或调试方块，交互目标严格限制在 3D 流形踏面方块上！
         if (currentTool === 'start' || currentTool === 'goal' || currentTool === 'debug') {
@@ -383,94 +377,92 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         }
     }
 
-    // 代价地图格子诊断: 点击地毯空白处, 显示该格代价与成因 (成因码由 C++ 地毯构建器逐格记录)
-    function handleCostmapCellInspection(worldPoint) {
-        if (!costmapVisualizer) return;
-        const info = costmapVisualizer.highlightCell(worldPoint.x, worldPoint.y);
-        if (!info) {
-            if (statusEl) statusEl.innerText = '点击位置不在局部代价地图窗口内';
-            return;
-        }
-        const reasonInfo = CELL_REASON_TEXT ? CELL_REASON_TEXT[info.reason] : null;
+    // 障碍物排查诊断面板信息渲染
+    function showObstacleDebug(obs) {
+        if (!obs) return;
+        if (obsDebugPanelDiv) obsDebugPanelDiv.style.display = 'block';
 
-        const set = (id, text, color) => {
+        const idEl = document.getElementById('obs-id');
+        const typeEl = document.getElementById('obs-type');
+        const srcEl = document.getElementById('obs-source');
+        const zEl = document.getElementById('obs-z');
+        const geoEl = document.getElementById('obs-geometry');
+        const reasonEl = document.getElementById('obs-reason');
+        const tebEl = document.getElementById('obs-teb-effect');
+
+        if (idEl) idEl.innerText = obs.id !== undefined ? obs.id : '-';
+        if (typeEl) {
+            const typeMap = {
+                circle: '圆柱体 (CircularObstacle)',
+                line: '线段/护栏 (LineObstacle)',
+                polygon: '多边形 (PolygonObstacle)'
+            };
+            typeEl.innerText = typeMap[obs.type] || obs.type;
+        }
+        if (srcEl) srcEl.innerText = obs.source || '3D 结构化障碍物';
+
+        let zVal = '-';
+        let geoInfo = '-';
+
+        if (obs.type === 'circle') {
+            zVal = obs.z !== undefined ? `${Number(obs.z).toFixed(3)} m` : '-';
+            geoInfo = `圆心: (${Number(obs.x ?? 0).toFixed(2)}, ${Number(obs.y ?? 0).toFixed(2)})\n半径 R: ${Number(obs.radius ?? 0.15).toFixed(2)} m`;
+        } else if (obs.type === 'line') {
+            if (obs.start && obs.end) {
+                const zAvg = ((obs.start[2] + obs.end[2]) * 0.5).toFixed(3);
+                zVal = `${zAvg} m`;
+                geoInfo = `起点: (${obs.start[0].toFixed(2)}, ${obs.start[1].toFixed(2)})\n终点: (${obs.end[0].toFixed(2)}, ${obs.end[1].toFixed(2)})\n长度: ${obs.length !== undefined ? Number(obs.length).toFixed(2) : '-'} m`;
+            }
+        } else if (obs.type === 'polygon' && obs.points) {
+            if (obs.points.length > 0) {
+                const zAvg = (obs.points.reduce((acc, p) => acc + p[2], 0) / obs.points.length).toFixed(3);
+                zVal = `${zAvg} m`;
+                geoInfo = `顶点数: ${obs.points.length} 个\n首点: (${obs.points[0][0].toFixed(2)}, ${obs.points[0][1].toFixed(2)})`;
+            }
+        }
+
+        if (zEl) zEl.innerText = zVal;
+        if (geoEl) geoEl.innerText = geoInfo;
+        if (reasonEl) reasonEl.innerText = obs.reason || '由局部流形提取器根据点云或连通性边界生成。';
+        if (tebEl) tebEl.innerText = obs.teb_effect || '注入 TEB 局部规划器进行避障轨迹非线性求解。';
+    }
+
+    function clearObstacleDebugUI() {
+        ['obs-id', 'obs-type', 'obs-source', 'obs-z', 'obs-geometry', 'obs-reason', 'obs-teb-effect'].forEach(id => {
             const el = document.getElementById(id);
-            if (!el) return;
-            el.innerText = text;
-            if (color) el.style.color = color;
-        };
-
-        set('cm-cell-rc', `(${info.r}, ${info.c})`);
-        set('cm-cell-xy', `(${info.x.toFixed(2)}, ${info.y.toFixed(2)})`);
-
-        let costText = String(info.cost);
-        let costColor = '#ddd';
-        if (info.cost === 100) { costText += ' (致命)'; costColor = '#ff5252'; }
-        else if (info.cost > 0) { costText += ' (软代价)'; costColor = '#ffab40'; }
-        else if (info.cost === 0) { costText += ' (自由)'; costColor = '#69f0ae'; }
-        set('cm-cell-cost', costText, costColor);
-
-        if (info.reason === null || info.reason === undefined) {
-            set('cm-cell-reason', '无调试图层数据', '#ffab40');
-            set('cm-cell-detail', '未收到 /elevation_local_costmap_debug, 请确认 elevation_costmap 已更新并重启', '#ffab40');
-        } else {
-            set('cm-cell-reason', reasonInfo ? reasonInfo.label : `未知 (${info.reason})`, reasonInfo ? reasonInfo.color : '#ddd');
-            set('cm-cell-detail', reasonInfo ? reasonInfo.detail : '-');
-        }
-
-        // 实际盖章节点 (C++ 地毯构建器逐格记录的胜出节点 id)
-        // 优先走 C++ 下发的胜出节点坐标表 (融合图/全局图模式均精确);
-        // 表缺失时降级用 allNodeList 下标对照 (仅全局图模式成立, 且要求节点在格子 15cm 内)
-        let winnerText = '-';
-        if (info.nodeId === null || info.nodeId === undefined) {
-            winnerText = '无节点图层数据';
-        } else if (info.nodeId < 0) {
-            winnerText = '无单一归属节点 (默认致命 / 拓扑缝 / 闭运算填充)';
-        } else {
-            const viaTable = costmapVisualizer.getWinnerNode ? costmapVisualizer.getWinnerNode(info.nodeId) : null;
-            if (viaTable) {
-                winnerText = `#${info.nodeId} (${viaTable.x.toFixed(2)}, ${viaTable.y.toFixed(2)}, z=${viaTable.z.toFixed(2)}) trav=${viaTable.trav.toFixed(2)}`;
-            } else {
-                const wn = (graphVisualizer && graphVisualizer.allNodeList &&
-                            info.nodeId < graphVisualizer.allNodeList.length)
-                    ? graphVisualizer.allNodeList[info.nodeId] : null;
-                if (wn && Math.hypot(wn.x - info.x, wn.y - info.y) <= 0.15) {
-                    winnerText = `#${info.nodeId} (${wn.x.toFixed(2)}, ${wn.y.toFixed(2)}, z=${wn.z.toFixed(2)}) trav=${Number(wn.traversability).toFixed(2)}`;
-                } else {
-                    winnerText = `#${info.nodeId} (坐标表缺失, 坐标不可对照)`;
-                }
-            }
-        }
-        set('cm-cell-winner', winnerText);
-
-        // 最近踏面节点 (从流形图节点缓存中查找, 附盖章半径判读)
-        let nearestText = '-';
-        if (graphVisualizer && graphVisualizer.allNodeList && graphVisualizer.allNodeList.length > 0) {
-            let best = null, bestD = Infinity;
-            for (const n of graphVisualizer.allNodeList) {
-                const d = Math.hypot(n.x - info.x, n.y - info.y);
-                if (d < bestD) { bestD = d; best = n; }
-            }
-            if (best) {
-                const stampR = 0.08;
-                const tag = bestD <= stampR ? '在盖章半径内' : `超出盖章半径 ${stampR}m`;
-                nearestText = `(${best.x.toFixed(2)}, ${best.y.toFixed(2)}, z=${best.z.toFixed(2)}) ` +
-                    `trav=${Number(best.traversability).toFixed(2)}, 距离 ${bestD.toFixed(3)}m (${tag})`;
-            }
-        }
-        set('cm-cell-nearest', nearestText);
+            if (el) el.innerText = '-';
+        });
     }
 
     // 事件监听
     renderer.domElement.addEventListener('mousemove', (e) => {
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
         if (currentTool === 'view') {
             cursor.visible = false;
             return;
         }
 
-        const rect = renderer.domElement.getBoundingClientRect();
-        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        if (currentTool === 'obstacle_debug') {
+            cursor.visible = false;
+            if (graphVisualizer) graphVisualizer.clearHoveredNode();
+
+            if (costmapVisualizer) {
+                camera.updateMatrixWorld();
+                raycaster.setFromCamera(mouse, camera);
+                const obs = costmapVisualizer.pickObstacle(raycaster);
+                if (obs) {
+                    costmapVisualizer.setHoveredObstacle(obs.id);
+                    renderer.domElement.style.cursor = 'pointer';
+                } else {
+                    costmapVisualizer.clearHoveredObstacle();
+                    renderer.domElement.style.cursor = 'default';
+                }
+            }
+            return;
+        }
 
         // 在设起点/设终点/调试方块模式下，严格仅吸附流形方块，画笔游标立方体永久隐藏！
         if (currentTool === 'start' || currentTool === 'goal' || currentTool === 'debug') {
@@ -480,22 +472,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 if (graphVisualizer) graphVisualizer.highlightHoveredNode(target.node);
             } else {
                 if (graphVisualizer) graphVisualizer.clearHoveredNode();
-            }
-            return;
-        }
-
-        // 代价地图调试模式: 悬停实时高亮对应格子, 点击时在 mousedown 中诊断
-        if (currentTool === 'costmap_debug') {
-            cursor.visible = false;
-            if (graphVisualizer) graphVisualizer.clearHoveredNode();
-            if (costmapVisualizer && costmapVisualizer.planeMesh) {
-                raycaster.setFromCamera(mouse, camera);
-                const carpetHits = raycaster.intersectObject(costmapVisualizer.planeMesh);
-                if (carpetHits.length > 0) {
-                    costmapVisualizer.highlightCell(carpetHits[0].point.x, carpetHits[0].point.y);
-                } else {
-                    costmapVisualizer.clearHighlight();
-                }
             }
             return;
         }
@@ -522,11 +498,42 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         cursor.visible = false;
         isPainting = false;
         if (graphVisualizer) graphVisualizer.clearHoveredNode();
-        if (costmapVisualizer) costmapVisualizer.clearHighlight();
+        if (costmapVisualizer) {
+            costmapVisualizer.clearHoveredObstacle();
+            renderer.domElement.style.cursor = 'default';
+        }
     });
 
     renderer.domElement.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return; // 仅响应左键点击
+
+        if (currentTool === 'obstacle_debug') {
+            if (!costmapVisualizer) return;
+            camera.updateMatrixWorld();
+            raycaster.setFromCamera(mouse, camera);
+            const obs = costmapVisualizer.pickObstacle(raycaster);
+            if (obs) {
+                if (costmapVisualizer.selectedObstacleId === obs.id) {
+                    // 再次点击已选中的障碍物：取消选中并隐藏调试面板
+                    costmapVisualizer.clearSelection();
+                    clearObstacleDebugUI();
+                    if (obsDebugPanelDiv) obsDebugPanelDiv.style.display = 'none';
+                    if (statusEl) statusEl.innerText = `已取消选中障碍物 [ID: ${obs.id}]`;
+                } else {
+                    // 点击后才锁定选中，并显示详细调试诊断信息！
+                    costmapVisualizer.selectObstacle(obs.id);
+                    showObstacleDebug(obs);
+                    if (statusEl) statusEl.innerText = `已选中障碍物 [ID: ${obs.id}] (${obs.type})`;
+                }
+            } else {
+                costmapVisualizer.clearSelection();
+                clearObstacleDebugUI();
+                if (obsDebugPanelDiv) obsDebugPanelDiv.style.display = 'none';
+                if (statusEl) statusEl.innerText = `未点中障碍物，已清除选中`;
+            }
+            return;
+        }
+
         const target = getInteractionTarget();
         if (!target) return;
 
@@ -571,10 +578,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             if (target.type === 'snapped_node') {
                 handleDebugInspection(target.node);
             }
-        } else if (currentTool === 'costmap_debug') {
-            if (target && target.type === 'costmap_cell') {
-                handleCostmapCellInspection(target.point);
-            }
         }
     });
 
@@ -605,25 +608,23 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         });
     }
 
-    // 代价地图格子诊断一键复制
-    document.getElementById('btn-copy-costmap')?.addEventListener('click', () => {
-        const get = (id) => document.getElementById(id)?.innerText.trim() || '-';
-        const text = [
-            '=== 代价地图格子诊断 ===',
-            `格子坐标 (r, c): ${get('cm-cell-rc')}`,
-            `世界坐标 (X, Y): ${get('cm-cell-xy')}`,
-            `代价值: ${get('cm-cell-cost')}`,
-            `成因分类: ${get('cm-cell-reason')}`,
-            `实际盖章节点: ${get('cm-cell-winner')}`,
-            `成因说明: ${get('cm-cell-detail')}`,
-            `最近踏面节点: ${get('cm-cell-nearest')}`
-        ].join('\n');
-        navigator.clipboard.writeText(text).then(() => {
-            if (statusEl) statusEl.innerText = '已复制代价地图诊断信息到剪贴板';
-        }).catch(() => {
-            alert('复制失败, 请手动选择文本复制');
+    if (btnClearObsDebug) {
+        btnClearObsDebug.addEventListener('click', () => {
+            if (costmapVisualizer) costmapVisualizer.clearSelection();
+            clearObstacleDebugUI();
+            if (obsDebugPanelDiv) obsDebugPanelDiv.style.display = 'none';
+            if (statusEl) statusEl.innerText = '已清除障碍物高亮选择';
         });
-    });
+    }
+
+    if (btnCopyObsDebug) {
+        btnCopyObsDebug.addEventListener('click', () => {
+            const text = obsDebugPanelDiv ? obsDebugPanelDiv.innerText : '';
+            navigator.clipboard.writeText(text).then(() => {
+                alert("已复制障碍物排查诊断信息到剪贴板");
+            }).catch(() => {});
+        });
+    }
 
     return {
         getCurrentTool: () => currentTool,
