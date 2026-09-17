@@ -259,8 +259,10 @@ void ManifoldCostmapLayer::fusionAndCarpetLoop()
       std::vector<int32_t> winner_ids;
       geometry_msgs::TransformStamped dummy_tf;
       costmap_converter::ObstacleArrayMsg obstacles_msg;
-      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf, &reasons, &winner_ids, &obstacles_msg))
+      auto elevation_grid = std::make_shared<elevation_planner::LocalElevationGrid>();
+      if (costmap_builder_.buildCostmap(*active_graph, robot_pose, plan, grid, dummy_tf, &reasons, &winner_ids, &obstacles_msg, elevation_grid.get()))
       {
+        elevation_planner::GraphStore::instance().setLocalElevationGrid(elevation_grid);
         // 成因码调试图层: 与地毯同几何, data 逐格 CellReason (供 Web 点击诊断)
         nav_msgs::OccupancyGrid debug_grid = grid;
         debug_grid.data.assign(reasons.begin(), reasons.end());

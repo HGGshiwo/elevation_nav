@@ -578,6 +578,33 @@ bool Teb3DLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
   selected_teb->getVelocityCommand(cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z,
                                    cfg_.trajectory.control_look_ahead_poses);
 
+  // 8.1 真实 3D 空间几何步长速度校正 (克服楼梯/斜坡 2D 投影距离压缩导致的实际速度超限或失真)
+  if (selected_teb->teb().sizePoses() >= 2)
+  {
+    const auto & p0 = selected_teb->teb().Pose(0);
+    size_t lookahead_idx = std::min(static_cast<size_t>(cfg_.trajectory.control_look_ahead_poses),
+                                    static_cast<size_t>(selected_teb->teb().sizePoses() - 1));
+    if (lookahead_idx < 1) lookahead_idx = 1;
+    const auto & p1 = selected_teb->teb().Pose(lookahead_idx);
+
+    double dxy = (p1.position() - p0.position()).norm();
+    if (dxy > 1e-4)
+    {
+      double z0 = querySurfaceZ(p0.x(), p0.y(), robot_z, max_step_height_);
+      double z1 = querySurfaceZ(p1.x(), p1.y(), z0, max_step_height_);
+      double dz = z1 - z0;
+      double ds_3d = std::hypot(dxy, dz);
+      double slope_ratio = ds_3d / dxy; // 3D/2D 距离比率 >= 1.0
+
+      // 若机器狗沿坡面行走，实际 3D 运动线速度为 v_cmd * slope_ratio
+      // 当其超出机器狗动力学极限 max_vel_x 时，按比例压低水平投影指令，确保真实 3D 攀爬线速度不超限
+      if (std::abs(cmd_vel.linear.x) * slope_ratio > cfg_.robot.max_vel_x)
+      {
+        cmd_vel.linear.x = std::copysign(cfg_.robot.max_vel_x / slope_ratio, cmd_vel.linear.x);
+      }
+    }
+  }
+
   // 9. 构建并发布具备真实三维高程 Z 的局部规划路径与整体规划可视化
   if (visualization_)
   {
@@ -651,6 +678,13 @@ bool Teb3DLocalPlanner::isGoalReached()
   double dist_xy = std::hypot(dx, dy);
 
   if (dist_xy > cfg_.goal_tolerance.xy_goal_tolerance)
+  {
+    return false;
+  }
+
+  // 3D 高程高度差检查 (防止跨楼层/上下重叠层误判到达)
+  double dz = std::abs(robot_pose.pose.position.z - goal.pose.position.z);
+  if (dz > std::max(max_step_height_, 0.35))
   {
     return false;
   }

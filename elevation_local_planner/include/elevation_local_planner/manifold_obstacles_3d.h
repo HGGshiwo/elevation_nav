@@ -18,6 +18,18 @@ namespace elevation_local_planner
  */
 inline double querySurfaceZ(double x, double y, double ref_z, double max_dz = 0.25)
 {
+  // 1. 优先使用进程级零拷贝局部活动踏面高程网格以 O(1) 双线性插值极速查询 (消除多层重叠失真)
+  auto local_grid = elevation_planner::GraphStore::instance().getLocalElevationGrid();
+  double local_z = 0.0;
+  if (local_grid && local_grid->interpolateZ(x, y, local_z))
+  {
+    if (std::isnan(ref_z) || std::abs(local_z - ref_z) <= std::max(max_dz * 2.0, 0.50))
+    {
+      return local_z;
+    }
+  }
+
+  // 2. 局部网格超出范围或未命中时，回退到全局/融合流形图检索
   auto graph = elevation_planner::GraphStore::instance().getFusedGraph();
   if (!graph || graph->numNodes() == 0)
   {

@@ -55,9 +55,22 @@ public:
     }
 
     const double res = graph->getResolution();
+    auto local_grid = GraphStore::instance().getLocalElevationGrid();
 
-    // 踏面瞬时查询闭包: 在流形图中以 O(1) 检索 (x, y) 处与 ref_z 垂直接近的合法承载面
+    // 踏面瞬时查询闭包: 优先通过局部切片以 O(1) 查询，未命中时向全局流形图检索
     auto querySurface = [&](double x, double y, double ref_z, double max_dz) -> std::pair<bool, double> {
+      if (local_grid)
+      {
+        double lz = 0.0;
+        if (local_grid->interpolateZ(x, y, lz))
+        {
+          if (std::abs(lz - ref_z) <= max_dz)
+          {
+            return {true, lz};
+          }
+        }
+      }
+
       int r = 0, c = 0;
       if (!graph->toGridIndex(x, y, r, c))
       {

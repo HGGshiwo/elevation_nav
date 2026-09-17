@@ -5,6 +5,7 @@
 #include <geometry_msgs/TransformStamped.h>
 #include <costmap_converter/ObstacleArrayMsg.h>
 #include <elevation_planner_core/manifold_graph.hpp>
+#include <elevation_planner_core/local_elevation_grid.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <vector>
@@ -94,7 +95,8 @@ public:
                     geometry_msgs::TransformStamped & out_tf,
                     std::vector<int8_t> * out_reasons = nullptr,
                     std::vector<int32_t> * out_node_ids = nullptr,
-                    costmap_converter::ObstacleArrayMsg * out_obstacles = nullptr) const;
+                    costmap_converter::ObstacleArrayMsg * out_obstacles = nullptr,
+                    elevation_planner::LocalElevationGrid * out_elevation_grid = nullptr) const;
 
 private:
   ManifoldCostmapBuilderConfig config_;

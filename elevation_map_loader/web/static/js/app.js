@@ -75,7 +75,22 @@ const editor = initEditor(scene, camera, renderer, controls, layers, editPlane, 
 const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, localCostmapVisualizer);
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
-// TEB 结构化几何障碍物显隐控制 (替代原 2D 稠密 costmap 地毯)
+// 4.0 高程局部代价地图与成因染色控制
+document.getElementById('show-local-costmap')?.addEventListener('change', (e) => {
+    localCostmapVisualizer.setVisible(e.target.checked);
+});
+
+document.getElementById('show-costmap-debug')?.addEventListener('change', (e) => {
+    localCostmapVisualizer.setDebugMode(e.target.checked);
+    if (e.target.checked) {
+        const radio = document.querySelector('input[name="tool"][value="costmap_debug"]');
+        if (radio) {
+            radio.checked = true;
+            radio.dispatchEvent(new Event('change'));
+        }
+    }
+});
+
 document.getElementById('show-teb-obstacles')?.addEventListener('change', (e) => {
     localCostmapVisualizer.setObstaclesVisible(e.target.checked);
 });

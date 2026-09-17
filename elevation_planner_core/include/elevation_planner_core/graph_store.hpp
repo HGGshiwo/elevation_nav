@@ -2,6 +2,7 @@
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include "elevation_planner_core/manifold_graph.hpp"
+#include "elevation_planner_core/local_elevation_grid.hpp"
 
 #include <memory>
 #include <mutex>
@@ -61,6 +62,18 @@ public:
     return fused_graph_;
   }
 
+  void setLocalElevationGrid(std::shared_ptr<const LocalElevationGrid> grid)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    local_elevation_grid_ = std::move(grid);
+  }
+
+  std::shared_ptr<const LocalElevationGrid> getLocalElevationGrid() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return local_elevation_grid_;
+  }
+
 private:
   GraphStore() = default;
   GraphStore(const GraphStore &) = delete;
@@ -70,6 +83,7 @@ private:
   std::shared_ptr<const ColumnTable> global_table_;
   std::shared_ptr<const ManifoldGraph> global_graph_;
   std::shared_ptr<const ManifoldGraph> fused_graph_;
+  std::shared_ptr<const LocalElevationGrid> local_elevation_grid_;
 };
 
 } // namespace elevation_planner

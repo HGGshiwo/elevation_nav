@@ -31,7 +31,7 @@
             display: none;
             z-index: 10;
         }
-        #obstacle-debug-panel {
+        #costmap-panel {
             position: absolute;
             top: 10px;
             right: 10px;
@@ -40,7 +40,7 @@
             border-radius: 8px;
             width: 350px;
             box-shadow: 0 4px 14px rgba(0,0,0,0.6);
-            border: 1px solid #ff5252;
+            border: 1px solid #ffab40;
             display: none;
             z-index: 15;
         }
@@ -85,7 +85,7 @@
             <label><input type="radio" name="tool" value="start"> 设起点</label>
             <label><input type="radio" name="tool" value="goal"> 设终点</label>
             <label><input type="radio" name="tool" value="debug"> 调试方块</label>
-            <label><input type="radio" name="tool" value="obstacle_debug"> 调试障碍物</label>
+            <label><input type="radio" name="tool" value="costmap_debug"> 调试代价地图</label>
         </div>
         <div class="row">
             <span>目标图层:</span>
@@ -106,7 +106,9 @@
             <label><input type="checkbox" id="show-octomap-fused"> 融合Octomap(紫)</label>
             <label><input type="checkbox" id="show-emergency-stop"> 紧急制动探针</label>
             <label><input type="checkbox" id="show-robot" checked> 狗定位(蓝)</label>
-            <label><input type="checkbox" id="show-teb-obstacles" checked> 局部障碍(TEB)</label>
+            <label><input type="checkbox" id="show-local-costmap" checked> 高程代价地图</label>
+            <label><input type="checkbox" id="show-costmap-debug"> 地毯成因染色</label>
+            <label><input type="checkbox" id="show-teb-obstacles"> 3D几何障碍物</label>
             <label><input type="checkbox" id="show-local-path" checked> 局部规划(黄)</label>
             <label><input type="checkbox" id="follow-robot"> 跟随视角</label>
         </div>
@@ -178,29 +180,34 @@
             <button id="btn-clear-debug" style="background: #555;">清空选择</button>
         </div>
     </div>
-    <div id="obstacle-debug-panel">
-        <div class="debug-title" style="color: #ff5252; border-color: #ff5252;">3D 障碍物来源与成因排查</div>
-        <div style="font-size: 11px; color: #aaa; margin-bottom: 8px;">点击场景中任意 3D 障碍物，高亮显示（纯白边缘）并排查其物理来源与生成机理</div>
-
-        <div class="row"><span>障碍物编号 (ID):</span> <span id="obs-id" style="font-weight: bold; color: #00e5ff;">-</span></div>
-        <div class="row"><span>几何基元类型:</span> <span id="obs-type" style="font-weight: bold; color: #fff;">-</span></div>
-        <div class="row"><span>物理生成来源:</span> <span id="obs-source" style="color: #ffab40; font-weight: bold;">-</span></div>
-        <div class="row"><span>基准踏面高度 (Z):</span> <span id="obs-z" style="color: #69f0ae; font-weight: bold;">-</span></div>
+    <div id="costmap-panel">
+        <div class="debug-title" style="color: #ffab40; border-color: #ffab40;">高程代价地图与障碍物诊断</div>
+        <div style="font-size: 11px; color: #aaa; margin-bottom: 8px;">点击地毯任意格子，查询其物理高程 Z、代价值、实际盖章节点与物理成因来源（配合"地毯成因染色"按成因染色）</div>
+        <div style="font-size: 10px; color: #bbb; margin-bottom: 8px; line-height: 1.6;">
+            <span style="color:#c084fc;">■</span> 无节点
+            <span style="color:#69f0ae;">■</span> 自由
+            <span style="color:#ffab40;">■</span> 软代价
+            <span style="color:#ff5722;">■</span> 净空不足
+            <span style="color:#ff5252;">■</span> 侧向阻挡
+            <span style="color:#ff00ff;">■</span> 拓扑缝
+            <span style="color:#ffeb3b;">■</span> 闭运算
+        </div>
+        <div class="row"><span>格子索引 (r, c):</span> <span id="cm-cell-rc" style="font-weight: bold; color: #00e5ff;">-</span></div>
+        <div class="row"><span>世界平面坐标 (X, Y):</span> <span id="cm-cell-xy" style="color: #fff;">-</span></div>
+        <div class="row"><span>物理踏面高程 (Z):</span> <span id="cm-cell-z" style="color: #69f0ae; font-weight: bold;">-</span></div>
+        <div class="row"><span>代价数值 (Cost):</span> <span id="cm-cell-cost" style="font-weight: bold;">-</span></div>
+        <div class="row"><span>成因分类:</span> <span id="cm-cell-reason" style="font-weight: bold;">-</span></div>
         <div class="row" style="align-items: flex-start;">
-            <span>空间几何参数:</span>
-            <span id="obs-geometry" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-all; color: #e0e0e0;">-</span>
+            <span>实际盖章节点:</span>
+            <span id="cm-cell-winner" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-all; color: #4dd0e1;">-</span>
         </div>
         <div class="row" style="align-items: flex-start;">
-            <span>生成原因排查:</span>
-            <span id="obs-reason" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #ff5252;">-</span>
-        </div>
-        <div class="row" style="align-items: flex-start;">
-            <span>TEB 优化机制:</span>
-            <span id="obs-teb-effect" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #4dd0e1;">-</span>
+            <span>物理来源与说明:</span>
+            <span id="cm-cell-detail" style="font-size: 11px; text-align: right; max-width: 190px; word-break: break-word; color: #ffab40;">-</span>
         </div>
         <div style="display: flex; gap: 8px; margin-top: 10px;">
-            <button id="btn-copy-obs-debug" style="flex: 1; background: #2196F3;">一键复制诊断</button>
-            <button id="btn-clear-obs-debug" style="background: #555; flex: 1;">清除高亮选择</button>
+            <button id="btn-copy-costmap" style="flex: 1; background: #2196F3;">一键复制诊断</button>
+            <button id="btn-clear-costmap" style="background: #555; flex: 1;">清空选择</button>
         </div>
     </div>
     <div id="canvas-container"></div>

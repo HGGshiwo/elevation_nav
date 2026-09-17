@@ -171,6 +171,14 @@ class ElevationRosBridge:
             rospy.Subscriber("/move_base/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/elevation_local_plan", ROSPath, self._local_path_callback, queue_size=2)
 
+            # 订阅局部代价地图 (1:1 流形局部高程代价地图与原生 local_costmap)
+            rospy.Subscriber("/elevation_local_costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
+            rospy.Subscriber("/move_base/local_costmap/costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
+            # 逐格成因码调试图层 (Web 点击诊断 "看不见的障碍")
+            rospy.Subscriber("/elevation_local_costmap_debug", OccupancyGrid, self._local_costmap_debug_callback, queue_size=1)
+            # 逐格胜出节点 id 调试图层 ([w, h, id...], id=-1 表示无节点)
+            rospy.Subscriber("/elevation_local_costmap_debug_nodes", Int32MultiArray, self._local_costmap_debug_nodes_callback, queue_size=1)
+
             # 订阅供给 TEB 局部规划器的结构化几何障碍物 (替代原 2D 稠密 costmap)
             if HAS_COSTMAP_CONVERTER:
                 rospy.Subscriber("/move_base/TebLocalPlannerROS/obstacles", ObstacleArrayMsg, self._teb_obstacles_callback, queue_size=2)
