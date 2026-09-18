@@ -7,6 +7,8 @@
 #include <unordered_set>
 
 #include "elevation_costmap/manifold_obstacle_extractor.h"
+#include "elevation_planner_core/graph_store.hpp"
+#include "elevation_planner_core/topological_corridor.hpp"
 
 namespace elevation_costmap
 {
@@ -26,7 +28,6 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
                                          costmap_converter::ObstacleArrayMsg * out_obstacles,
                                          elevation_planner::LocalElevationGrid * out_elevation_grid) const
 {
-  (void)global_plan;
   if (graph.numNodes() == 0) return false;
 
   // -------------------------------------------------------------
@@ -69,12 +70,143 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
 
   if (out_elevation_grid)
   {
-    *out_elevation_grid = elevation_planner::LocalElevationGrid(cols, rows, res, origin_x, origin_y, config_.map_frame, static_cast<float>(origin_z));
+    *out_elevation_grid = elevation_planner::LocalElevationGrid(cols, rows, res, origin_x, origin_y, config_.map_frame, std::numeric_limits<float>::quiet_NaN());
   }
 
   // -------------------------------------------------------------
-  // 第三步: 拓扑连通优先遍历 (BFS 从脚下 N0 沿拓扑边辐射，不受垂直高差截断)
+  // 第三步: 提取局部 A* 路径参考面 (遇 2D 自重叠处截断，只保留从狗开始的单层平面)
   // -------------------------------------------------------------
+  std::vector<Eigen::Vector3d> local_waypoints;
+  local_waypoints.reserve(30);
+  {
+    // 从离当前机器人位置最近的航点开始截取，避免机器人远离起点后取到身后历史航点
+    size_t start_idx = 0;
+    double min_d_robot = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < global_plan.size(); ++i)
+    {
+      double d = std::hypot(global_plan[i].pose.position.x - p0.x(),
+                            global_plan[i].pose.position.y - p0.y());
+      if (d < min_d_robot)
+      {
+        min_d_robot = d;
+        start_idx = i;
+      }
+    }
+    if (start_idx > 1) start_idx -= 1; // 包含前一个点保持平滑连续
+
+    double w_acc = 0.0;
+    for (size_t i = start_idx; i < global_plan.size(); ++i)
+    {
+      const auto & pos = global_plan[i].pose.position;
+      Eigen::Vector3d curr_wp(pos.x, pos.y, pos.z);
+
+      // 检测 2D 自身重叠: 航点在水平投影上与较早航点非常接近 (< 0.25m)，但高差明显 (> 0.40m)
+      bool self_overlap = false;
+      for (size_t j = 0; j < local_waypoints.size(); ++j)
+      {
+        double dxy2 = std::pow(curr_wp.x() - local_waypoints[j].x(), 2) +
+                      std::pow(curr_wp.y() - local_waypoints[j].y(), 2);
+        if (dxy2 < 0.25 * 0.25 && std::abs(curr_wp.z() - local_waypoints[j].z()) > 0.40)
+        {
+          self_overlap = true;
+          break;
+        }
+      }
+      if (self_overlap)
+      {
+        break; // 截断重叠后的远端航点，确保局部代价地图在视野内永远是单层不重叠平面
+      }
+
+      local_waypoints.push_back(curr_wp);
+      if (i + 1 < global_plan.size())
+      {
+        w_acc += std::hypot(global_plan[i+1].pose.position.x - pos.x, global_plan[i+1].pose.position.y - pos.y);
+        if (w_acc > 4.5) break;
+      }
+    }
+  }
+
+  // 计算任意点 (x, y) 到局部 A* 路径的最短水平距离
+  auto distToLocalPlan = [&](double x, double y) -> double {
+    if (local_waypoints.empty()) return 0.0;
+    double min_d2 = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < local_waypoints.size(); ++i)
+    {
+      if (i + 1 < local_waypoints.size())
+      {
+        const auto & p1 = local_waypoints[i];
+        const auto & p2 = local_waypoints[i + 1];
+        double dx = p2.x() - p1.x();
+        double dy = p2.y() - p1.y();
+        double len2 = dx * dx + dy * dy;
+        if (len2 < 1e-6)
+        {
+          double d2 = std::pow(x - p1.x(), 2) + std::pow(y - p1.y(), 2);
+          if (d2 < min_d2) min_d2 = d2;
+        }
+        else
+        {
+          double t = std::max(0.0, std::min(1.0, ((x - p1.x()) * dx + (y - p1.y()) * dy) / len2));
+          double proj_x = p1.x() + t * dx;
+          double proj_y = p1.y() + t * dy;
+          double d2 = std::pow(x - proj_x, 2) + std::pow(y - proj_y, 2);
+          if (d2 < min_d2) min_d2 = d2;
+        }
+      }
+      else
+      {
+        double d2 = std::pow(x - local_waypoints[i].x(), 2) + std::pow(y - local_waypoints[i].y(), 2);
+        if (d2 < min_d2) min_d2 = d2;
+      }
+    }
+    return std::sqrt(min_d2);
+  };
+
+  // 局部航点参考高程场: 每个栅格以对应局部航点高度为参考深度基准
+  std::vector<float> ref_z(rows * cols, static_cast<float>(p0.z()));
+  if (!local_waypoints.empty())
+  {
+    for (int r = 0; r < rows; ++r)
+    {
+      for (int c = 0; c < cols; ++c)
+      {
+        double cell_wx = origin_x + (c + 0.5) * res;
+        double cell_wy = origin_y + (r + 0.5) * res;
+        double min_dxy = 999.0;
+        double best_wz = p0.z();
+        for (const auto & wp : local_waypoints)
+        {
+          double dxy = std::hypot(wp.x() - cell_wx, wp.y() - cell_wy);
+          if (dxy < min_dxy)
+          {
+            min_dxy = dxy;
+            best_wz = wp.z();
+          }
+        }
+        if (min_dxy <= std::max(1.2, config_.corridor_radius + 0.3))
+        {
+          ref_z[static_cast<size_t>(r * cols + c)] = static_cast<float>(best_wz);
+        }
+        else
+        {
+          ref_z[static_cast<size_t>(r * cols + c)] = std::numeric_limits<float>::quiet_NaN();
+        }
+      }
+    }
+  }
+
+  // 获取全局拓扑管道 (由 A* 规划生成并基于连通图向外膨胀至 corridor_radius)
+  auto global_corridor = elevation_planner::GraphStore::instance().getTopologicalCorridor();
+  const double max_lateral_dist = config_.corridor_radius > 0.1 ? config_.corridor_radius : 3.0;
+
+  // -------------------------------------------------------------
+  // 第四步: BFS 仅扩展【可通行 + 单步联通】节点 (多次扩展直到 costmap 边界)
+  // -------------------------------------------------------------
+  auto isPassableNode = [&](const elevation_planner::GraphNode & nd) -> bool {
+    return (nd.traversability < 0.8f &&
+            (nd.headroom <= 0.0f || nd.headroom >= config_.dog_height));
+  };
+
   std::vector<uint32_t> candidate_nodes;
   candidate_nodes.reserve(2000);
   std::vector<char> is_candidate(graph.numNodes(), 0);
@@ -84,17 +216,36 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
   const double win_y_min = origin_y - 0.3;
   const double win_y_max = origin_y + config_.map_length + 0.3;
 
-  const float max_layer_dz = 1.5f;          // 局部规划切层相对高差上限 (排除异层/二楼天花板)
-  const float max_step_dz = 0.25f;          // 单步台阶高差上限 (单步联通)
-  const double max_step_dxy2 = 0.35 * 0.35; // 单步平面相邻距离上限 (x,y 空间相邻)
+  const float max_step_dz = 0.25f;          // 单步台阶高差上限 (物理跨步极限)
+  const double max_step_dxy2 = 0.35 * 0.35; // 单步平面相邻距离上限 (物理跨步极限)
 
-  if (found_n0 && graph.numEdges() > 0)
+  if (graph.numEdges() > 0)
   {
     std::vector<bool> visited(graph.numNodes(), false);
     std::queue<uint32_t> q;
-    q.push(n0_id);
-    visited[n0_id] = true;
 
+    // 种子 1: 机器人脚下起始节点 N0 (若可通行)
+    if (found_n0 && isPassableNode(graph.getNode(n0_id)))
+    {
+      q.push(n0_id);
+      visited[n0_id] = true;
+    }
+
+    // 种子 2: A* 局部航点上的对应可通行节点 (确保局部规划走廊锚定在 A* 面层)
+    for (const auto & wp : local_waypoints)
+    {
+      uint32_t wp_nid = 0;
+      if (graph.findClosestNode(wp.x(), wp.y(), wp.z(), wp_nid, 0.35, 0.35))
+      {
+        if (!visited[wp_nid] && isPassableNode(graph.getNode(wp_nid)))
+        {
+          q.push(wp_nid);
+          visited[wp_nid] = true;
+        }
+      }
+    }
+
+    // BFS 广度优先循环扩展: 像水流一样在当前物理踏面上漫延，直至边界/墙体/断崖
     while (!q.empty())
     {
       uint32_t curr = q.front();
@@ -102,46 +253,67 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
       const auto & curr_nd = graph.getNode(curr);
 
       if (curr_nd.x >= win_x_min && curr_nd.x <= win_x_max &&
-          curr_nd.y >= win_y_min && curr_nd.y <= win_y_max &&
-          std::abs(curr_nd.z - static_cast<float>(p0.z())) <= max_layer_dz)
+          curr_nd.y >= win_y_min && curr_nd.y <= win_y_max)
       {
         candidate_nodes.push_back(curr);
         is_candidate[curr] = 1;
+      }
 
-        uint16_t edge_count = 0;
-        const auto * edges = graph.getEdges(curr, edge_count);
-        for (uint16_t e = 0; e < edge_count; ++e)
+      uint16_t edge_count = 0;
+      const auto * edges = graph.getEdges(curr, edge_count);
+      for (uint16_t e = 0; e < edge_count; ++e)
+      {
+        uint32_t nbr = edges[e].target_id;
+        if (visited[nbr]) continue;
+
+        const auto & nbr_nd = graph.getNode(nbr);
+
+        // 1. 代价地图窗口边界过滤 (超出 costmap 窗口停止向外扩展)
+        if (nbr_nd.x < win_x_min || nbr_nd.x > win_x_max ||
+            nbr_nd.y < win_y_min || nbr_nd.y > win_y_max)
+          continue;
+
+        // 2. 只扩展【可通行】节点 (彻底阻断不可通行死角、墙体、低净空入队)
+        if (!isPassableNode(nbr_nd))
+          continue;
+
+        // 3. x, y 相邻判定 (单步平面跨步 <= 0.35m)
+        double dxy2 = std::pow(nbr_nd.x - curr_nd.x, 2) + std::pow(nbr_nd.y - curr_nd.y, 2);
+        if (dxy2 > max_step_dxy2) continue;
+
+        // 4. 单步物理连通高差判定 (|dz| <= 0.25m)
+        float s_dz = std::abs(nbr_nd.z - curr_nd.z);
+        if (s_dz > max_step_dz) continue;
+
+        // 5. 与局部参考高程场一致性判定 (防止顺着坡道一路蔓延到多层楼上或楼下)
+        int c_idx = static_cast<int>(std::floor((nbr_nd.x - origin_x) / res));
+        int r_idx = static_cast<int>(std::floor((nbr_nd.y - origin_y) / res));
+        if (r_idx >= 0 && r_idx < rows && c_idx >= 0 && c_idx < cols)
         {
-          uint32_t nbr = edges[e].target_id;
-          if (visited[nbr]) continue;
-
-          const auto & nbr_nd = graph.getNode(nbr);
-
-          // 1. 窗口边界过滤
-          if (nbr_nd.x < win_x_min || nbr_nd.x > win_x_max ||
-              nbr_nd.y < win_y_min || nbr_nd.y > win_y_max)
-            continue;
-
-          // 2. x, y 相邻判定 (平面距离 <= 0.35m)
-          double dxy2 = std::pow(nbr_nd.x - curr_nd.x, 2) + std::pow(nbr_nd.y - curr_nd.y, 2);
-          if (dxy2 > max_step_dxy2) continue;
-
-          // 3. 单步联通高差判定 (|dz| <= 0.25m)
-          float s_dz = std::abs(nbr_nd.z - curr_nd.z);
-          if (s_dz > max_step_dz) continue;
-
-          // 4. 局部层高判定 (|z - p0.z| <= 1.5m, 排除二楼/天花板)
-          if (std::abs(nbr_nd.z - static_cast<float>(p0.z())) > max_layer_dz)
-            continue;
-
-          visited[nbr] = true;
-          q.push(nbr);
+          float target_ref_z = ref_z[static_cast<size_t>(r_idx * cols + c_idx)];
+          if (std::isnan(target_ref_z) || std::abs(nbr_nd.z - target_ref_z) > 0.50f)
+            continue; // 偏离 A* 所在的面层或超出走廊，停止蔓延
         }
+
+        // 6. 拓扑流形管道范围过滤 (优先采用基于连通图生成的全局拓扑管道，遇悬空/断崖/不可达自然阻断)
+        if (global_corridor && !global_corridor->empty())
+        {
+          if (!global_corridor->isInCorridor(nbr))
+            continue;
+        }
+        else if (!local_waypoints.empty())
+        {
+          if (distToLocalPlan(nbr_nd.x, nbr_nd.y) > max_lateral_dist)
+            continue;
+        }
+
+        visited[nbr] = true;
+        q.push(nbr);
       }
     }
   }
 
-  // 兜底策略: 若图无拓扑边(如轻量测试)或未锁定 N0, 则收集窗口内同层几何节点
+  // 兜底策略: 若图无拓扑边(如轻量测试)或未锁定 N0, 则收集窗口内同层可通行几何节点
   if (candidate_nodes.empty())
   {
     for (size_t i = 0; i < graph.numNodes(); ++i)
@@ -149,8 +321,18 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
       const auto & nd = graph.getNode(i);
       if (nd.x >= win_x_min && nd.x <= win_x_max &&
           nd.y >= win_y_min && nd.y <= win_y_max &&
-          std::abs(nd.z - static_cast<float>(p0.z())) <= max_layer_dz)
+          isPassableNode(nd) &&
+          std::abs(nd.z - static_cast<float>(p0.z())) <= 0.50f)
       {
+        if (global_corridor && !global_corridor->empty())
+        {
+          if (!global_corridor->isInCorridor(static_cast<uint32_t>(i)))
+            continue;
+        }
+        else if (!local_waypoints.empty() && distToLocalPlan(nd.x, nd.y) > max_lateral_dist)
+        {
+          continue;
+        }
         is_candidate[static_cast<size_t>(i)] = 1;
         candidate_nodes.push_back(static_cast<uint32_t>(i));
       }
@@ -158,17 +340,17 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
   }
 
   // -------------------------------------------------------------
-  // 第四步: 2D 栅格深度测试 (Z-Buffer 去重，铺满连通踏面，重合时丢弃较远层)
+  // 第五步: 2D 栅格单层盖章 (只盖章可通行节点，其余位置天然保持 100 障碍)
   // -------------------------------------------------------------
-  // 初始地图默认全为 100 (悬崖/墙体等不可通行区)
+  // 初始地图默认全为 100 (悬崖/墙体等不可通行区天然保持 100)
   out_grid.data.assign(rows * cols, 100);
-  // 逐格成因追踪 (调试图层): 初始全为 "无节点盖章"
   if (out_reasons) out_reasons->assign(rows * cols, REASON_NO_NODE);
-  // 逐格胜出节点 id: 初始 -1 (无节点)
   if (out_node_ids) out_node_ids->assign(rows * cols, -1);
 
-  // 深度缓冲区: 记录每个 2D 栅格已记录的踏面距离机器人基准高度的绝对高差 |z - z0|
+  // 深度缓冲区: 记录每个 2D 栅格胜出节点距离局部参考高度的绝对高差 |z - z_ref|
   std::vector<float> min_dz(rows * cols, std::numeric_limits<float>::max());
+  // 水平距离缓冲区: 同层节点裁决时，离节点中心更近的胜出 (泰森多边形自然边界)
+  std::vector<float> min_d2(rows * cols, std::numeric_limits<float>::max());
 
   // 盖章半径: 确保节点间无孔洞缝隙铺满踏面
   const double stamp_radius = std::max(0.08, graph.getResolution() * 0.75);
@@ -178,24 +360,12 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
   for (uint32_t nid : candidate_nodes)
   {
     const auto & nd = graph.getNode(nid);
-    float dz = std::abs(nd.z - static_cast<float>(p0.z()));
-    if (dz > max_layer_dz) continue;
 
     int center_c = static_cast<int>(std::floor((nd.x - origin_x) / res));
     int center_r = static_cast<int>(std::floor((nd.y - origin_y) / res));
 
-    bool is_passable = (nd.traversability < 0.8f &&
-                        (nd.headroom <= 0.0f || nd.headroom >= config_.dog_height));
-    int8_t cell_cost = is_passable ? static_cast<int8_t>(nd.traversability * 70.0f) : 100;
-    // 成因码: 依节点禁行标志细分, 软代价与自由分开记录
-    int8_t node_reason = REASON_FREE_NODE;
-    if (!is_passable) {
-      if (nd.flags & elevation_planner::node_flags::BLOCK_HEADROOM) node_reason = REASON_BLOCK_HEADROOM;
-      else if (nd.flags & elevation_planner::node_flags::BLOCK_LATERAL) node_reason = REASON_BLOCK_LATERAL;
-      else node_reason = REASON_BLOCK_OTHER;
-    } else if (nd.traversability > 0.05f) {
-      node_reason = REASON_SOFT_NODE;
-    }
+    int8_t cell_cost = static_cast<int8_t>(nd.traversability * 70.0f);
+    int8_t node_reason = (nd.traversability > 0.05f) ? REASON_SOFT_NODE : REASON_FREE_NODE;
 
     for (int dr = -stamp_cells; dr <= stamp_cells; ++dr)
     {
@@ -213,31 +383,32 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
         if (d2 > stamp_r2) continue;
 
         size_t idx = static_cast<size_t>(nr * cols + nc);
+        float dz = std::abs(nd.z - ref_z[idx]);
 
-        // 核心深度测试:
-        // 1. 若当前节点高度比已记录节点明显更靠近机器人 (高度差差额 > 0.20m), 强行覆盖 (丢弃较远层)
-        // 2. 若高度差在同一层内 (<= 0.20m), 属于同一踏面层, 代价取最恶劣值以确保安全, 并更新最小 dz
-        // 3. 若当前节点明显更远 (dz > min_dz[idx] + 0.20m), 属于楼上或楼下层, 直接丢弃
-        if (dz < min_dz[idx] - 0.20f)
+        // 深度测试：
+        // 1. 明显更靠近参考面层 (差距 > 0.05m) -> 胜出
+        // 2. 属于同一高度层 (|dz - min_dz| <= 0.05m) -> 水平距离离节点中心更近者胜出 (泰森多边形原则)
+        bool update = false;
+        if (dz < min_dz[idx] - 0.05f)
+        {
+          update = true;
+        }
+        else if (std::abs(dz - min_dz[idx]) <= 0.05f)
+        {
+          if (static_cast<float>(d2) < min_d2[idx])
+          {
+            update = true;
+          }
+        }
+
+        if (update)
         {
           min_dz[idx] = dz;
+          min_d2[idx] = static_cast<float>(d2);
           out_grid.data[idx] = cell_cost;
           if (out_reasons) (*out_reasons)[idx] = node_reason;
           if (out_node_ids) (*out_node_ids)[idx] = static_cast<int32_t>(nid);
           if (out_elevation_grid) out_elevation_grid->setZ(nr, nc, nd.z);
-        }
-        else if (std::abs(dz - min_dz[idx]) <= 0.20f)
-        {
-          const int8_t merged = std::max(out_grid.data[idx], cell_cost);
-          out_grid.data[idx] = merged;
-          // 本节点代价为合并后最恶劣值时, 成因归属本节点
-          if (out_reasons && cell_cost >= merged) (*out_reasons)[idx] = node_reason;
-          if (out_node_ids && cell_cost >= merged) (*out_node_ids)[idx] = static_cast<int32_t>(nid);
-          if (dz < min_dz[idx])
-          {
-            min_dz[idx] = dz;
-            if (out_elevation_grid) out_elevation_grid->setZ(nr, nc, nd.z);
-          }
         }
       }
     }
@@ -316,11 +487,45 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
             continue; // 跨步与短边链连通, 视为连通
           }
 
-          // 3. 确系物理断层/断坎 (如楼梯边缘悬崖直落底层): 在偏离机器人高度的一侧 (或两侧) 插入致命障碍
-          float dzu = std::abs(nu.z - static_cast<float>(p0.z()));
-          float dzv = std::abs(nv.z - static_cast<float>(p0.z()));
-          if (dzv >= dzu) seam_cells.push_back(nidx);
-          if (dzu >= dzv) seam_cells.push_back(idx);
+          // 3. 确系物理断层/断坎 (如楼梯边缘悬崖直落底层):
+          // 路径踏面绝对保护法则: 凡是落在 A* 全局路径走廊内的合法踏面，绝不标记为断缝
+          float dzu = std::abs(nu.z - ref_z[idx]);
+          float dzv = std::abs(nv.z - ref_z[nidx]);
+
+          if (!local_waypoints.empty())
+          {
+            bool u_on_path = (distToLocalPlan(nu.x, nu.y) <= 0.20 && dzu <= 0.20f);
+            bool v_on_path = (distToLocalPlan(nv.x, nv.y) <= 0.20 && dzv <= 0.20f);
+
+            if (u_on_path && v_on_path)
+            {
+              // 两侧同属于规划路径走廊 (如双折转角前后段)，均受保护，不自相残杀涂黑踏面
+              continue;
+            }
+            else if (u_on_path)
+            {
+              // u 在规划路径上，断缝只能落在非路径一侧的 v (如中间缝隙/外侧)
+              seam_cells.push_back(nidx);
+            }
+            else if (v_on_path)
+            {
+              // v 在规划路径上，断缝只能落在非路径一侧的 u
+              seam_cells.push_back(idx);
+            }
+            else
+            {
+              // 两者均不在核心规划路径上，将明显偏离期望参考高程的一侧标记为断缝
+              if (dzv > dzu + 0.05f) seam_cells.push_back(nidx);
+              else if (dzu > dzv + 0.05f) seam_cells.push_back(idx);
+              else seam_cells.push_back(dzv >= dzu ? nidx : idx);
+            }
+          }
+          else
+          {
+            // 无全局路径模式 (如离线单元测试): 偏离机器人高度的一侧插入致命障碍
+            if (dzv >= dzu) seam_cells.push_back(nidx);
+            if (dzu >= dzv) seam_cells.push_back(idx);
+          }
         }
       }
     }
@@ -446,7 +651,7 @@ bool ManifoldCostmapBuilder::buildCostmap(const elevation_planner::ManifoldGraph
           if (out_elevation_grid) {
             int r = static_cast<int>(i / cols);
             int c = static_cast<int>(i % cols);
-            out_elevation_grid->setZ(r, c, static_cast<float>(p0.z()));
+            out_elevation_grid->setZ(r, c, std::numeric_limits<float>::quiet_NaN());
           }
         }
       }

@@ -30,7 +30,7 @@ struct LocalElevationGrid
 
   LocalElevationGrid() = default;
 
-  LocalElevationGrid(int w, int h, double res, double ox, double oy, const std::string& frame = "map", float default_z = 0.0f)
+  LocalElevationGrid(int w, int h, double res, double ox, double oy, const std::string& frame = "map", float default_z = std::numeric_limits<float>::quiet_NaN())
     : frame_id(frame), origin_x(ox), origin_y(oy), resolution(res), width(w), height(h),
       data(w * h, default_z)
   {
@@ -71,6 +71,13 @@ struct LocalElevationGrid
   inline bool interpolateZ(double x, double y, double& out_z) const
   {
     if (resolution <= 1e-6 || width <= 0 || height <= 0 || data.empty()) return false;
+
+    // 超出网格几何范围直接返回 false, 回退至流形大图查询
+    if (x < origin_x || x > origin_x + width * resolution ||
+        y < origin_y || y > origin_y + height * resolution)
+    {
+      return false;
+    }
 
     double c_f = (x - origin_x) / resolution - 0.5;
     double r_f = (y - origin_y) / resolution - 0.5;

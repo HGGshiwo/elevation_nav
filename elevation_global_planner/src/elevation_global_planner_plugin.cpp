@@ -10,12 +10,14 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/crop_box.h>
+#include <pcl_conversions/pcl_conversions.h>
 #include <yaml-cpp/yaml.h>
 #include <string>
 #include <cmath>
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include "elevation_planner_core/graph_store.hpp"
+#include "elevation_planner_core/topological_corridor.hpp"
 #include "elevation_global_planner/manifold_astar.hpp"
 #include "elevation_global_planner/path_smoother.hpp"
 
@@ -91,6 +93,11 @@ public:
     private_nh.param<double>("cluster_height_diff", cfg.cluster_height_diff, 0.08);
     private_nh.param<int>("min_cluster_points", cfg.min_cluster_points, 2);
 
+    private_nh.param<double>("corridor_radius", corridor_radius_, 3.0);
+    private_nh.param<double>("corridor_lookahead", corridor_lookahead_, 5.0);
+    max_step_height_ = cfg.max_step_height;
+    dog_height_ = cfg.dog_height;
+
     double robot_length = 0.0, robot_width = 0.0, margin = 0.04;
     private_nh.param<double>("obstacle_safety_margin", margin, 0.04);
     if (private_nh.getParam("robot_width", robot_width) && robot_width > 0.0) {
@@ -105,6 +112,8 @@ public:
 
     ros::NodeHandle nh;
     path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan", 1, true);
+    corridor_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_corridor_nodes", 1, true);
+    corridor_boundary_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/elevation_global_corridor_boundaries", 1, true);
     nodes_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_graph_nodes", 1, true);
     edges_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/elevation_graph_edges", 1, true);
     debug_result_pub_ = nh.advertise<std_msgs::String>("/elevation_debug_result", 5, true);
@@ -119,7 +128,8 @@ public:
     }
 
     initialized_ = true;
-    ROS_INFO("[ElevationGlobalPlanner] Manifold global planner plugin is ready");
+    ROS_INFO("[ElevationGlobalPlanner] Manifold global planner plugin is ready (corridor_radius=%.2fm, corridor_lookahead=%.2fm)",
+             corridor_radius_, corridor_lookahead_);
   }
 
   bool makePlan(const geometry_msgs::PoseStamped & start,
@@ -162,6 +172,15 @@ public:
       plan[i].pose.orientation.z = std::sin(yaw * 0.5);
       plan[i].pose.orientation.w = std::cos(yaw * 0.5);
     }
+
+    // 扩展 A* 规划结果为局部前瞻拓扑流形管道 (供 TEB 局部规划器在管道内部避障与同伦优化)
+    auto corridor = std::make_shared<elevation_planner::TopologicalCorridor>(
+        elevation_planner::TopologicalCorridorGenerator::generate(
+            graph_, plan, corridor_radius_, corridor_lookahead_, max_step_height_, dog_height_));
+    elevation_planner::GraphStore::instance().setTopologicalCorridor(corridor);
+    ROS_INFO("[ElevationGlobalPlanner] Initial topological corridor generated: %zu nodes within radius %.2fm, lookahead %.2fm",
+             corridor->size(), corridor_radius_, corridor_lookahead_);
+    publishCorridorVisuals(*corridor);
 
     // latched 兼容发布: Web 端与旧消费者订阅 /elevation_global_plan
     smoothed_path.header.stamp = ros::Time::now();
@@ -308,10 +327,29 @@ private:
     debug_result_pub_.publish(out_msg);
   }
 
+  void publishCorridorVisuals(const elevation_planner::TopologicalCorridor & corridor)
+  {
+    if (corridor.empty() || !has_map_) return;
+
+    sensor_msgs::PointCloud2 cloud_msg;
+    elevation_planner::TopologicalCorridorGenerator::toPointCloudMsg(
+        graph_, corridor, map_frame_, cloud_msg);
+    corridor_pub_.publish(cloud_msg);
+
+    visualization_msgs::MarkerArray marker_msg;
+    elevation_planner::TopologicalCorridorGenerator::toBoundaryMarkers(
+        graph_, corridor, map_frame_, marker_msg, dog_height_, max_step_height_);
+    corridor_boundary_pub_.publish(marker_msg);
+  }
+
   std::string map_frame_;
   std::string map_config_file_;
   bool initialized_{false};
   bool has_map_{false};
+  double corridor_radius_{3.0};
+  double corridor_lookahead_{5.0};
+  double max_step_height_{0.25};
+  double dog_height_{0.45};
 
   elevation_planner::CloudGraphBuilder builder_;
   elevation_planner::ManifoldGraph graph_;
@@ -319,6 +357,8 @@ private:
   PathSmoother smoother_;
 
   ros::Publisher path_pub_;
+  ros::Publisher corridor_pub_;
+  ros::Publisher corridor_boundary_pub_;
   ros::Publisher nodes_pub_;
   ros::Publisher edges_pub_;
   ros::Publisher debug_result_pub_;

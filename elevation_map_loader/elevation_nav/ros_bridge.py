@@ -85,6 +85,11 @@ class ElevationRosBridge:
         # 供给 TEB 局部规划器的结构化几何障碍物 (替代稠密 costmap)
         self.teb_obstacles: List[Dict[str, Any]] = []
         self.teb_obstacles_version = 0
+        # 拓扑流形管道节点与状态
+        self.corridor_nodes: List[List[float]] = []
+        self.corridor_lines: List[List[float]] = []
+        self.corridor_walls: List[List[float]] = []
+        self.corridor_nodes_version = 0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -155,7 +160,9 @@ class ElevationRosBridge:
 
             if self.publish_fake_tf:
                 self.last_sim_time = rospy.Time.now()
-                rospy.Timer(rospy.Duration(0.02), self.publish_fake_tf_loop)  # 50Hz 高频广播与积分
+                import threading
+                self._tf_thread = threading.Thread(target=self._fake_tf_thread_worker, daemon=True)
+                self._tf_thread.start()
 
             # 订阅机器人位姿（支持 /loc_base 或 /odom）
             rospy.Subscriber("/loc_base", Odometry, self._odom_callback, queue_size=5)
@@ -186,12 +193,50 @@ class ElevationRosBridge:
             # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
             rospy.Subscriber("/elevation_graph_edges", MarkerArray, self._graph_edges_callback, queue_size=1)
+            rospy.Subscriber("/elevation_corridor_nodes", PointCloud2, self._corridor_nodes_callback, queue_size=1)
+            rospy.Subscriber("/elevation_corridor_boundaries", MarkerArray, self._corridor_boundaries_callback, queue_size=1)
             rospy.Subscriber("/elevation_debug_result", RosString, self._debug_result_callback, queue_size=5)
 
             self.is_initialized = True
             rospy.loginfo("[ElevationRosBridge] ROS node and topic subscriptions ready")
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] ROS init exception: {e}")
+
+    def _corridor_boundaries_callback(self, msg: MarkerArray):
+        """解析后端生成的真 3D 拓扑管道边界轮廓线与立体防护墙"""
+        try:
+            lines = []
+            walls = []
+            for m in msg.markers:
+                if m.ns == "corridor_boundaries" and m.type == 5:  # LINE_LIST
+                    for p in m.points:
+                        lines.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
+                elif m.ns == "corridor_walls" and m.type == 11:  # TRIANGLE_LIST
+                    for p in m.points:
+                        walls.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
+            with self._lock:
+                self.corridor_lines = lines
+                self.corridor_walls = walls
+                self.corridor_nodes_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 corridor boundaries 异常: {e}")
+
+    def _corridor_nodes_callback(self, msg: PointCloud2):
+        """解析拓扑流形管道点云并更新管道 (节流 5Hz, 避免 20Hz 反序列化耗尽 Python 算力)"""
+        try:
+            now_sec = rospy.Time.now().to_sec()
+            if hasattr(self, '_last_corridor_parse_time') and (now_sec - self._last_corridor_parse_time) < 0.2:
+                return
+            self._last_corridor_parse_time = now_sec
+
+            pts = []
+            for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+                pts.append([round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3)])
+            with self._lock:
+                self.corridor_nodes = pts
+                self.corridor_nodes_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 corridor nodes 点云异常: {e}")
 
     def _graph_nodes_callback(self, msg: PointCloud2):
         """解析流形踏面节点点云并建立空间栅格哈希"""
@@ -683,6 +728,16 @@ class ElevationRosBridge:
         if self.publish_fake_tf:
             self.publish_fake_tf_loop()
 
+    def _fake_tf_thread_worker(self):
+        """100Hz 独立高频广播线程，彻底规避 Python 定时器事件队列阻塞造成的 TF 延迟"""
+        rate = rospy.Rate(100)
+        while not rospy.is_shutdown():
+            self.publish_fake_tf_loop()
+            try:
+                rate.sleep()
+            except Exception:
+                break
+
     def publish_fake_tf_loop(self, event=None):
         if not self.publish_fake_tf or self.tf_broadcaster is None:
             return
@@ -907,7 +962,11 @@ class ElevationRosBridge:
                 "local_costmap_debug_nodes": dict(self.local_costmap_debug_nodes) if self.local_costmap_debug_nodes else None,
                 "local_costmap_debug_nodes_version": self.local_costmap_debug_nodes_version,
                 "teb_obstacles": list(self.teb_obstacles) if self.teb_obstacles else [],
-                "teb_obstacles_version": self.teb_obstacles_version
+                "teb_obstacles_version": self.teb_obstacles_version,
+                "corridor_nodes": list(self.corridor_nodes),
+                "corridor_lines": list(self.corridor_lines),
+                "corridor_walls": list(self.corridor_walls),
+                "corridor_nodes_version": self.corridor_nodes_version
             }
 
 

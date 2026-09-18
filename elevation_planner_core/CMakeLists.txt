@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
   pcl_ros
   pcl_conversions
+  costmap_2d
 )
 
 find_package(PCL REQUIRED)
@@ -20,7 +21,7 @@ find_package(PCL REQUIRED)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES elevation_planner_core
-  CATKIN_DEPENDS roscpp grid_map_core grid_map_msgs geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions
+  CATKIN_DEPENDS roscpp grid_map_core grid_map_msgs geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions costmap_2d
   DEPENDS PCL
 )
 

@@ -36,7 +36,7 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<std::string>("map_frame",   map_frame_,   "map");
   private_nh.param<std::string>("base_frame",  base_frame_,  "base_link");
   private_nh.param<std::string>("cloud_topic",     cloud_topic_,     "/lidar_points");
-  private_nh.param<std::string>("plan_topic",      plan_topic_,      "/move_base/ElevationGlobalPlanner/global_plan");
+  private_nh.param<std::string>("plan_topic",      plan_topic_,      "/elevation_global_plan");
   private_nh.param<std::string>("obstacles_topic", obstacles_topic_, "/move_base/TebLocalPlannerROS/obstacles");
   private_nh.param<double>("fusion_rate",        fusion_rate_, 10.0);
   private_nh.param<double>("crop_radius_xy",     crop_radius_xy_, 2.0);
@@ -52,6 +52,7 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<double>("lookahead_distance", builder_cfg.lookahead_distance, 0.6);
   private_nh.param<double>("height_tolerance",   builder_cfg.height_tolerance, 0.30);
   private_nh.param<double>("dog_height",         builder_cfg.dog_height, 0.45);
+  private_nh.param<double>("corridor_radius",    builder_cfg.corridor_radius, 3.0);
   builder_cfg.map_frame = map_frame_;
   builder_cfg.base_frame = base_frame_;
   costmap_builder_.setConfig(builder_cfg);

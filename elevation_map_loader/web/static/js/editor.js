@@ -1,19 +1,15 @@
 import * as THREE from 'three';
-import { CELL_REASON_TEXT } from './local_costmap_visualizer.js';
 
 /**
  * 栅格地图交互与编辑模块 (Editor)
  * 完整实现：画笔、橡皮擦、设起点、设终点、Z轴编辑平面、游标拾取与体素增删
  */
-export function initEditor(scene, camera, renderer, controls, layers, editPlane, onDirty, graphVisualizer = null, costmapVisualizer = null, roamController = null) {
+export function initEditor(scene, camera, renderer, controls, layers, editPlane, onDirty, graphVisualizer = null, roamController = null) {
     const statusEl = document.getElementById('status');
     const brushSizeInput = document.getElementById('brush-size');
     const editLayerSelect = document.getElementById('edit-layer');
     const debugPanelDiv = document.getElementById('debug-panel');
     const btnCopyDebug = document.getElementById('btn-copy-debug');
-    const costmapPanelDiv = document.getElementById('costmap-panel');
-    const btnCopyCostmap = document.getElementById('btn-copy-costmap');
-    const btnClearCostmap = document.getElementById('btn-clear-costmap');
 
     let currentTool = 'view';
     let currentLayer = 'occupied';
@@ -61,15 +57,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             if (debugPanelDiv) {
                 debugPanelDiv.style.display = (currentTool === 'debug') ? 'block' : 'none';
             }
-            if (costmapPanelDiv) {
-                costmapPanelDiv.style.display = (currentTool === 'costmap_debug') ? 'block' : 'none';
-            }
-            if (currentTool === 'costmap_debug') {
-                if (statusEl) statusEl.innerText = '模式: 调试代价地图 | 移动鼠标悬停或点击格子查看高程与障碍成因';
-            }
-            if (currentTool !== 'costmap_debug' && costmapVisualizer) {
-                costmapVisualizer.clearHighlight();
-            }
             renderer.domElement.style.cursor = 'default';
         });
     });
@@ -89,15 +76,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     function getInteractionTarget() {
         raycaster.setFromCamera(mouse, camera);
 
-        // -1. 代价地图调试工具: 交互目标仅为贴地高程代价地图格子
-        if (currentTool === 'costmap_debug') {
-            if (!costmapVisualizer) return null;
-            const hit = costmapVisualizer.raycastPoint(raycaster);
-            if (hit) {
-                return { type: 'costmap_cell', point: hit };
-            }
-            return null;
-        }
 
         // 0. 若当前为设起点、设终点或调试方块，交互目标严格限制在 3D 流形踏面方块上！
         if (currentTool === 'start' || currentTool === 'goal' || currentTool === 'debug') {
@@ -387,65 +365,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         }
     }
 
-    // 代价地图格子诊断: 点击地毯任意格子, 显示该格物理高程、代价值、实际盖章节点与成因
-    function handleCostmapCellInspection(worldPoint) {
-        if (!costmapVisualizer) return;
-        const info = costmapVisualizer.highlightCell(worldPoint.x, worldPoint.y);
-        if (!info) {
-            if (statusEl) statusEl.innerText = '点击位置不在局部高程代价地图窗口内';
-            return;
-        }
-        if (costmapPanelDiv) costmapPanelDiv.style.display = 'block';
-
-        const set = (id, text, color) => {
-            const el = document.getElementById(id);
-            if (!el) return;
-            el.innerText = text;
-            if (color) el.style.color = color;
-        };
-
-        set('cm-cell-rc', `(${info.r}, ${info.c})`);
-        set('cm-cell-xy', `(${info.x.toFixed(2)}, ${info.y.toFixed(2)})`);
-        set('cm-cell-z', info.z !== null && info.z !== undefined ? `${Number(info.z).toFixed(3)} m` : '-');
-
-        let costText = String(info.cost);
-        let costColor = '#ddd';
-        if (info.cost === 100) { costText += ' (致命障碍 / 禁行)'; costColor = '#ff5252'; }
-        else if (info.cost > 0) { costText += ' (软代价膨胀带)'; costColor = '#ffab40'; }
-        else if (info.cost === 0) { costText += ' (自由可通行)'; costColor = '#69f0ae'; }
-        set('cm-cell-cost', costText, costColor);
-
-        // 成因解析
-        const reasonInfo = CELL_REASON_TEXT ? CELL_REASON_TEXT[info.reason] : null;
-        if (info.reason === null || info.reason === undefined) {
-            set('cm-cell-reason', '无成因数据', '#aaa');
-            set('cm-cell-detail', '未收到成因图层数据，显示基础代价值。', '#aaa');
-        } else {
-            set('cm-cell-reason', reasonInfo ? reasonInfo.label : `未知成因 (${info.reason})`, reasonInfo ? reasonInfo.color : '#ddd');
-            set('cm-cell-detail', reasonInfo ? reasonInfo.detail : '-');
-        }
-
-        // 胜出节点信息
-        if (info.nodeId !== null && info.nodeId !== undefined && info.nodeId >= 0) {
-            const wn = info.winnerNode;
-            if (wn) {
-                set('cm-cell-winner', `ID: ${info.nodeId} (X:${wn.x.toFixed(2)}, Y:${wn.y.toFixed(2)}, Z:${wn.z.toFixed(2)}, 通行阻力:${wn.trav.toFixed(2)})`, '#4dd0e1');
-            } else {
-                set('cm-cell-winner', `Node ID: ${info.nodeId}`, '#4dd0e1');
-            }
-        } else {
-            set('cm-cell-winner', '无对应图节点 (拓扑缝/默认致命/窗口外)', '#aaa');
-        }
-
-        if (statusEl) statusEl.innerText = `已选中代价地图格子 (${info.r}, ${info.c}) | 代价: ${info.cost} | 高程: ${info.z?.toFixed(2)}m`;
-    }
-
-    function clearCostmapDebugUI() {
-        ['cm-cell-rc', 'cm-cell-xy', 'cm-cell-z', 'cm-cell-cost', 'cm-cell-reason', 'cm-cell-winner', 'cm-cell-detail'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) el.innerText = '-';
-        });
-    }
 
     // 事件监听
     renderer.domElement.addEventListener('mousemove', (e) => {
@@ -458,35 +377,6 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             return;
         }
 
-        if (currentTool === 'costmap_debug') {
-            cursor.visible = false;
-            if (graphVisualizer) graphVisualizer.clearHoveredNode();
-
-            if (costmapVisualizer) {
-                camera.updateMatrixWorld();
-                raycaster.setFromCamera(mouse, camera);
-                const hitPoint = costmapVisualizer.raycastPoint(raycaster);
-                if (hitPoint) {
-                    const info = costmapVisualizer.highlightCell(hitPoint.x, hitPoint.y);
-                    if (info) {
-                        renderer.domElement.style.cursor = 'crosshair';
-                        if (statusEl) {
-                            const rInfo = CELL_REASON_TEXT ? CELL_REASON_TEXT[info.reason] : null;
-                            const rLabel = rInfo ? rInfo.label : (info.reason !== null && info.reason !== undefined ? `成因 ${info.reason}` : '正常');
-                            const costText = info.cost === 100 ? '致命障碍' : (info.cost > 0 ? `软代价(${info.cost})` : '自由(0)');
-                            statusEl.innerText = `[代价地图命中] 格子 (${info.r}, ${info.c}) | 高程: ${Number(info.z).toFixed(3)}m | ${costText} | ${rLabel}`;
-                        }
-                    } else {
-                        costmapVisualizer.clearHighlight();
-                        renderer.domElement.style.cursor = 'default';
-                    }
-                } else {
-                    costmapVisualizer.clearHighlight();
-                    renderer.domElement.style.cursor = 'default';
-                }
-            }
-            return;
-        }
 
         // 在设起点/设终点/调试方块模式下，严格仅吸附流形方块，画笔游标立方体永久隐藏！
         if (currentTool === 'start' || currentTool === 'goal' || currentTool === 'debug') {
@@ -522,29 +412,10 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         cursor.visible = false;
         isPainting = false;
         if (graphVisualizer) graphVisualizer.clearHoveredNode();
-        if (costmapVisualizer) {
-            costmapVisualizer.clearHighlight();
-            renderer.domElement.style.cursor = 'default';
-        }
     });
 
     renderer.domElement.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return; // 仅响应左键点击
-
-        if (currentTool === 'costmap_debug') {
-            if (!costmapVisualizer) return;
-            camera.updateMatrixWorld();
-            raycaster.setFromCamera(mouse, camera);
-            const hitPoint = costmapVisualizer.raycastPoint(raycaster);
-            if (hitPoint) {
-                handleCostmapCellInspection(hitPoint);
-            } else {
-                costmapVisualizer.clearHighlight();
-                clearCostmapDebugUI();
-                if (statusEl) statusEl.innerText = '未点中代价地图格子，已清除选中';
-            }
-            return;
-        }
 
         const target = getInteractionTarget();
         if (!target) return;
@@ -620,23 +491,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
         });
     }
 
-    if (btnClearCostmap) {
-        btnClearCostmap.addEventListener('click', () => {
-            if (costmapVisualizer) costmapVisualizer.clearHighlight();
-            clearCostmapDebugUI();
-            if (costmapPanelDiv) costmapPanelDiv.style.display = 'none';
-            if (statusEl) statusEl.innerText = '已清除代价地图选择';
-        });
-    }
 
-    if (btnCopyCostmap) {
-        btnCopyCostmap.addEventListener('click', () => {
-            const text = costmapPanelDiv ? costmapPanelDiv.innerText : '';
-            navigator.clipboard.writeText(text).then(() => {
-                alert("已复制代价地图诊断信息到剪贴板");
-            }).catch(() => {});
-        });
-    }
 
     return {
         getCurrentTool: () => currentTool,

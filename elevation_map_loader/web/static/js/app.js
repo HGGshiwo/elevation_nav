@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { initScene } from '../scene.js';
 import { LayerManager } from '../layer.js';
 import { GraphVisualizer } from './graph_visualizer.js';
-import { LocalCostmapVisualizer } from './local_costmap_visualizer.js';
+import { CorridorVisualizer } from './corridor_visualizer.js';
 import { initEditor } from './editor.js';
 import { initRobotTracker } from './robot_tracker.js';
 import { initMapStorage } from './map_storage.js';
@@ -38,8 +38,8 @@ layers.emergency_stop_occupied.mesh.visible = false;
 // 3D 流形拓扑图渲染器 (点云直通踏面与连通网格)
 const graphVisualizer = new GraphVisualizer(scene, camera, controls);
 
-// 1:1 流形局部代价地图 3D 渲染器 (实时贴地地毯与规划窗口外框)
-const localCostmapVisualizer = new LocalCostmapVisualizer(scene);
+// 3D 拓扑流形管道渲染器 (基于 A* 路径与连通图的 3m 运动安全走廊)
+const corridorVisualizer = new CorridorVisualizer(scene);
 
 // 获取当前已勾选需流式同步的图层列表
 function getActiveRequestedLayers() {
@@ -69,30 +69,19 @@ const mapStorage = initMapStorage(layers, () => {
 // 3.3 栅格与交互编辑模块 (接入 3D 流形吸附)
 const editor = initEditor(scene, camera, renderer, controls, layers, editPlane, (layerName) => {
     mapStorage.markDirty(layerName);
-}, graphVisualizer, localCostmapVisualizer, roamController);
+}, graphVisualizer, roamController);
 
-// 3.4 WebSocket 全双工流式同步模块 (支持流形图、局部代价地图与点云直通数据)
-const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, localCostmapVisualizer);
+// 3.4 WebSocket 全双工流式同步模块 (支持流形图、3D拓扑管道与点云直通数据)
+const wsStream = initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer, corridorVisualizer);
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
-// 4.0 高程局部代价地图与成因染色控制
-document.getElementById('show-local-costmap')?.addEventListener('change', (e) => {
-    localCostmapVisualizer.setVisible(e.target.checked);
-});
-
-document.getElementById('show-costmap-debug')?.addEventListener('change', (e) => {
-    localCostmapVisualizer.setDebugMode(e.target.checked);
-    if (e.target.checked) {
-        const radio = document.querySelector('input[name="tool"][value="costmap_debug"]');
-        if (radio) {
-            radio.checked = true;
-            radio.dispatchEvent(new Event('change'));
-        }
-    }
+// 4.0 3D 拓扑流形管道与内部几何障碍物显隐控制
+document.getElementById('show-corridor')?.addEventListener('change', (e) => {
+    corridorVisualizer.setVisible(e.target.checked);
 });
 
 document.getElementById('show-teb-obstacles')?.addEventListener('change', (e) => {
-    localCostmapVisualizer.setObstaclesVisible(e.target.checked);
+    corridorVisualizer.setObstaclesVisible(e.target.checked);
 });
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----

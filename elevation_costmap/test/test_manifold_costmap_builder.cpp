@@ -1,5 +1,7 @@
 #include "elevation_costmap/manifold_costmap_builder.h"
 #include <elevation_planner_core/manifold_graph.hpp>
+#include <elevation_planner_core/trajectory_validator.hpp>
+#include <elevation_planner_core/topological_corridor.hpp>
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -335,6 +337,233 @@ int main()
               << " (expect 100)" << std::endl;
     assert(near_robot == 0);
     assert(far_island == 100);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 6. 拓扑图真实连通性与走廊校验 (TrajectoryValidator)
+  // ---------------------------------------------------------------------------
+  elevation_planner::ManifoldGraph g_cliff;
+  {
+    // 将 graph 注册到 GraphStore
+    auto shared_g = std::make_shared<elevation_planner::ManifoldGraph>(graph);
+    elevation_planner::GraphStore::instance().setGlobalGraph(shared_g);
+
+    // 测试 1: 沿楼梯正面逐级攀爬轨迹 (节点有拓扑边连通) -> 必须合法通过
+    std::vector<Eigen::Vector2d> valid_traj = {
+      Eigen::Vector2d(0.0, 0.0),
+      Eigen::Vector2d(0.1, 0.0),
+      Eigen::Vector2d(0.2, 0.0),
+      Eigen::Vector2d(0.4, 0.0)
+    };
+    std::string reason_valid;
+    bool res_valid = elevation_planner::TrajectoryValidator::validate(
+        valid_traj, 0.0, std::numeric_limits<double>::quiet_NaN(),
+        Eigen::Vector2d::Zero(), 0.25, std::numeric_limits<double>::quiet_NaN(), &reason_valid);
+    std::cout << "  TrajectoryValidator valid stair climb: res = " << res_valid
+              << ", reason = " << reason_valid << " (expect 1)" << std::endl;
+    assert(res_valid == true);
+
+    // 构造一个楼梯侧面场景: 楼梯台阶相互连通，而在侧方 y=0.8 处添加平地孤立节点 (无拓扑边连到楼梯台阶)
+    g_cliff.initSpatialGrid(0.10, -5.0, -5.0, 100, 100);
+    for (int r = 0; r <= 30; ++r)
+    {
+      double x = r * 0.10;
+      double z = r * 0.08;
+      for (int c = -5; c <= 5; ++c)
+      {
+        double y = c * 0.10;
+        elevation_planner::GraphNode node;
+        node.x = static_cast<float>(x);
+        node.y = static_cast<float>(y);
+        node.z = static_cast<float>(z);
+        node.traversability = 0.0f;
+        node.headroom = 2.0f;
+        node.row = 50 + r;
+        node.col = 50 + c;
+        node.layer_id = 0;
+        g_cliff.addNode(node);
+      }
+    }
+    // 添加侧方平地孤立节点
+    elevation_planner::GraphNode side_ground;
+    side_ground.x = 0.2f;
+    side_ground.y = 0.8f;
+    side_ground.z = 0.0f; // 平地
+    side_ground.traversability = 0.0f;
+    side_ground.headroom = 2.0f;
+    side_ground.row = 52;
+    side_ground.col = 58;
+    side_ground.layer_id = 0;
+    g_cliff.addNode(side_ground);
+
+    for (int r = 0; r <= 30; ++r)
+      for (int c = -5; c <= 5; ++c)
+      {
+        const int id = r * 11 + (c + 5);
+        if (r < 30) { g_cliff.addEdge(id, id + 11, 0.1f); g_cliff.addEdge(id + 11, id, 0.1f); }
+        if (c < 5)  { g_cliff.addEdge(id, id + 1, 0.1f);  g_cliff.addEdge(id + 1, id, 0.1f); }
+      }
+    g_cliff.finalizeCSR();
+    elevation_planner::GraphStore::instance().setGlobalGraph(std::make_shared<elevation_planner::ManifoldGraph>(g_cliff));
+
+    // 测试 2: 从平地侧面跨向楼梯台阶 (0.2, 0.8, z=0.0) -> (0.2, 0.4, z=0.16)
+    // 空间高差仅 0.16m <= 0.25m, 但拓扑无边 -> 必须被拒绝且返回 topological_disconnected
+    std::vector<Eigen::Vector2d> side_climb_traj = {
+      Eigen::Vector2d(0.2, 0.8),
+      Eigen::Vector2d(0.2, 0.4)
+    };
+    std::string reason_invalid;
+    bool res_invalid = elevation_planner::TrajectoryValidator::validate(
+        side_climb_traj, 0.0, std::numeric_limits<double>::quiet_NaN(),
+        Eigen::Vector2d::Zero(), 0.25, std::numeric_limits<double>::quiet_NaN(), &reason_invalid);
+    std::cout << "  TrajectoryValidator side cliff jump: res = " << res_invalid
+              << ", reason = " << reason_invalid << " (expect 0, topological_disconnected)" << std::endl;
+    assert(res_invalid == false);
+    assert(reason_invalid == "topological_disconnected");
+  }
+
+  // -------------------------------------------------------------
+  // 测试 8: TopologicalCorridorGenerator 拓扑管道生成测试
+  // -------------------------------------------------------------
+  {
+    // 路径为中轴线: x: 0.0 -> 2.0, y = 0.0, z: 0.0 -> 1.6
+    std::vector<geometry_msgs::PoseStamped> path;
+    for (int i = 0; i <= 20; ++i)
+    {
+      geometry_msgs::PoseStamped ps;
+      ps.pose.position.x = i * 0.10;
+      ps.pose.position.y = 0.0;
+      ps.pose.position.z = i * 0.08;
+      path.push_back(ps);
+    }
+
+    // 生成半宽为 3.0m 的管道 (楼梯总宽 1.0m, 到悬空边缘自然截断)
+    double corridor_r = 3.0;
+    auto corridor = elevation_planner::TopologicalCorridorGenerator::generate(graph, path, corridor_r);
+    std::cout << "  TopologicalCorridor generated with " << corridor.size()
+              << " nodes (radius=" << corridor.radius << "m)" << std::endl;
+    assert(corridor.size() > 0);
+    assert(corridor.radius == 3.0);
+
+    // 验证中轴线上所有节点都在管道内
+    uint32_t center_id = 0;
+    assert(graph.findClosestNode(0.5, 0.0, 0.4, center_id, 0.2, 0.2));
+    assert(corridor.isInCorridor(center_id));
+
+    // 验证楼梯边缘节点 (y = 0.5) 也在管道内 (因为 0.5m <= 3.0m 且拓扑连通)
+    uint32_t edge_id = 0;
+    assert(graph.findClosestNode(0.5, 0.5, 0.4, edge_id, 0.2, 0.2));
+    assert(corridor.isInCorridor(edge_id));
+
+    // 验证管道遇悬空自然停止: 在 g_cliff 中，side_ground (y=0.8) 无连通边
+    auto corridor_cliff = elevation_planner::TopologicalCorridorGenerator::generate(g_cliff, path, corridor_r);
+    uint32_t side_ground_id = 0;
+    assert(g_cliff.findClosestNode(0.2, 0.8, 0.0, side_ground_id, 0.2, 0.2));
+    // side_ground 虽然在 0.8m 水平距离内 (< 3.0m)，但由于无拓扑连通边 (悬空隔离)，绝不能进入管道！
+    bool side_in = corridor_cliff.isInCorridor(side_ground_id);
+    std::cout << "  TopologicalCorridor cliff isolation test: side_ground in corridor = "
+              << side_in << " (expect 0)" << std::endl;
+    assert(!side_in);
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 9: 管道动态结合障碍物阻断测试 (Obstacle-Carved Corridor Test)
+  // -------------------------------------------------------------------------
+  {
+    std::vector<geometry_msgs::PoseStamped> path;
+    for (int i = 0; i <= 20; ++i)
+    {
+      geometry_msgs::PoseStamped ps;
+      ps.pose.position.x = i * 0.10;
+      ps.pose.position.y = 0.0;
+      ps.pose.position.z = i * 0.08;
+      path.push_back(ps);
+    }
+    // 模拟在 x in [0.4, 0.6] 区域存在障碍物
+    auto is_obstacle = [](float x, float y, float z) -> bool {
+      return (x >= 0.40f && x <= 0.60f);
+    };
+
+    auto corridor_obs = elevation_planner::TopologicalCorridorGenerator::generate(
+        graph, path, 3.0, 6.0, 0.25, 0.45, is_obstacle);
+    
+    // 验证处于障碍物内部的节点绝不能进入管道
+    uint32_t obs_nid = 0;
+    assert(graph.findClosestNode(0.50, 0.0, 0.40, obs_nid, 0.2, 0.2));
+    bool obs_in = corridor_obs.isInCorridor(obs_nid);
+    std::cout << "  TopologicalCorridor obstacle blocking test: obstacle cell in corridor = "
+              << obs_in << " (expect 0)" << std::endl;
+    assert(!obs_in);
+
+    // 验证起点处的非障碍物节点正常在管道内
+    uint32_t start_nid = 0;
+    assert(graph.findClosestNode(0.10, 0.0, 0.08, start_nid, 0.2, 0.2));
+    assert(corridor_obs.isInCorridor(start_nid));
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 10: 管道局部前瞻截断测试 (Lookahead-Limited Corridor Test)
+  // -------------------------------------------------------------------------
+  {
+    // 构建一条 5 米长的路径 (50 个航点)
+    std::vector<geometry_msgs::PoseStamped> long_path;
+    for (int i = 0; i <= 50; ++i)
+    {
+      geometry_msgs::PoseStamped ps;
+      ps.pose.position.x = i * 0.10;
+      ps.pose.position.y = 0.0;
+      ps.pose.position.z = i * 0.08;
+      long_path.push_back(ps);
+    }
+    // 前瞻限制为 0.5 米, 展开半径 0.2 米
+    double lookahead = 0.5;
+    double radius = 0.2;
+    auto corridor_short = elevation_planner::TopologicalCorridorGenerator::generate(
+        graph, long_path, radius, lookahead);
+    
+    // 远端航点 (x = 1.5m > lookahead + radius) 对应的节点绝不能在管道内
+    uint32_t far_nid = 0;
+    assert(graph.findClosestNode(1.50, 0.0, 1.20, far_nid, 0.2, 0.2));
+    bool far_in = corridor_short.isInCorridor(far_nid);
+    std::cout << "  TopologicalCorridor lookahead limit test: far node in corridor = "
+              << far_in << " (expect 0)" << std::endl;
+    assert(!far_in);
+
+    // 前瞻范围内航点 (x = 0.2m) 对应的节点正常在管道内
+    uint32_t near_nid = 0;
+    assert(graph.findClosestNode(0.20, 0.0, 0.16, near_nid, 0.2, 0.2));
+    assert(corridor_short.isInCorridor(near_nid));
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 11: 轨迹校验器在有效管道内的放行验证 (TrajectoryValidator Corridor Test)
+  // -------------------------------------------------------------------------
+  {
+    std::vector<geometry_msgs::PoseStamped> path;
+    for (int i = 0; i <= 20; ++i)
+    {
+      geometry_msgs::PoseStamped ps;
+      ps.pose.position.x = i * 0.10;
+      ps.pose.position.y = 0.0;
+      ps.pose.position.z = i * 0.08;
+      path.push_back(ps);
+    }
+    auto corridor = std::make_shared<elevation_planner::TopologicalCorridor>(
+        elevation_planner::TopologicalCorridorGenerator::generate(graph, path, 3.0, 6.0));
+    elevation_planner::GraphStore::instance().setTopologicalCorridor(corridor);
+
+    // 沿中轴线正常上楼梯轨迹
+    std::vector<Eigen::Vector2d> traj_poses;
+    for (int i = 0; i <= 10; ++i)
+    {
+      traj_poses.emplace_back(i * 0.10, 0.0);
+    }
+    std::string reason;
+    bool valid = elevation_planner::TrajectoryValidator::validate(
+        traj_poses, 0.0, 0.8, Eigen::Vector2d(1.0, 0.0), 0.25, std::numeric_limits<double>::quiet_NaN(), &reason);
+    std::cout << "  TrajectoryValidator inside corridor test: valid = " << valid
+              << ", reason = " << reason << " (expect valid=1)" << std::endl;
+    assert(valid);
   }
 
   std::cout << "[TestManifoldCostmapBuilder] ALL ASSERTIONS PASSED!" << std::endl;

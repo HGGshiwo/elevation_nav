@@ -181,6 +181,7 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 | `crop_radius_xy` | `1.5` | 实时点云融合的 ROI 滚动窗口半径 (m)，融合图边长 = 2 × crop_radius_xy |
 | `crop_height_above` / `crop_height_below` | `2.0` / `1.0` | ROI 裁剪的垂直高度带：机器人脚下平面以上/以下保留范围 (m) |
 | `fusion_rate` | `5.0` | 融合图刷新频率 (Hz)，与控制循环 (controller_frequency) 解耦 |
+| `corridor_radius` | `3.0` | 拓扑流形管道最大展开半宽 (m)，沿连通图向外膨胀至此半径，遇悬空/断崖/不可达自然停止 |
 | `cloud_topic` | `lidar_points` | 实时点云话题，融合线程的数据源 |
 
 ---
@@ -382,5 +383,71 @@ roslaunch elevation_map_loader navigation.launch sim:=false local_planner:=teb
   - 前端 3D 地形曲面动态按胜出节点物理高程重建网格，未连通障碍区域平整贴地；
   - 配备点击诊断面板与成因热力染色模式，支持悬停检测与一键诊断复制，提供工业级的在线感知-建图-规划全链路可视化诊断能力。
 
+---
 
+## 七、2026-09-17 更新：拓扑流形管道规划与动态障碍物前瞻生成
 
+### 1. 实机/仿真 Bag 静止停滞问题根因定位与彻底修复
+- **停滞根因剖析**：
+  - 经对 `/home/hggshiwo/catkin_ws/src/2026-09-17-20-37-23.bag` 分析，move_base 产生 `[Teb3DLocalPlanner] All trajectories rejected by 3D manifold validation (reason: out_of_topological_corridor). Halting.` 报警并持续输出 0 速度。
+  - 核心原因在于 `TrajectoryValidator::validate` 在存在 `local_grid` 时直接以高程插值，但局部遍历中的 `curr_nid` 未同步从流形图中检索最近邻节点，导致 `curr_nid` 始终保持为初始值 `0`。而在该地图中节点 0 位于 (-14.34m, -0.97m)，距机器狗起始位置 (-6.84m, -3.77m) 达 8 米远且不在当前规划走廊中，造成轨迹校验器误判所有候选轨迹“越界”（`out_of_topological_corridor`）。
+- **校验器对齐修复**：
+  - 在 `TrajectoryValidator` 中引入无论是否通过 `local_grid` 插值、均严格同步依据真实三维空间位置匹配当前流形节点 `curr_nid` 的校验逻辑，彻底根治静态停滞问题。
+
+### 2. 动态障碍物前瞻拓扑管道生成体系 (Real-Time Lookahead Obstacle-Carved Corridor)
+- **局部前瞻截断 (`corridor_lookahead`)**：
+  - 废除原先沿全局 60+ 米路径一次性生成全图 33,000+ 静态节点长管道的做法；
+  - 增加 `corridor_lookahead: 6.0` 参数，拓扑管道仅沿机器狗前向路径截取前瞻区间（默认 6.0m），并以 `corridor_radius: 3.0` 向外测地展开，生成轻量级局部安全管道。
+- **动态实体障碍物实时拦截**：
+  - `TopologicalCorridorGenerator` 接入动态/静态障碍物阻挡判据回调（结合 Costmap 致命障碍格与 TEB 3D 几何障碍物 `CylinderObstacle3D`/`LineObstacle3D`）；
+  - 障碍物内部踏面禁止作为种子节点，多源 Dijkstra 测地膨胀遇到障碍物时自然阻断，使管道在三维流形上顺应障碍物轮廓流式绕行。
+- **高频流式闭环**：
+  - `Teb3DLocalPlanner` 在每帧控制周期（5~10Hz）动态根据最新位姿、裁剪路径与实时障碍物重构前瞻管道，写入 `GraphStore` 供同伦类规划与校验器消费，并实时发布 `/elevation_corridor_nodes` 供前端 Three.js 呈现带有立体护栏的 3D 运动安全管道。
+
+---
+
+## 十、2026-09-18 更新：Frenet 弧长-横向参数化局部规划架构、速度解算与急弯防切角坠落修复
+
+针对立体跨层场景下传统 2D 投影多义性、楼梯起步与平台接缝卡死、以及发夹弯切角踩空坠落等一系列复杂工况，对局部规划与流形管道体系实施了重大重构：
+
+### 1. Frenet 弧长-横向参数化流形空间局部规划架构
+- **彻底消除 3D 投影多义性与空间折叠**：
+  - 在楼梯、立交坡道及多层重叠地形中，传统 2D 投影存在“同一 $(x, y)$ 对应多层高度”与“楼下障碍物错误排斥楼上”的本质缺陷。
+  - 本次更新在 `elevation_planner_core` 中构建了沿 3D 流形参考路径的参数化核心引擎 `FrenetFrame`：
+    - **真实三维几何弧长累积**：纵向坐标 $s$ 严格按三维空间欧氏位移累加（$ds = \sqrt{dx^2 + dy^2 + dz^2}$），天然贴合大坡度与阶梯，彻底根除了大坡度在平面投影上被严重压缩失真的几何缺陷；
+    - **横向偏距正交展开**：横向坐标 $l$ 沿踏面水平切线法向展开（左正右负），在单值无歧义的二维 $(s, l)$ 纯净流形空间中展开优化；
+    - **微分几何曲率前馈**：解析输出沿参考路径的三维曲率 $\kappa$、坡度角 $\alpha$ 与切线航向，为底盘提供精确微分几何角速度前馈（$\omega_z = \omega_{\text{rel}} + \frac{\kappa_0}{1 - \kappa_0 l} v_s$）。
+- **3D 拓扑管道断面映射为 Frenet 刚性护栏**：
+  - 从全局流形图与局部前瞻中实时提取三维拓扑管道（`TopologicalCorridor`），解析各断面的真实物理通行半宽（$W_{\text{left}}(s), W_{\text{right}}(s)$）；
+  - 在 Frenet 空间直接映射为左、右连续折线硬边界（`LineObstacle` at $l = +W_{\text{left}}$ 与 $l = -W_{\text{right}}$），把机器狗严格锁闭在安全踏面之内。
+- **零 via-points 纯净弹性带时空优化**：
+  - 彻底禁用 via-points，解除了全局引导点与局部动态避障之间的死锁冲突，释放四足全向底盘的弹性避障自由度。
+
+### 2. 前端 3D 管道可视化与 WebSocket 高频推流闭环
+- **3D 发光护栏与动态安全曲面**：
+  - 新建 `corridor_visualizer.js`，在 Web 端通过 Three.js 动态渲染三维半透明安全管道曲面与亮绿色发光硬边界；
+- **推流与话题隔离修复**：
+  - 修复 `elevation_server.py`：在 WebSocket 主循环中补充 `corridor_lines` 与 `corridor_walls` 字段推送，解决前端丢失管道显示的 Bug；
+  - 隔离全局与局部话题：全局规划器管道话题重命名为 `/elevation_global_corridor_boundaries`，避免与局部规划器的 `/elevation_corridor_boundaries` 冲突覆盖。
+
+### 3. 局部规划器速度双重旋转消除与开局快速自转对齐
+- **根治速度反向倒车与死锁 Bug**：
+  - 排查并修复严重数学 Bug：`TebOptimalPlanner::getVelocityCommand` 输出的 `cmd_vx, cmd_vy` 内部已根据起点位姿角度自动投影到机体坐标系，`teb_3d_local_planner.cpp` 原逻辑多做了一次旋转矩阵乘法，导致航向偏差大时速度矢量被反转 180°、机器人朝路径反方向开去卡死。消除冗余旋转后速度方向 100% 正确；
+- **开局原地快速对齐保护 (In-place Heading Alignment)**：
+  - 当开局机体朝向与路径切向偏差较明显（$> 40^\circ$）时，优先输出纯原地旋转角速度 $\omega_z = \pm 0.75\text{ rad/s}$ 快速回正，避免四足底盘倒车或大角度打横侧滑；
+- **起点断面横向自适应包络**：
+  - 起点处若存在微小横向偏差，自适应预留安全裕度，防止初始起点直接越界造成优化求解失败。
+
+### 4. 静态踏面边缘线段过滤 (排除虚假路障与原地震荡中止)
+- **台阶接缝虚假路障与死锁分析**：
+  - `ManifoldObstacleExtractor` 提取的图边缘网格边界线段（ID >= 2000）是原 2D 代价地图边界。该批线段被误投影注入 Frenet 空间后，楼梯和平台接缝处的端点恰好落在机器人脚底（距起点仅 2mm~7cm），触发 TEB 严重碰撞惩罚，位姿 1 塌缩至起点导致 $v_x \to 0$ 归零停滞；
+- **针对性过滤生效**：
+  - 在 `populateFrenetObstacles` 中增加 `if (obs.id >= 2000) continue;`。可通行边界已由连续护栏（`LineObstacle`）严格包络，彻底清空脚底虚假路障，机器人顺利连续爬升两层楼梯。
+
+### 5. 路径修剪重构：根治发夹弯切角踩空坠落 (Strict Behind-Robot Pruning)
+- **发夹弯切角与踏空机理剖析**：
+  - 原 `pruneGlobalPlan` 设置了 `min_lookahead = 0.25m` 的视线锚点搜索；在密集台阶发夹弯处（航点间距 10cm），该算法穿透弯道空隙，锁定了 25cm 外弯道对面的航点，**直接把机器人正前方用于拐弯爬升的 4 个关键台阶航点（wp[87]~wp[90]）全量擦除**，形成虚空切角直连；
+  - 机器人原地转向对准虚空连线并前进，跳过了通往 $4.50\text{m}$ 上层连廊的台阶，误冲入 $4.10\text{m}$ 的断头过渡板，最终在拐弯处从平台边缘踩空跌落至下方 $3.60\text{m}$ 踏面；
+- **重构严格身后修剪法则**：
+  - 彻底废除超前视线锚点机制，**严格只剪除机器人身后已走过的历史航点，绝不越权剪除前方任何未来航点**；
+  - 楼梯与发夹弯处的每一个 10cm 台阶微元 100% 完整保留在局部规划与拓扑管道内，引导四足机器人老老实实沿楼梯外侧走完台阶、踏上真实上层连廊，彻底根除切角跌落风险。

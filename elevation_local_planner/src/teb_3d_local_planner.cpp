@@ -1,4 +1,7 @@
 #include "elevation_local_planner/teb_3d_local_planner.h"
+#include <elevation_planner_core/topological_corridor.hpp>
+#include <pcl_ros/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
 #include <pluginlib/class_list_macros.h>
 #include <teb_local_planner/teb_local_planner_ros.h>
 #include <tf2/utils.h>
@@ -47,6 +50,11 @@ void Teb3DLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
   nh_param.param<double>("max_step_height", max_step_height_, 0.25);
   nh_param.param<double>("plan_slice_horizon", plan_slice_horizon_, 2.5);
   nh_param.param<double>("dog_height", dog_height_, 0.45);
+  nh_param.param<double>("corridor_radius", corridor_radius_, 2.5);
+
+  ros::NodeHandle nh_root;
+  corridor_pub_ = nh_root.advertise<sensor_msgs::PointCloud2>("/elevation_corridor_nodes", 1);
+  corridor_boundary_pub_ = nh_root.advertise<visualization_msgs::MarkerArray>("/elevation_corridor_boundaries", 1);
 
   global_frame_ = costmap_ros_->getGlobalFrameID();
   cfg_.map_frame = global_frame_;
@@ -124,49 +132,131 @@ void Teb3DLocalPlanner::customObstacleCB(const costmap_converter::ObstacleArrayM
   has_new_obstacles_ = true;
 }
 
-void Teb3DLocalPlanner::updateObstaclesFromMsg()
+void Teb3DLocalPlanner::populateFrenetObstacles(const elevation_planner::FrenetFrame& frenet_frame,
+                                               double s_start, double s_end, double l_robot)
 {
-  std::lock_guard<std::mutex> lock(custom_obst_mutex_);
   obstacles_.clear();
+  via_points_.clear(); // 彻底禁用 via-points，释放避障弹性自由度
 
-  if (custom_obstacle_msg_.obstacles.empty()) return;
+  if (frenet_frame.empty()) return;
 
-  for (const auto & obs : custom_obstacle_msg_.obstacles)
+  // 1. 生成 Frenet 走廊左/右硬边界 (由连续 LineObstacle 折线段构成)
+  const double step_s = 0.25; // 每隔 25cm 采样一段边界线段
+  double cur_s = std::max(0.0, s_start - 0.20);
+  double max_s = std::min(frenet_frame.totalLength(), s_end + 0.30);
+
+  double prev_s = cur_s;
+  double prev_wl = frenet_frame.getLeftWidth(prev_s);
+  double prev_wr = frenet_frame.getRightWidth(prev_s);
+
+  // 起点断面自适应包络当前机器人横向偏距，防止因轻微偏差触发边界碰撞
+  if (std::abs(prev_s - s_start) < 0.50)
   {
-    if (obs.polygon.points.empty()) continue;
+    prev_wl = std::max(prev_wl, l_robot + 0.20);
+    prev_wr = std::max(prev_wr, -l_robot + 0.20);
+  }
 
-    if (obs.polygon.points.size() == 2 && obs.radius <= 0.001)
+  for (cur_s = prev_s + step_s; cur_s <= max_s + 1e-4; cur_s += step_s)
+  {
+    double cur_eval_s = std::min(cur_s, max_s);
+    double cur_wl = frenet_frame.getLeftWidth(cur_eval_s);
+    double cur_wr = frenet_frame.getRightWidth(cur_eval_s);
+
+    if (std::abs(cur_eval_s - s_start) < 0.50)
     {
-      // 3D 悬崖/台阶边缘线段
-      Eigen::Vector3d p1(obs.polygon.points[0].x, obs.polygon.points[0].y, obs.polygon.points[0].z);
-      Eigen::Vector3d p2(obs.polygon.points[1].x, obs.polygon.points[1].y, obs.polygon.points[1].z);
-      obstacles_.push_back(boost::make_shared<LineObstacle3D>(p1, p2));
+      cur_wl = std::max(cur_wl, l_robot + 0.20);
+      cur_wr = std::max(cur_wr, -l_robot + 0.20);
     }
-    else if (obs.polygon.points.size() == 1 && obs.radius > 0.0)
+
+    // 左边界折线段 (l = +W_left)
+    obstacles_.push_back(boost::make_shared<teb_local_planner::LineObstacle>(
+        Eigen::Vector2d(prev_s, prev_wl), Eigen::Vector2d(cur_eval_s, cur_wl)));
+
+    // 右边界折线段 (l = -W_right)
+    obstacles_.push_back(boost::make_shared<teb_local_planner::LineObstacle>(
+        Eigen::Vector2d(prev_s, -prev_wr), Eigen::Vector2d(cur_eval_s, -cur_wr)));
+
+    prev_s = cur_eval_s;
+    prev_wl = cur_wl;
+    prev_wr = cur_wr;
+    if (prev_s >= max_s) break;
+  }
+
+  // 2. 投影结构化外部 3D 障碍物 (若有)
+  {
+    std::lock_guard<std::mutex> lock(custom_obst_mutex_);
+    for (const auto& obs : custom_obstacle_msg_.obstacles)
     {
-      // 3D 柱体
-      Eigen::Vector3d center(obs.polygon.points[0].x, obs.polygon.points[0].y, obs.polygon.points[0].z);
-      obstacles_.push_back(boost::make_shared<CylinderObstacle3D>(center, obs.radius, /*height=*/2.0));
-    }
-    else if (obs.polygon.points.size() > 2)
-    {
-      // 3D 多棱柱体
-      std::vector<Eigen::Vector3d> verts;
-      double z_min = std::numeric_limits<double>::max();
-      double z_max = -std::numeric_limits<double>::max();
-      for (const auto & pt : obs.polygon.points)
+      // 方案 1: 忽略流形图踏面断坎/网格边界线段 (ID >= 2000)。
+      // 踏面可行走物理边界在步骤 1 中已由 3D 拓扑管道左右护栏 (LineObstacle) 严格约束，
+      // 绝不可将楼梯与平台边缘重复投影为障碍物，避免在机器人脚底与正前方形成虚假路障导致锁死。
+      if (obs.id >= 2000) continue;
+
+      for (const auto& pt : obs.polygon.points)
       {
-        verts.emplace_back(pt.x, pt.y, pt.z);
-        z_min = std::min(z_min, static_cast<double>(pt.z));
-        z_max = std::max(z_max, static_cast<double>(pt.z));
+        double so = 0.0, lo = 0.0, zo = 0.0;
+        frenet_frame.toFrenet(pt.x, pt.y, pt.z, so, lo, zo);
+        if (so >= s_start - 0.2 && so <= s_end + 0.3)
+        {
+          if (std::abs(pt.z - zo) <= dog_height_ + 0.15)
+          {
+            double r = std::max(0.04, static_cast<double>(obs.radius));
+            obstacles_.push_back(boost::make_shared<teb_local_planner::CircularObstacle>(so, lo, r));
+          }
+        }
       }
-      obstacles_.push_back(boost::make_shared<PolygonObstacle3D>(verts, z_min, z_max + 1.5));
     }
-    else if (obs.polygon.points.size() == 1)
+  }
+
+  // 3. 从局部 Costmap 投影当前踏面高度层内的致命实体障碍物
+  if (costmap_ && cfg_.obstacles.include_costmap_obstacles)
+  {
+    double rx = current_robot_pose_.pose.position.x;
+    double ry = current_robot_pose_.pose.position.y;
+    double rz = current_robot_pose_.pose.position.z;
+
+    const double search_r = std::max(2.5, s_end - s_start + 0.5);
+    int min_cx = 0, min_cy = 0, max_cx = 0, max_cy = 0;
+    costmap_->worldToMapEnforceBounds(rx - search_r, ry - search_r, min_cx, min_cy);
+    costmap_->worldToMapEnforceBounds(rx + search_r, ry + search_r, max_cx, max_cy);
+
+    // 稀疏栅格哈希，防止障碍点过密导致优化迟滞 (间距 12cm)
+    std::set<std::pair<int, int>> visited_cells;
+    const int step = 2; // 10cm 采样
+
+    for (int cy = min_cy; cy <= max_cy; cy += step)
     {
-      // 孤立点障碍物
-      Eigen::Vector3d pt(obs.polygon.points[0].x, obs.polygon.points[0].y, obs.polygon.points[0].z);
-      obstacles_.push_back(boost::make_shared<CylinderObstacle3D>(pt, cfg_.obstacles.min_obstacle_dist * 0.5, 2.0));
+      for (int cx = min_cx; cx <= max_cx; cx += step)
+      {
+        if (costmap_->getCost(cx, cy) >= costmap_2d::LETHAL_OBSTACLE)
+        {
+          double wx = 0.0, wy = 0.0;
+          costmap_->mapToWorld(cx, cy, wx, wy);
+          double wz = querySurfaceZ(wx, wy, rz, 0.50);
+
+          double so = 0.0, lo = 0.0, zo = 0.0;
+          frenet_frame.toFrenet(wx, wy, wz, so, lo, zo);
+
+          if (so >= s_start - 0.15 && so <= s_end + 0.30)
+          {
+            // 垂直高程过滤：严格排除上层天花板/下层地板点云
+            if (std::abs(wz - zo) <= dog_height_ + 0.15)
+            {
+              double wl = frenet_frame.getLeftWidth(so);
+              double wr = frenet_frame.getRightWidth(so);
+              if (lo >= -wr - 0.20 && lo <= wl + 0.20)
+              {
+                int g_s = static_cast<int>(std::round(so / 0.12));
+                int g_l = static_cast<int>(std::round(lo / 0.12));
+                if (visited_cells.insert({g_s, g_l}).second)
+                {
+                  obstacles_.push_back(boost::make_shared<teb_local_planner::PointObstacle>(so, lo));
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -192,11 +282,10 @@ bool Teb3DLocalPlanner::pruneGlobalPlan(const geometry_msgs::PoseStamped& global
   double rx = global_pose.pose.position.x;
   double ry = global_pose.pose.position.y;
   double rz = global_pose.pose.position.z;
-  double r_yaw = tf2::getYaw(global_pose.pose.orientation);
 
-  // 1. 连续线段正交投影：在前瞻搜索窗口内寻找机器人投影最近的线段
+  // 1. 连续线段三维几何正交投影：在前瞻搜索窗口内寻找机器人投影最近的线段
   size_t max_search = std::min(global_plan.size(), size_t(30));
-  size_t seg_idx = 0;
+  size_t closest_idx = 0;
   double min_d_sq = std::numeric_limits<double>::max();
 
   for (size_t i = 0; i + 1 < max_search; ++i)
@@ -220,73 +309,22 @@ bool Teb3DLocalPlanner::pruneGlobalPlan(const geometry_msgs::PoseStamped& global
     if (d_sq < min_d_sq)
     {
       min_d_sq = d_sq;
-      seg_idx = (t >= 0.99) ? (i + 1) : i;
+      // 当在当前段上投影进展超过前半程 (t >= 0.5) 时，当前点推进至 p2
+      closest_idx = (t >= 0.5) ? (i + 1) : i;
     }
   }
 
-  // 2. 前瞻视线锚点搜索 (Lookahead Anchor Selection)
-  // 从 seg_idx 开始向前寻找第一个满足前向可行视野锥与最小前瞻距离的引导航点
-  size_t anchor_idx = seg_idx;
-  bool found_anchor = false;
-  double best_angle_diff = std::numeric_limits<double>::max();
-  size_t best_relaxed_idx = seg_idx;
-
-  const double min_lookahead = 0.25;                    // 最小前瞻距离，避免 10cm 内直角横折
-  const double forward_cone = M_PI / 3.0;               // 60度前向可行视野锥
-  const double relaxed_cone = 5.0 * M_PI / 12.0;        // 75度放宽视角
-
-  for (size_t i = seg_idx; i < max_search; ++i)
+  // 2. 严格修剪准则：仅剪除机器人身后已经走过的历史航点 (closest_idx 之前的航点)
+  // 严禁越权向前方搜索吞噬未来航点！在楼梯与发夹弯处，前方每个 10cm 细微台阶
+  // 和绕弯微元都是避免切角踏空跌落的绝对生命线。
+  if (closest_idx >= global_plan.size())
   {
-    double dx = global_plan[i].pose.position.x - rx;
-    double dy = global_plan[i].pose.position.y - ry;
-    double dist = std::hypot(dx, dy);
-
-    double angle_to_p = std::atan2(dy, dx);
-    double angle_diff = std::abs(angles::shortest_angular_distance(r_yaw, angle_to_p));
-
-    if (angle_diff < best_angle_diff)
-    {
-      best_angle_diff = angle_diff;
-      best_relaxed_idx = i;
-    }
-
-    if (dist >= min_lookahead && angle_diff <= forward_cone)
-    {
-      anchor_idx = i;
-      found_anchor = true;
-      break;
-    }
+    closest_idx = global_plan.size() - 1;
   }
 
-  // 3. 降级兜底逻辑 (Fallback Hierarchy)
-  if (!found_anchor)
+  if (closest_idx > 0)
   {
-    if (global_plan.size() <= 3 || seg_idx + 2 >= global_plan.size())
-    {
-      // 接近终点：直接保留至终点
-      anchor_idx = (seg_idx < global_plan.size() - 1) ? seg_idx : (global_plan.size() - 1);
-    }
-    else if (best_angle_diff <= relaxed_cone)
-    {
-      // 自适应放宽视角（<= 75度）
-      anchor_idx = best_relaxed_idx;
-    }
-    else
-    {
-      // 航向偏差较大，选择夹角最小的前方点
-      anchor_idx = (best_relaxed_idx > seg_idx) ? best_relaxed_idx : seg_idx;
-    }
-  }
-
-  // 4. 彻底剪除 anchor_idx 之前的历史/横折航点，至少保留终点
-  if (anchor_idx >= global_plan.size())
-  {
-    anchor_idx = global_plan.size() - 1;
-  }
-
-  if (anchor_idx > 0)
-  {
-    global_plan.erase(global_plan.begin(), global_plan.begin() + anchor_idx);
+    global_plan.erase(global_plan.begin(), global_plan.begin() + closest_idx);
   }
   return true;
 }
@@ -329,72 +367,6 @@ bool Teb3DLocalPlanner::transformGlobalPlan(const std::vector<geometry_msgs::Pos
     transformed_plan.push_back(global_plan.front());
   }
   return true;
-}
-
-void Teb3DLocalPlanner::updateViaPointsSafe(const std::vector<geometry_msgs::PoseStamped>& transformed_plan,
-                                           double min_separation)
-{
-  via_points_.clear();
-  if (min_separation <= 0.0 || transformed_plan.size() <= 1) return;
-
-  auto graph = elevation_planner::GraphStore::instance().getGlobalGraph();
-  if (!graph || graph->numNodes() == 0)
-  {
-    graph = elevation_planner::GraphStore::instance().getFusedGraph();
-  }
-
-  // 沿路径 3D 欧氏距离均匀采样并筛选安全 via-points
-
-  size_t prev_idx = 0;
-  for (size_t i = 1; i < transformed_plan.size(); ++i)
-  {
-    const auto & p_prev = transformed_plan[prev_idx].pose.position;
-    const auto & p_curr = transformed_plan[i].pose.position;
-
-    // 沿路径 3D 欧氏距离均匀采样
-    double dist_3d = std::sqrt(std::pow(p_curr.x - p_prev.x, 2) +
-                               std::pow(p_curr.y - p_prev.y, 2) +
-                               std::pow(p_curr.z - p_prev.z, 2));
-    if (dist_3d < min_separation) continue;
-
-    bool is_safe = true;
-
-    // 1. 检查流形图节点属性 (若落入硬阻挡/顶头净空不足/过大通行阻力则剔除)
-    if (graph && graph->numNodes() > 0)
-    {
-      uint32_t nid = 0;
-      if (graph->findClosestNode(p_curr.x, p_curr.y, p_curr.z, nid, 0.35, 0.50))
-      {
-        const auto & nd = graph->getNode(nid);
-        if (nd.traversability >= 0.8f ||
-            (nd.headroom > 0.0f && nd.headroom < dog_height_) ||
-            (nd.flags & elevation_planner::node_flags::BLOCK_HEADROOM))
-        {
-          is_safe = false;
-        }
-      }
-    }
-
-    // 2. 检查 3D 几何障碍物距离 (若落入或过分贴近障碍物则剔除，避免与 TEB 斥力拔河)
-    if (is_safe && !obstacles_.empty())
-    {
-      Eigen::Vector2d pt_2d(p_curr.x, p_curr.y);
-      for (const auto & obs : obstacles_)
-      {
-        if (obs && obs->getMinimumDistance(pt_2d) < cfg_.obstacles.min_obstacle_dist)
-        {
-          is_safe = false;
-          break;
-        }
-      }
-    }
-
-    if (is_safe)
-    {
-      via_points_.emplace_back(p_curr.x, p_curr.y);
-    }
-    prev_idx = i;
-  }
 }
 
 bool Teb3DLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
@@ -469,196 +441,192 @@ bool Teb3DLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
     }
   }
 
-  // 5. 更新装载 3D 几何障碍物
-  updateObstaclesFromMsg();
+  // 5. 沿 3D 参考路径构建 Frenet 弧长-横向参数化流形空间 (FrenetFrame)
+  elevation_planner::FrenetFrame frenet_frame;
+  if (!frenet_frame.initialize(transformed_plan))
+  {
+    ROS_WARN_THROTTLE(1.0, "[Teb3DLocalPlanner] Failed to initialize FrenetFrame!");
+    return false;
+  }
 
-  // 5.5 安全生成 Via-Points 路径引导约束 (带障碍物与流形图通行度校验)
-  updateViaPointsSafe(transformed_plan, cfg_.trajectory.global_plan_viapoint_sep);
+  // 5.1 从流形连通图提取当前前瞻段的 3D 拓扑管道并精确解析各断面通行净宽
+  auto graph = elevation_planner::GraphStore::instance().getGlobalGraph();
+  if (!graph || graph->numNodes() == 0)
+  {
+    graph = elevation_planner::GraphStore::instance().getFusedGraph();
+  }
 
-  // 6. 执行 TEB 弹性带时空优化
-  bool success = planner_->plan(transformed_plan, &robot_vel_, cfg_.goal_tolerance.free_goal_vel);
+  if (graph && graph->numNodes() > 0)
+  {
+    auto corridor = elevation_planner::TopologicalCorridorGenerator::generate(
+        *graph, transformed_plan, corridor_radius_, /*lookahead_dist=*/0.0, max_step_height_, dog_height_);
+    frenet_frame.computeCorridorWidth(*graph, corridor, corridor_radius_, max_step_height_, dog_height_);
+
+    // 发布 3D 走廊连续曲面与发光护栏 Marker (节流 5Hz)
+    ros::Time now = ros::Time::now();
+    if ((now - last_corridor_pub_time_).toSec() >= 0.2)
+    {
+      last_corridor_pub_time_ = now;
+      visualization_msgs::MarkerArray marker_msg;
+      frenet_frame.toCorridorMarkers(global_frame_, marker_msg, dog_height_ * 0.75);
+      corridor_boundary_pub_.publish(marker_msg);
+    }
+  }
+
+  // 6. 将当前机器人位姿投影至 Frenet 坐标系 (s_robot, l_robot, yaw_robot_rel)
+  double s_robot = 0.0, l_robot = 0.0, z_proj = 0.0, ref_yaw_robot = 0.0;
+  frenet_frame.toFrenet(robot_pose.pose.position.x, robot_pose.pose.position.y, robot_pose.pose.position.z,
+                        s_robot, l_robot, z_proj, &ref_yaw_robot);
+  s_robot = std::max(0.0, s_robot);
+
+  double robot_yaw = tf2::getYaw(robot_pose.pose.orientation);
+  double yaw_robot_rel = angles::shortest_angular_distance(ref_yaw_robot, robot_yaw);
+
+  // 6.0 原地对齐检查：当机体朝向与路径切向偏差过大（> 40度）时，优先纯原地回正
+  // 四足底盘原地自转对齐，避免在通道内倒车或打横侧滑漂移
+  if (std::abs(yaw_robot_rel) > 0.70) // > ~40 degrees
+  {
+    cmd_vel.linear.x = 0.0;
+    cmd_vel.linear.y = 0.0;
+    // -yaw_robot_rel = ref_yaw_robot - robot_yaw: 驱动机器人直接转向路径切线
+    cmd_vel.angular.z = std::copysign(std::min(cfg_.robot.max_vel_theta, 0.75), -yaw_robot_rel);
+    return true;
+  }
+
+  // 6.1 确定 Frenet 空间规划终点 (s_goal, l_goal = 0, yaw_goal_rel)
+  double s_goal = frenet_frame.totalLength();
+  double l_goal = 0.0;
+  double yaw_goal_rel = 0.0;
+
+  double dist_to_global_goal = std::hypot(
+      robot_pose.pose.position.x - global_plan_.back().pose.position.x,
+      robot_pose.pose.position.y - global_plan_.back().pose.position.y);
+  if (dist_to_global_goal <= s_goal + 0.10)
+  {
+    double final_goal_yaw = tf2::getYaw(global_plan_.back().pose.orientation);
+    yaw_goal_rel = angles::shortest_angular_distance(frenet_frame.getTangentYaw(s_goal), final_goal_yaw);
+  }
+
+  // 6.2 在 Frenet 空间生成初始种子轨迹 (平滑连接当前位姿与局部前瞻终点)
+  double plan_dist = std::max(0.20, s_goal - s_robot);
+  size_t n_samples = std::max(size_t(5), static_cast<size_t>(std::ceil(plan_dist / 0.15)));
+  std::vector<geometry_msgs::PoseStamped> frenet_initial_plan;
+  frenet_initial_plan.reserve(n_samples);
+
+  ros::Time now = ros::Time::now();
+  for (size_t i = 0; i < n_samples; ++i)
+  {
+    double t = static_cast<double>(i) / (n_samples - 1);
+    double s = s_robot + t * (s_goal - s_robot);
+    double l = (1.0 - t) * l_robot + t * l_goal;
+    double theta = (1.0 - t) * yaw_robot_rel + t * yaw_goal_rel;
+
+    geometry_msgs::PoseStamped p;
+    p.header.frame_id = global_frame_;
+    p.header.stamp = now;
+    p.pose.position.x = s;
+    p.pose.position.y = l;
+    p.pose.position.z = 0.0;
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, theta);
+    p.pose.orientation = tf2::toMsg(q);
+    frenet_initial_plan.push_back(p);
+  }
+
+  // 7. 装载 Frenet 空间障碍物 (走廊左右 LineObstacle 边界 + 踏面投影点障碍物)
+  populateFrenetObstacles(frenet_frame, s_robot, s_goal, l_robot);
+
+  // 8. 计算 Frenet 空间初始速度
+  double v_s_start = robot_vel_.linear.x * std::cos(yaw_robot_rel) - robot_vel_.linear.y * std::sin(yaw_robot_rel);
+  double v_l_start = robot_vel_.linear.x * std::sin(yaw_robot_rel) + robot_vel_.linear.y * std::cos(yaw_robot_rel);
+  double kappa_0 = frenet_frame.getCurvature(s_robot);
+  double denom_0 = std::max(0.2, 1.0 - kappa_0 * l_robot);
+  double omega_rel_start = robot_vel_.angular.z - (kappa_0 / denom_0) * v_s_start;
+
+  geometry_msgs::Twist start_vel_frenet;
+  start_vel_frenet.linear.x = v_s_start;
+  start_vel_frenet.linear.y = v_l_start;
+  start_vel_frenet.angular.z = omega_rel_start;
+
+  // 9. 在纯净无折叠的 Frenet (s, l) 空间执行 TEB 弹性带时空优化 (零 via-points, 彻底杜绝与避障死锁)
+  bool success = planner_->plan(frenet_initial_plan, &start_vel_frenet, cfg_.goal_tolerance.free_goal_vel);
   if (!success)
   {
     planner_->clearPlanner();
-    ROS_WARN_THROTTLE(1.0, "[Teb3DLocalPlanner] TEB failed to produce a feasible trajectory.");
+    ROS_WARN_THROTTLE(1.0, "[Teb3DLocalPlanner] TEB optimization failed in Frenet space.");
     return false;
   }
 
-  // 7. 三维流形物理校验与多同伦候选轨迹优选 (TrajectoryValidator)
+  // 10. 提取最优轨迹
   teb_local_planner::TebOptimalPlannerPtr selected_teb = nullptr;
-  double robot_z = robot_pose.pose.position.z;
-  double target_z = transformed_plan.back().pose.position.z;
-  Eigen::Vector2d target_xy(transformed_plan.back().pose.position.x, transformed_plan.back().pose.position.y);
-
-  // 提取局部前瞻范围内的全局路径峰值高程 (针对"上->转角->下"立体构型, 峰值即转角平台)
-  double plan_peak_z = -std::numeric_limits<double>::max();
-  for (const auto & p : transformed_plan)
-  {
-    plan_peak_z = std::max(plan_peak_z, static_cast<double>(p.pose.position.z));
-  }
-  double min_peak_z = std::numeric_limits<double>::quiet_NaN();
-  if (plan_peak_z > std::max(robot_z, target_z) + 0.30)
-  {
-    min_peak_z = plan_peak_z;
-  }
-
-  std::string last_reject_reason = "none";
   auto hcp = boost::dynamic_pointer_cast<teb_local_planner::HomotopyClassPlanner>(planner_);
   if (hcp && !hcp->getTrajectoryContainer().empty())
   {
-    double best_cost = std::numeric_limits<double>::max();
-    const auto & candidates = hcp->getTrajectoryContainer();
-
-    for (const auto & opt : candidates)
-    {
-      if (!opt || !opt->isOptimized()) continue;
-
-      std::vector<Eigen::Vector2d> xy_poses;
-      const auto & poses = opt->teb().poses();
-      xy_poses.reserve(poses.size());
-      for (const auto & p : poses)
-      {
-        xy_poses.push_back(p->position());
-      }
-
-      // 复用建图算法口径的高程物理连续性、中间支撑、目标 Z 与峰值高程验证 (杜绝底层穿模绕行)
-      std::string current_reason;
-      bool is_3d_valid = elevation_planner::TrajectoryValidator::validate(
-          xy_poses, robot_z, target_z, target_xy, max_step_height_, min_peak_z, &current_reason);
-
-      if (is_3d_valid)
-      {
-        double cost = opt->getCurrentCost();
-        if (cost < best_cost)
-        {
-          best_cost = cost;
-          selected_teb = opt;
-        }
-      }
-      else
-      {
-        last_reject_reason = current_reason;
-        ROS_DEBUG_THROTTLE(1.0, "[Teb3DLocalPlanner] Candidate rejected by 3D validation: %s", current_reason.c_str());
-      }
-    }
+    selected_teb = hcp->bestTeb();
   }
   else
   {
-    // 单轨迹优化模式校验
     auto single_teb = boost::dynamic_pointer_cast<teb_local_planner::TebOptimalPlanner>(planner_);
     if (single_teb && single_teb->isOptimized())
     {
-      std::vector<Eigen::Vector2d> xy_poses;
-      const auto & poses = single_teb->teb().poses();
-      xy_poses.reserve(poses.size());
-      for (const auto & p : poses)
-      {
-        xy_poses.push_back(p->position());
-      }
-      if (elevation_planner::TrajectoryValidator::validate(
-              xy_poses, robot_z, target_z, target_xy, max_step_height_, min_peak_z, &last_reject_reason))
-      {
-        selected_teb = single_teb;
-      }
+      selected_teb = single_teb;
     }
   }
 
-  // 严格安全把关：若所有候选均未通过 3D 物理验证，坚决不执行错误轨迹，直接判定失败停车
   if (!selected_teb)
   {
-    ROS_WARN_THROTTLE(1.0, "[Teb3DLocalPlanner] All trajectories rejected by 3D manifold validation (reason: %s). Halting.",
-                      last_reject_reason.c_str());
+    ROS_WARN_THROTTLE(1.0, "[Teb3DLocalPlanner] TEB failed to produce a valid trajectory.");
     planner_->clearPlanner();
     return false;
   }
 
-
-
-  // 8. 提取速度指令
-  selected_teb->getVelocityCommand(cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z,
+  // 11. 提取速度指令并叠加解析曲率前馈
+  // 注意：TEB 内部 extractVelocity 已根据起点位姿 Pose(0).theta 自动投影到机体坐标系，
+  // getVelocityCommand 输出的 cmd_vx, cmd_vy 已经是机器狗机体坐标系下的速度指令，绝不可再做二次旋转！
+  double cmd_vx = 0.0, cmd_vy = 0.0, cmd_omega_rel = 0.0;
+  selected_teb->getVelocityCommand(cmd_vx, cmd_vy, cmd_omega_rel,
                                    cfg_.trajectory.control_look_ahead_poses);
 
-  // 8.1 真实 3D 空间几何步长速度校正 (克服楼梯/斜坡 2D 投影距离压缩导致的实际速度超限或失真)
-  if (selected_teb->teb().sizePoses() >= 2)
-  {
-    const auto & p0 = selected_teb->teb().Pose(0);
-    size_t lookahead_idx = std::min(static_cast<size_t>(cfg_.trajectory.control_look_ahead_poses),
-                                    static_cast<size_t>(selected_teb->teb().sizePoses() - 1));
-    if (lookahead_idx < 1) lookahead_idx = 1;
-    const auto & p1 = selected_teb->teb().Pose(lookahead_idx);
+  // 计算沿参考切线的真实前进分速度以合成曲率前馈
+  double v_s_eff = cmd_vx * std::cos(yaw_robot_rel) - cmd_vy * std::sin(yaw_robot_rel);
+  double omega_z = cmd_omega_rel + (kappa_0 / denom_0) * v_s_eff;
 
-    double dxy = (p1.position() - p0.position()).norm();
-    if (dxy > 1e-4)
-    {
-      double z0 = querySurfaceZ(p0.x(), p0.y(), robot_z, max_step_height_);
-      double z1 = querySurfaceZ(p1.x(), p1.y(), z0, max_step_height_);
-      double dz = z1 - z0;
-      double ds_3d = std::hypot(dxy, dz);
-      double slope_ratio = ds_3d / dxy; // 3D/2D 距离比率 >= 1.0
+  // 动力学限幅保护
+  cmd_vel.linear.x = std::max(-cfg_.robot.max_vel_x_backwards, std::min(cfg_.robot.max_vel_x, cmd_vx));
+  cmd_vel.linear.y = std::max(-cfg_.robot.max_vel_y, std::min(cfg_.robot.max_vel_y, cmd_vy));
+  cmd_vel.angular.z = std::max(-cfg_.robot.max_vel_theta, std::min(cfg_.robot.max_vel_theta, omega_z));
 
-      // 若机器狗沿坡面行走，实际 3D 运动线速度为 v_cmd * slope_ratio
-      // 当其超出机器狗动力学极限 max_vel_x 时，按比例压低水平投影指令，确保真实 3D 攀爬线速度不超限
-      if (std::abs(cmd_vel.linear.x) * slope_ratio > cfg_.robot.max_vel_x)
-      {
-        cmd_vel.linear.x = std::copysign(cfg_.robot.max_vel_x / slope_ratio, cmd_vel.linear.x);
-      }
-    }
-  }
-
-  // 9. 构建并发布具备真实三维高程 Z 的局部规划路径与整体规划可视化
+  // 12. 将优化后的 Frenet 轨迹严格映射回三维全局坐标系 (具备连续真实 Z 与姿态)
   if (visualization_)
   {
     std::vector<geometry_msgs::PoseStamped> local_3d_plan;
-    const auto & poses = selected_teb->teb().poses();
+    const auto& poses = selected_teb->teb().poses();
     local_3d_plan.reserve(poses.size());
-    ros::Time now = ros::Time::now();
 
-    size_t tp_start_idx = 0;
-    double last_ref_z = robot_z;
-
-    for (const auto & p : poses)
+    for (const auto& p : poses)
     {
+      double s_i = p->x();
+      double l_i = p->y();
+      double theta_rel_i = p->theta();
+
+      double wx = 0.0, wy = 0.0, wz = 0.0, ref_yaw_i = 0.0;
+      frenet_frame.toCartesian(s_i, l_i, wx, wy, wz, ref_yaw_i);
+      double ground_z = querySurfaceZ(wx, wy, wz, max_step_height_);
+
       geometry_msgs::PoseStamped pose;
       pose.header.frame_id = global_frame_;
       pose.header.stamp = now;
-      pose.pose.position.x = p->position().x();
-      pose.pose.position.y = p->position().y();
-
-      // 沿 transformed_plan 单调前向搜索最近全局高程（加权 3D 距离，防止折返楼梯处 2D 投影误吸附到下层）
-      double ref_z = last_ref_z;
-      double min_d3_sq = std::numeric_limits<double>::max();
-      size_t best_tp_idx = tp_start_idx;
-      size_t search_end = std::min(transformed_plan.size(), tp_start_idx + 15);
-
-      for (size_t j = tp_start_idx; j < search_end; ++j)
-      {
-        const auto & tp = transformed_plan[j];
-        double d2_xy = std::pow(p->position().x() - tp.pose.position.x, 2) +
-                       std::pow(p->position().y() - tp.pose.position.y, 2);
-        double dz = tp.pose.position.z - last_ref_z;
-        double d3_sq = d2_xy + 3.0 * dz * dz;
-        if (d3_sq < min_d3_sq)
-        {
-          min_d3_sq = d3_sq;
-          ref_z = tp.pose.position.z;
-          best_tp_idx = j;
-        }
-      }
-
-      tp_start_idx = best_tp_idx;
-      last_ref_z = ref_z;
-
-      pose.pose.position.z = querySurfaceZ(p->position().x(), p->position().y(), ref_z, max_step_height_);
+      pose.pose.position.x = wx;
+      pose.pose.position.y = wy;
+      pose.pose.position.z = ground_z;
 
       tf2::Quaternion q;
-      q.setRPY(0.0, 0.0, p->theta());
+      q.setRPY(0.0, 0.0, angles::normalize_angle(ref_yaw_i + theta_rel_i));
       pose.pose.orientation = tf2::toMsg(q);
       local_3d_plan.push_back(pose);
     }
 
     visualization_->publishLocalPlan(local_3d_plan);
-    visualization_->publishObstacles(obstacles_, costmap_->getResolution());
-    visualization_->publishViaPoints(via_points_);
     visualization_->publishGlobalPlan(global_plan_);
   }
 

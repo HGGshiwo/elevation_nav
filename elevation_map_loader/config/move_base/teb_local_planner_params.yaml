@@ -34,8 +34,8 @@ TebLocalPlannerROS:
   min_samples: 3
   max_samples: 25
   global_plan_overwrite_orientation: false
-  global_plan_viapoint_sep: 0.50
-  max_global_plan_lookahead_dist: 2.5
+  global_plan_viapoint_sep: -1.0
+  max_global_plan_lookahead_dist: 3.5
   force_reinit_new_goal_dist: 0.5
   feasibility_check_no_poses: 1
 
@@ -46,7 +46,7 @@ TebLocalPlannerROS:
   include_costmap_obstacles: false
   costmap_obstacles_behind_robot_dist: 1.0
   obstacle_poses_affected: 15
-  inflation_dist: 0.30
+  inflation_dist: 0.12
   costmap_converter_plugin: ""
 
   # ---- 优化器权重 (增大避障斥力, 拐角主动提前外绕) ----
@@ -65,8 +65,8 @@ TebLocalPlannerROS:
   weight_kinematics_forward_drive: 5.0
   weight_kinematics_turning_radius: 0.0
   weight_optimaltime: 0.5
-  weight_obstacle: 15.0
-  weight_viapoint: 0.2
+  weight_obstacle: 50.0
+  weight_viapoint: 0.0
   weight_inflation: 2.0
 
   # ---- 同伦类规划 (基于稀疏流形障碍物的拓扑多路径并行探索) ----

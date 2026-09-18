@@ -22,3 +22,8 @@ sweep_penalty_weight: 1.0      # 机体扫掠区软代价权重
 # 派生碰撞半径 (若未显式指定 robot_width/robot_length 则以此默认值生效; 若指定则由节点自适应几何推导)
 body_hard_radius: 0.17         # = robot_width / 2 + obstacle_safety_margin
 footprint_radius: 0.26         # = hypot(robot_length/2, robot_width/2) + obstacle_safety_margin
+
+# 拓扑流形管道参数 (A* 规划结果扩展为拓扑管道，供局部规划器 TEB 内部规划)
+corridor_radius: 3.0           # 拓扑管道最大展开半宽 (m)，沿连通图向外膨胀至此半径，遇悬空/断崖/不可达位置自然停止
+corridor_lookahead: 5.0        # 拓扑管道前瞻长度上限 (m)，仅计算当前局部规划前瞻段 (默认 5.0m)，轻量高效杜绝跨层叠透
+

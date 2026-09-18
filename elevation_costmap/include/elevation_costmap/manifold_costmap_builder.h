@@ -54,6 +54,7 @@ struct ManifoldCostmapBuilderConfig
   double lookahead_distance{0.6};      ///< 全局路径前瞻采样距离 (m), 用于确定切向前进方向
   double height_tolerance{0.30};       ///< 贴地离面高度容差 (m)
   double dog_height{0.45};             ///< 净空高度阈值 (m)
+  double corridor_radius{3.0};         ///< 拓扑管道最大展开半宽 (m)，遇悬空/断崖/不可达自然停止
   std::string map_frame{"map"};        ///< 全局参考系
   std::string base_frame{"base_link"}; ///< 机器人机身参考系
   std::string output_frame{"local_manifold_frame"}; ///< 局部流形切空间参考系

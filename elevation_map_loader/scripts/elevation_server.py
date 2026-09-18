@@ -245,6 +245,7 @@ async def websocket_live(websocket: WebSocket):
     last_path_v = -1
     last_nodes_v = -1
     last_edges_v = -1
+    last_corridor_v = -1
     last_teb_obstacles_v = -1
     last_costmap_v = -1
     last_debug_v = -1
@@ -270,6 +271,13 @@ async def websocket_live(websocket: WebSocket):
                 frame["graph_edges"] = state["graph_edges"]
                 frame["graph_edges_version"] = state["graph_edges_version"]
                 last_edges_v = state["graph_edges_version"]
+
+            if state.get("corridor_nodes_version", 0) != last_corridor_v:
+                frame["corridor_nodes"] = state.get("corridor_nodes", [])
+                frame["corridor_lines"] = state.get("corridor_lines", [])
+                frame["corridor_walls"] = state.get("corridor_walls", [])
+                frame["corridor_nodes_version"] = state["corridor_nodes_version"]
+                last_corridor_v = state["corridor_nodes_version"]
 
             if state.get("teb_obstacles_version", 0) != last_teb_obstacles_v:
                 frame["teb_obstacles"] = state.get("teb_obstacles", [])

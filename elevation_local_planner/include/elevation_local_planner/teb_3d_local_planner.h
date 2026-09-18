@@ -17,6 +17,7 @@
 
 #include "elevation_local_planner/manifold_obstacles_3d.h"
 #include <elevation_planner_core/trajectory_validator.hpp>
+#include <elevation_planner_core/frenet_frame.hpp>
 
 #include <vector>
 #include <string>
@@ -28,11 +29,11 @@ namespace elevation_local_planner
 
 /**
  * @class Teb3DLocalPlanner
- * @brief 深度融合三维高程流形图的 TEB 局部轨迹规划器
+ * @brief 深度融合三维高程流形图与 Frenet 空间参数化的 TEB 局部轨迹规划器
  * 
- * 1. 原生复用 teb_local_planner 的时空弹性带 (Timed-Elastic-Band) 与 g2o 优化图
- * 2. 对接全套三维几何障碍物 (LineObstacle3D, CylinderObstacle3D, PolygonObstacle3D)，以空间真实三维距离计算势场
- * 3. 在多同伦探索阶段，使用 TrajectoryValidator 在流形图上查询连通性、步高极限与终点 Z，优选出真正合法的 3D 轨迹
+ * 1. 沿 3D A* 规划路径实时构建无投影失真的 Frenet (s, l) 坐标系，从根本上杜绝上下层重叠与空间多义性
+ * 2. 管道物理断面作为 Frenet 左右硬边界 LineObstacle，TEB 在管道内部自由避障优化，无需任何脆弱的 via-points
+ * 3. 通过真实 3D 弧长累积与切线微分几何，完美自适应大坡度攀爬、斜坡与直角/螺旋大转弯，输出带解析曲率前馈的运动指令
  */
 class Teb3DLocalPlanner : public nav_core::BaseLocalPlanner
 {
@@ -47,7 +48,8 @@ public:
 
 private:
   void customObstacleCB(const costmap_converter::ObstacleArrayMsg::ConstPtr& obst_msg);
-  void updateObstaclesFromMsg();
+  void populateFrenetObstacles(const elevation_planner::FrenetFrame& frenet_frame,
+                               double s_start, double s_end, double l_robot);
 
   bool pruneGlobalPlan(const geometry_msgs::PoseStamped& global_pose,
                        std::vector<geometry_msgs::PoseStamped>& global_plan,
@@ -59,9 +61,6 @@ private:
                            const std::string& global_frame,
                            double max_plan_length,
                            std::vector<geometry_msgs::PoseStamped>& transformed_plan);
-
-  void updateViaPointsSafe(const std::vector<geometry_msgs::PoseStamped>& transformed_plan,
-                          double min_separation);
 
 private:
   bool initialized_{false};
@@ -92,6 +91,11 @@ private:
   double max_step_height_{0.25};
   double plan_slice_horizon_{2.5};
   double dog_height_{0.45};
+  double corridor_radius_{2.5};
+
+  ros::Publisher corridor_pub_;
+  ros::Publisher corridor_boundary_pub_;
+  ros::Time last_corridor_pub_time_{0};
 };
 
 } // namespace elevation_local_planner

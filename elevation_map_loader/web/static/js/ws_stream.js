@@ -2,7 +2,7 @@
  * WebSocket 流式增量数据同步模块 (WebSocket Stream)
  * 完整保留原版：全双工通道、图层差量版本同步(unchanged 跳过)、状态主动分发与断线重连
  */
-export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, localCostmapVisualizer = null) {
+export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, corridorVisualizer = null) {
     let ws = null;
     let isConnecting = false;
     const clientLayerVersions = {};
@@ -79,24 +79,14 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             }
         }
 
-        // 3. 1:1 流形局部高程代价地图更新
-        if (frame.local_costmap && localCostmapVisualizer) {
-            localCostmapVisualizer.update(frame.local_costmap);
-        }
-
-        // 3.1 逐格成因码调试图层更新
-        if (frame.local_costmap_debug && localCostmapVisualizer) {
-            localCostmapVisualizer.updateDebug(frame.local_costmap_debug);
-        }
-
-        // 3.2 逐格胜出节点 id 调试图层更新
-        if (frame.local_costmap_debug_nodes && localCostmapVisualizer) {
-            localCostmapVisualizer.updateDebugNodes(frame.local_costmap_debug_nodes);
-        }
-
-        // 3.3 供给 TEB 的几何障碍物更新
-        if (frame.teb_obstacles !== undefined && localCostmapVisualizer) {
-            localCostmapVisualizer.updateTebObstacles(frame.teb_obstacles);
+        // 3. 3D 拓扑流形管道更新 (后端 C++ 实时计算局部前瞻管道与真 3D 边界)
+        if (corridorVisualizer) {
+            if (frame.corridor_nodes) {
+                corridorVisualizer.update(frame.corridor_nodes, frame.corridor_lines, frame.corridor_walls);
+            }
+            if (frame.teb_obstacles !== undefined) {
+                corridorVisualizer.updateTebObstacles(frame.teb_obstacles);
+            }
         }
 
         // 4. 增量图层更新
