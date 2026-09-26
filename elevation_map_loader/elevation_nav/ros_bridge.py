@@ -15,18 +15,13 @@ from typing import Dict, Any, Optional, List, Tuple
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovarianceStamped, Twist, TransformStamped
-from nav_msgs.msg import Path as ROSPath, Odometry, OccupancyGrid
+from nav_msgs.msg import Path as ROSPath, Odometry
 from actionlib_msgs.msg import GoalID
-from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString, Int32MultiArray
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout, String as RosString
 from grid_map_msgs.msg import GridMap, GridMapInfo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import MarkerArray
-try:
-    from costmap_converter.msg import ObstacleArrayMsg
-    HAS_COSTMAP_CONVERTER = True
-except ImportError:
-    HAS_COSTMAP_CONVERTER = False
 import numpy as np
 
 def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -73,23 +68,13 @@ class ElevationRosBridge:
         self.graph_edges_version = 0
         self.graph_adj: Dict[Tuple[float, float, float], List[Tuple[float, float, float]]] = {}
         self.current_graph_node: Optional[Tuple[float, float, float]] = None
-        # 局部代价地图缓存
-        self.local_costmap: Optional[Dict[str, Any]] = None
-        self.local_costmap_version = 0
-        # 局部代价地图逐格成因码 (调试图层)
-        self.local_costmap_debug: Optional[Dict[str, Any]] = None
-        self.local_costmap_debug_version = 0
-        # 局部代价地图逐格胜出节点 id (调试图层)
-        self.local_costmap_debug_nodes: Optional[Dict[str, Any]] = None
-        self.local_costmap_debug_nodes_version = 0
-        # 供给 TEB 局部规划器的结构化几何障碍物 (替代稠密 costmap)
-        self.teb_obstacles: List[Dict[str, Any]] = []
-        self.teb_obstacles_version = 0
         # 拓扑流形管道节点与状态
         self.corridor_nodes: List[List[float]] = []
         self.corridor_lines: List[List[float]] = []
-        self.corridor_walls: List[List[float]] = []
         self.corridor_nodes_version = 0
+        # 局部 SFC 走廊诊断数据 (各路径点与扩散节点群)
+        self.sfc_corridors_debug: List[Dict[str, Any]] = []
+        self.sfc_corridors_debug_version = 0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -134,6 +119,9 @@ class ElevationRosBridge:
             self._cancel_pub = rospy.Publisher(
                 "/move_base/cancel", GoalID, queue_size=1
             )
+            self._cmd_vel_pub = rospy.Publisher(
+                "/cmd_vel", Twist, queue_size=1
+            )
             self._pcd_cmd_pub = rospy.Publisher(
                 "/pcd_file_cmd", RosString, queue_size=1
             )
@@ -172,29 +160,18 @@ class ElevationRosBridge:
             rospy.Subscriber("/elevation_global_plan", ROSPath, self._global_path_callback, queue_size=2)
             rospy.Subscriber("/move_base/plan", ROSPath, self._global_path_callback, queue_size=2)
 
-            # 订阅局部规划路径 (多源兼容: TEB, AStarLocalPlanner 及原生 local_plan)
-            rospy.Subscriber("/move_base/TebLocalPlannerROS/local_plan", ROSPath, self._local_path_callback, queue_size=2)
+            # 订阅局部规划路径 (多源兼容: local_spline_plan, AStarLocalPlanner 及原生 local_plan)
+            rospy.Subscriber("/move_base/local_spline_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/move_base/AStarLocalPlanner/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/move_base/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/elevation_local_plan", ROSPath, self._local_path_callback, queue_size=2)
 
-            # 订阅局部代价地图 (1:1 流形局部高程代价地图与原生 local_costmap)
-            rospy.Subscriber("/elevation_local_costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
-            rospy.Subscriber("/move_base/local_costmap/costmap", OccupancyGrid, self._local_costmap_callback, queue_size=1)
-            # 逐格成因码调试图层 (Web 点击诊断 "看不见的障碍")
-            rospy.Subscriber("/elevation_local_costmap_debug", OccupancyGrid, self._local_costmap_debug_callback, queue_size=1)
-            # 逐格胜出节点 id 调试图层 ([w, h, id...], id=-1 表示无节点)
-            rospy.Subscriber("/elevation_local_costmap_debug_nodes", Int32MultiArray, self._local_costmap_debug_nodes_callback, queue_size=1)
-
-            # 订阅供给 TEB 局部规划器的结构化几何障碍物 (替代原 2D 稠密 costmap)
-            if HAS_COSTMAP_CONVERTER:
-                rospy.Subscriber("/move_base/TebLocalPlannerROS/obstacles", ObstacleArrayMsg, self._teb_obstacles_callback, queue_size=2)
-
-            # 订阅流形图节点与边可视化数据
+            # 订阅流形图节点与边可视化数据，以及全局/局部 3D 走廊
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
             rospy.Subscriber("/elevation_graph_edges", MarkerArray, self._graph_edges_callback, queue_size=1)
             rospy.Subscriber("/elevation_corridor_nodes", PointCloud2, self._corridor_nodes_callback, queue_size=1)
-            rospy.Subscriber("/elevation_corridor_boundaries", MarkerArray, self._corridor_boundaries_callback, queue_size=1)
+            rospy.Subscriber("/move_base/local_sfc_corridor", MarkerArray, self._corridor_boundaries_callback, queue_size=1)
+            rospy.Subscriber("/elevation_local_corridors_debug", RosString, self._sfc_corridors_debug_callback, queue_size=1)
             rospy.Subscriber("/elevation_debug_result", RosString, self._debug_result_callback, queue_size=5)
 
             self.is_initialized = True
@@ -202,21 +179,27 @@ class ElevationRosBridge:
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] ROS init exception: {e}")
 
+    def _sfc_corridors_debug_callback(self, msg: RosString):
+        """解析局部 SFC 凸多边形走廊调试数据 (包含各路径点坐标、node_id 及 8 邻域扩散节点群)"""
+        try:
+            data = json.loads(msg.data)
+            corridors = data.get("corridors", [])
+            with self._lock:
+                self.sfc_corridors_debug = corridors
+                self.sfc_corridors_debug_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 sfc_corridors_debug 异常: {e}")
+
     def _corridor_boundaries_callback(self, msg: MarkerArray):
-        """解析后端生成的真 3D 拓扑管道边界轮廓线与立体防护墙"""
+        """解析局部 SFC 凸走廊 3D 边界发光线框"""
         try:
             lines = []
-            walls = []
             for m in msg.markers:
-                if m.ns == "corridor_boundaries" and m.type == 5:  # LINE_LIST
+                if m.ns == "sfc_corridor_wireframe" and m.type == 5:  # LINE_LIST
                     for p in m.points:
                         lines.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
-                elif m.ns == "corridor_walls" and m.type == 11:  # TRIANGLE_LIST
-                    for p in m.points:
-                        walls.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
             with self._lock:
                 self.corridor_lines = lines
-                self.corridor_walls = walls
                 self.corridor_nodes_version += 1
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 corridor boundaries 异常: {e}")
@@ -308,26 +291,6 @@ class ElevationRosBridge:
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 graph edges 异常: {e}")
 
-    def _local_costmap_debug_nodes_callback(self, msg: Int32MultiArray):
-        """解析逐格胜出节点 id 调试图层
-        新格式 [width, height, 表条数T, id×(w*h), (id, x_mm, y_mm, z_mm, trav_x100)×T]
-        整包透传给前端 (含宽高), 前端按相同布局解析"""
-        try:
-            if len(msg.data) < 3:
-                return
-            w, h = int(msg.data[0]), int(msg.data[1])
-            packed = array('i', msg.data).tobytes()
-            b64_str = base64.b64encode(packed).decode('ascii')
-            with self._lock:
-                self.local_costmap_debug_nodes = {
-                    "width": w,
-                    "height": h,
-                    "data": b64_str
-                }
-                self.local_costmap_debug_nodes_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 costmap debug nodes 异常: {e}")
-
     def _odom_callback(self, msg: Odometry):
         pos = msg.pose.pose.position
         ori = msg.pose.pose.orientation
@@ -385,129 +348,6 @@ class ElevationRosBridge:
 
         with self._lock:
             self.local_path = pts
-
-    def _local_costmap_callback(self, msg: OccupancyGrid):
-        """解析 1:1 流形局部代价地图 (发布给 Web 前端渲染局部地毯)"""
-        try:
-            w = int(msg.info.width)
-            h = int(msg.info.height)
-            res = float(msg.info.resolution)
-            ox = float(msg.info.origin.position.x)
-            oy = float(msg.info.origin.position.y)
-            oz = float(msg.info.origin.position.z)
-
-            # 数据映射: 将 int8 数组转为无符号单字节 (255: 未知, 0: 自由, 1~99: 代价, 100: 致命障碍)
-            raw = bytearray(len(msg.data))
-            for i, val in enumerate(msg.data):
-                raw[i] = val if val >= 0 else 255
-            b64_str = base64.b64encode(raw).decode('ascii')
-
-            with self._lock:
-                self.local_costmap = {
-                    "width": w,
-                    "height": h,
-                    "resolution": round(res, 3),
-                    "origin": {
-                        "x": round(ox, 3),
-                        "y": round(oy, 3),
-                        "z": round(oz, 3)
-                    },
-                    "data": b64_str
-                }
-                self.local_costmap_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 local costmap 异常: {e}")
-
-    def _local_costmap_debug_callback(self, msg: OccupancyGrid):
-        """解析逐格成因码调试图层 (与地毯同几何, 每格 CellReason 0~7)"""
-        try:
-            w = int(msg.info.width)
-            h = int(msg.info.height)
-            raw = bytearray(len(msg.data))
-            for i, val in enumerate(msg.data):
-                raw[i] = val if val >= 0 else 255
-            b64_str = base64.b64encode(raw).decode('ascii')
-            with self._lock:
-                self.local_costmap_debug = {
-                    "width": w,
-                    "height": h,
-                    "resolution": round(float(msg.info.resolution), 3),
-                    "origin": {
-                        "x": round(float(msg.info.origin.position.x), 3),
-                        "y": round(float(msg.info.origin.position.y), 3),
-                        "z": round(float(msg.info.origin.position.z), 3)
-                    },
-                    "data": b64_str
-                }
-                self.local_costmap_debug_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 costmap debug 异常: {e}")
-
-    def _teb_obstacles_callback(self, msg: ObstacleArrayMsg):
-        """解析供给 TEB 的结构化几何障碍物 (替代稠密 costmap 像素点)"""
-        try:
-            obstacles_data = []
-            for idx, obs in enumerate(msg.obstacles):
-                pts = [[round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)] for p in obs.polygon.points]
-                radius = round(float(obs.radius), 3)
-                obs_id = int(obs.id) if obs.id > 0 else (idx + 1)
-
-                if radius > 0 and len(pts) >= 1:
-                    # 圆形障碍物 (柱体/聚类实体)
-                    obstacles_data.append({
-                        "id": obs_id,
-                        "type": "circle",
-                        "x": pts[0][0],
-                        "y": pts[0][1],
-                        "z": pts[0][2],
-                        "radius": radius,
-                        "source": "3D 空间正障碍聚类 (Physical Obstacle)",
-                        "reason": f"在机器狗垂直净空高度带内检测到激光点云实体（如立柱/障碍物），经欧氏聚类拟合为半径 {radius}m 的圆柱避障原语。",
-                        "teb_effect": "作为 CircularObstacle 激活 TEB 柯西积分同伦类规划 (HCP)，使机器狗能够从左侧或右侧探索多条拓扑等价路径并选出最优解。"
-                    })
-                elif radius == 0 and len(pts) == 2:
-                    # 线段障碍物 (楼梯断坎/无边界面边缘)
-                    dx = pts[1][0] - pts[0][0]
-                    dy = pts[1][1] - pts[0][1]
-                    length = round(math.hypot(dx, dy), 3)
-                    obstacles_data.append({
-                        "id": obs_id,
-                        "type": "line",
-                        "start": pts[0],
-                        "end": pts[1],
-                        "length": length,
-                        "source": "踏面断坎 / 悬空边缘 (Drop-off Boundary)",
-                        "reason": f"该线段外侧相邻网格无连通踏面（断坎或台阶高差跌落）。流形提取器沿台沿建立长 {length}m 的 3D 护栏，防止机体踏空跌落。",
-                        "teb_effect": "作为 LineObstacle 注入 TEB 优化图，利用解析线段投影距离施加斥力梯度惩罚，严格禁止局部轨迹穿越台沿边缘。"
-                    })
-                elif radius == 0 and len(pts) > 2:
-                    # 多边形障碍物 (大墙体凸包)
-                    obstacles_data.append({
-                        "id": obs_id,
-                        "type": "polygon",
-                        "points": pts,
-                        "source": "大型凸多边形墙体 (Convex Wall)",
-                        "reason": f"检测到由 {len(pts)} 个顶点围成的连续障碍实体，凸包算法拟合为刚性阻挡区域。",
-                        "teb_effect": "作为 PolygonObstacle 施加全足印多边形分离轴间距约束，引导机器狗在墙体外侧平滑绕行。"
-                    })
-                elif len(pts) == 1:
-                    obstacles_data.append({
-                        "id": obs_id,
-                        "type": "circle",
-                        "x": pts[0][0],
-                        "y": pts[0][1],
-                        "z": pts[0][2],
-                        "radius": radius if radius > 0 else 0.15,
-                        "source": "3D 空间单点障碍 (Point Obstacle)",
-                        "reason": "孤立小体积点云阻挡，拟合为紧凑圆形障碍物。",
-                        "teb_effect": "作为点/小圆避障体计算局部欧氏斥力势场。"
-                    })
-
-            with self._lock:
-                self.teb_obstacles = obstacles_data
-                self.teb_obstacles_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 teb obstacles 异常: {e}")
 
     # ------------------ 仿真运动学积分与 TF/Odom 高频广播 (移植自 jie_octomap) ------------------
     def _cmd_vel_callback(self, msg: Twist):
@@ -899,9 +739,12 @@ class ElevationRosBridge:
         self._goal_pub.publish(goal)
 
     def cancel_navigation(self):
-        """取消当前导航目标"""
+        """取消当前导航目标并刹停机器人 (保留当前前端场景与路径)"""
         if self._cancel_pub:
             self._cancel_pub.publish(GoalID())
+            rospy.loginfo("[ElevationRosBridge] Published GoalID() to /move_base/cancel")
+        if self._cmd_vel_pub:
+            self._cmd_vel_pub.publish(Twist())
 
     def publish_pcd_cmd(self, pcd_path: str):
         """向 C++ 节点发送 PCD 加载指令"""
@@ -955,18 +798,11 @@ class ElevationRosBridge:
                 "graph_nodes_version": self.graph_nodes_version,
                 "graph_edges": list(self.graph_edges),
                 "graph_edges_version": self.graph_edges_version,
-                "local_costmap": dict(self.local_costmap) if self.local_costmap else None,
-                "local_costmap_version": self.local_costmap_version,
-                "local_costmap_debug": dict(self.local_costmap_debug) if self.local_costmap_debug else None,
-                "local_costmap_debug_version": self.local_costmap_debug_version,
-                "local_costmap_debug_nodes": dict(self.local_costmap_debug_nodes) if self.local_costmap_debug_nodes else None,
-                "local_costmap_debug_nodes_version": self.local_costmap_debug_nodes_version,
-                "teb_obstacles": list(self.teb_obstacles) if self.teb_obstacles else [],
-                "teb_obstacles_version": self.teb_obstacles_version,
                 "corridor_nodes": list(self.corridor_nodes),
                 "corridor_lines": list(self.corridor_lines),
-                "corridor_walls": list(self.corridor_walls),
-                "corridor_nodes_version": self.corridor_nodes_version
+                "corridor_nodes_version": self.corridor_nodes_version,
+                "sfc_corridors_debug": list(self.sfc_corridors_debug),
+                "sfc_corridors_debug_version": self.sfc_corridors_debug_version
             }
 
 

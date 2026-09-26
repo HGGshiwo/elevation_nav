@@ -1,10 +1,13 @@
 #pragma once
 
 #include "elevation_planner_core/manifold_graph.hpp"
+#include "elevation_planner_core/manifold_search.hpp"
 #include "elevation_planner_core/layer_portal.hpp"
 #include "elevation_planner_core/cost_evaluator.hpp"
 #include "elevation_planner_core/planner_interface.hpp"
+#include "elevation_planner_core/path_simplifier.hpp"
 
+#include <nav_msgs/Path.h>
 #include <vector>
 #include <queue>
 #include <cstdint>
@@ -30,6 +33,15 @@ public:
   void setPortalManager(const elevation_planner::LayerPortalManager & portal_mgr);
   void setCostEvaluator(const elevation_planner::CostEvaluator & evaluator);
 
+  /**
+   * @brief SC-LOS 剪枝开关与最大段长 (2D, m); 需在 initialize 前调用
+   */
+  void setLosPruning(bool enabled, double max_segment)
+  {
+    los_prune_enabled_ = enabled;
+    los_max_segment_ = max_segment;
+  }
+
   bool plan(const geometry_msgs::PoseStamped & start,
             const geometry_msgs::PoseStamped & goal,
             nav_msgs::Path & out_path) override;
@@ -38,12 +50,21 @@ public:
 
   const elevation_planner::ManifoldGraph & getGraph() const { return graph_; }
 
+  /**
+   * @brief 最近一次 plan() 剪枝前的原始密集路径 (供 debug 话题发布)
+   */
+  const nav_msgs::Path & getLastDensePath() const { return last_dense_path_; }
+
 private:
   float computeHeuristic(uint32_t node_a, uint32_t node_b) const;
 
   elevation_planner::ManifoldGraph graph_;
   elevation_planner::LayerPortalManager portal_mgr_;
   elevation_planner::CostEvaluator cost_evaluator_;
+  elevation_planner::PathSimplifier los_simplifier_;
+  bool los_prune_enabled_{true};
+  double los_max_segment_{0.60};
+  nav_msgs::Path last_dense_path_;
   bool is_initialized_{false};
 };
 

@@ -179,6 +179,7 @@ def set_nav_goal(req: NavGoalRequest):
 
 
 @app.post("/api/nav/cancel_goal")
+@app.post("/api/cancel_goal")
 def cancel_nav_goal():
     """取消当前导航"""
     ros_bridge.cancel_navigation()
@@ -246,10 +247,7 @@ async def websocket_live(websocket: WebSocket):
     last_nodes_v = -1
     last_edges_v = -1
     last_corridor_v = -1
-    last_teb_obstacles_v = -1
-    last_costmap_v = -1
-    last_debug_v = -1
-    last_debug_nodes_v = -1
+    last_sfc_corridors_v = -1
     try:
         while True:
             state = ros_bridge.get_live_state()
@@ -275,26 +273,13 @@ async def websocket_live(websocket: WebSocket):
             if state.get("corridor_nodes_version", 0) != last_corridor_v:
                 frame["corridor_nodes"] = state.get("corridor_nodes", [])
                 frame["corridor_lines"] = state.get("corridor_lines", [])
-                frame["corridor_walls"] = state.get("corridor_walls", [])
                 frame["corridor_nodes_version"] = state["corridor_nodes_version"]
                 last_corridor_v = state["corridor_nodes_version"]
 
-            if state.get("teb_obstacles_version", 0) != last_teb_obstacles_v:
-                frame["teb_obstacles"] = state.get("teb_obstacles", [])
-                frame["teb_obstacles_version"] = state["teb_obstacles_version"]
-                last_teb_obstacles_v = state["teb_obstacles_version"]
-
-            if state.get("local_costmap_version", 0) != last_costmap_v and state.get("local_costmap"):
-                frame["local_costmap"] = state["local_costmap"]
-                last_costmap_v = state["local_costmap_version"]
-
-            if state.get("local_costmap_debug_version", 0) != last_debug_v and state.get("local_costmap_debug"):
-                frame["local_costmap_debug"] = state["local_costmap_debug"]
-                last_debug_v = state["local_costmap_debug_version"]
-
-            if state.get("local_costmap_debug_nodes_version", 0) != last_debug_nodes_v and state.get("local_costmap_debug_nodes"):
-                frame["local_costmap_debug_nodes"] = state["local_costmap_debug_nodes"]
-                last_debug_nodes_v = state["local_costmap_debug_nodes_version"]
+            if state.get("sfc_corridors_debug_version", 0) != last_sfc_corridors_v:
+                frame["sfc_corridors_debug"] = state.get("sfc_corridors_debug", [])
+                frame["sfc_corridors_debug_version"] = state.get("sfc_corridors_debug_version", 0)
+                last_sfc_corridors_v = state.get("sfc_corridors_debug_version", 0)
 
             await websocket.send_text(json.dumps(frame))
             await asyncio.sleep(0.1)  # 10Hz 稳定推送

@@ -467,7 +467,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     window.addEventListener('mouseup', () => { isPainting = false; });
 
     document.getElementById('btn-cancel-goal')?.addEventListener('click', () => {
-        fetch('/api/cancel_goal', { method: 'POST' }).catch(() => {});
+        fetch('/api/nav/cancel_goal', { method: 'POST' }).catch((e) => console.error("取消导航异常:", e));
     });
 
     document.getElementById('btn-clear-debug')?.addEventListener('click', () => {

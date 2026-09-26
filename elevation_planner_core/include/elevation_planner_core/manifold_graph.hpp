@@ -128,6 +128,17 @@ public:
   bool getNode(int layer, int r, int c, ManifoldNode & out_node) const;
   bool getNeighbors(const ManifoldNode & curr, std::vector<ManifoldNode> & neighbors) const;
 
+  /// @brief 判定两节点是否满足单步运动学相邻 (单步 8 邻域、步高与步长极限内)
+  bool isSingleStepNeighbor(const GraphNode & u, const GraphNode & v,
+                            double max_step_height = 0.25,
+                            double max_stride_length = 0.35) const;
+
+  /// @brief 获取给定节点在图上所有合法的单步相邻邻居节点 ID
+  void getSingleStepNeighbors(uint32_t node_id,
+                              std::vector<uint32_t> & out_neighbor_ids,
+                              double max_step_height = 0.25,
+                              double max_stride_length = 0.35) const;
+
 private:
   std::vector<GraphNode> nodes_;
   std::vector<GraphEdge> edges_;

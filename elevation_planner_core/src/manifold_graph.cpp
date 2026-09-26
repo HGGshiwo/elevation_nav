@@ -106,8 +106,8 @@ bool ManifoldGraph::findClosestNode(double x, double y, double z,
         double dz = std::abs(nd.z - z);
         if (dz > max_dist_z) continue;
 
-        // 优先距离近且可通行度好的踏面
-        double score = dxy + 2.0 * dz + nd.traversability * 2.0;
+        // 优先距离近且高度高度一致的踏面 (严禁跨楼层)
+        double score = dxy + 6.0 * dz + nd.traversability * 2.0;
         if (score < best_cost) {
           best_cost = score;
           out_node_id = nid;
@@ -159,7 +159,7 @@ bool ManifoldGraph::findStartNode(double x, double y, double z,
           double proj = (nd.x - x) * heading_x + (nd.y - y) * heading_y;
           if (proj < -0.05) continue; // 坚决剔除身后的倒退节点
 
-          double score = dxy + 1.0 * dz + nd.traversability * 2.0;
+          double score = dxy + 6.0 * dz + nd.traversability * 2.0;
           if (score < best_cost) {
             best_cost = score;
             out_node_id = nid;
@@ -315,6 +315,53 @@ bool ManifoldGraph::isConnected(uint32_t from_id, uint32_t to_id, int max_hops) 
     frontier = next_frontier;
   }
   return false;
+}
+
+bool ManifoldGraph::isSingleStepNeighbor(const GraphNode & u, const GraphNode & v,
+                                         double max_step_height,
+                                         double max_stride_length) const
+{
+  if (u.id == v.id) return false;
+
+  // 1. 严格 8 邻域栅格拓扑检查 (最多相邻 1 个栅格)
+  int dr = std::abs(u.row - v.row);
+  int dc = std::abs(u.col - v.col);
+  if (dr > 1 || dc > 1 || (dr == 0 && dc == 0)) return false;
+
+  // 2. 水平跨步步长检查
+  double dxy = std::hypot(static_cast<double>(u.x - v.x), static_cast<double>(u.y - v.y));
+  if (dxy > max_stride_length + 1e-4) return false;
+
+  // 3. 垂直单步高差检查
+  double dz = std::abs(static_cast<double>(u.z - v.z));
+  if (dz > max_step_height + 1e-4) return false;
+
+  // 4. 通行度与净空检查 (障碍阻挡与顶头禁行)
+  if (v.traversability >= 0.85f || v.headroom < 0.38f) return false;
+
+  return true;
+}
+
+void ManifoldGraph::getSingleStepNeighbors(uint32_t node_id,
+                                          std::vector<uint32_t> & out_neighbor_ids,
+                                          double max_step_height,
+                                          double max_stride_length) const
+{
+  out_neighbor_ids.clear();
+  if (node_id >= nodes_.size()) return;
+
+  const auto & u = nodes_[node_id];
+  uint16_t edge_count = 0;
+  const auto * edges = getEdges(node_id, edge_count);
+
+  for (uint16_t i = 0; i < edge_count; ++i) {
+    uint32_t nid = edges[i].target_id;
+    if (nid >= nodes_.size()) continue;
+    const auto & v = nodes_[nid];
+    if (isSingleStepNeighbor(u, v, max_step_height, max_stride_length)) {
+      out_neighbor_ids.push_back(nid);
+    }
+  }
 }
 
 } // namespace elevation_planner

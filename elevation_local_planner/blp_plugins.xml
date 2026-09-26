@@ -1,12 +1,7 @@
 <library path="lib/libelevation_local_planner_lib">
   <class name="elevation_local_planner/AStarLocalPlanner" type="elevation_local_planner::AStarLocalPlanner" base_class_type="nav_core::BaseLocalPlanner">
     <description>
-      Elevation manifold graph A* local planner and tracking controller for ROS 1 move_base.
-    </description>
-  </class>
-  <class name="elevation_local_planner/Teb3DLocalPlanner" type="elevation_local_planner::Teb3DLocalPlanner" base_class_type="nav_core::BaseLocalPlanner">
-    <description>
-      3D elevation manifold aware TEB local planner, evaluating physical step continuity and 3D geometric obstacles.
+      Kinematic A* and B-spline local trajectory planner and velocity controller for 3D elevation manifolds.
     </description>
   </class>
 </library>

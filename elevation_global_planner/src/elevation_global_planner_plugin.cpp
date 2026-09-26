@@ -98,6 +98,14 @@ public:
     max_step_height_ = cfg.max_step_height;
     dog_height_ = cfg.dog_height;
 
+    bool los_prune_enabled = true;
+    double los_max_segment = 0.60;
+    private_nh.param<bool>("los_prune_enabled", los_prune_enabled, true);
+    private_nh.param<double>("los_max_segment", los_max_segment, 0.60);
+    planner_.setLosPruning(los_prune_enabled, los_max_segment);
+    ROS_INFO("[ElevationGlobalPlanner] SC-LOS pruning: %s, max_segment=%.2fm",
+             los_prune_enabled ? "enabled" : "disabled", los_max_segment);
+
     double robot_length = 0.0, robot_width = 0.0, margin = 0.04;
     private_nh.param<double>("obstacle_safety_margin", margin, 0.04);
     if (private_nh.getParam("robot_width", robot_width) && robot_width > 0.0) {
@@ -112,6 +120,7 @@ public:
 
     ros::NodeHandle nh;
     path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan", 1, true);
+    dense_path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan_dense", 1, true);
     corridor_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_corridor_nodes", 1, true);
     corridor_boundary_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/elevation_global_corridor_boundaries", 1, true);
     nodes_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_graph_nodes", 1, true);
@@ -165,9 +174,10 @@ public:
       const size_t i1 = (i + 1 < plan.size()) ? i + 1 : i;
       const double dx = plan[i1].pose.position.x - plan[i0].pose.position.x;
       const double dy = plan[i1].pose.position.y - plan[i0].pose.position.y;
-      if (std::hypot(dx, dy) < 1e-4) continue; // 垂直段 (楼梯井跨层) 保持上一朝向
-      const double yaw = std::atan2(dy, dx);
-      plan[i].pose.orientation.x = 0.0;
+      double yaw = 0.0;
+      if (std::hypot(dx, dy) >= 1e-4) yaw = std::atan2(dy, dx);
+      // orientation.x 透传 node_id 给 move_base 局部规划器 (方案 B)
+      plan[i].pose.orientation.x = (i < raw_path.poses.size()) ? raw_path.poses[i].pose.orientation.x : 0.0;
       plan[i].pose.orientation.y = 0.0;
       plan[i].pose.orientation.z = std::sin(yaw * 0.5);
       plan[i].pose.orientation.w = std::cos(yaw * 0.5);
@@ -185,6 +195,13 @@ public:
     // latched 兼容发布: Web 端与旧消费者订阅 /elevation_global_plan
     smoothed_path.header.stamp = ros::Time::now();
     path_pub_.publish(smoothed_path);
+
+    // 剪枝前的原始密集 A* 路径 (调试对比用)
+    if (dense_path_pub_.getNumSubscribers() > 0) {
+      nav_msgs::Path dense = planner_.getLastDensePath();
+      dense.header.stamp = ros::Time::now();
+      dense_path_pub_.publish(dense);
+    }
 
     double plan_time = (ros::Time::now() - t0).toSec() * 1000.0;
     ROS_INFO("[ElevationGlobalPlanner] Global plan success: time = %.2f ms, points = %zu",
@@ -357,6 +374,7 @@ private:
   PathSmoother smoother_;
 
   ros::Publisher path_pub_;
+  ros::Publisher dense_path_pub_;
   ros::Publisher corridor_pub_;
   ros::Publisher corridor_boundary_pub_;
   ros::Publisher nodes_pub_;

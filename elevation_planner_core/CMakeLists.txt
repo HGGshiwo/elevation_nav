@@ -41,3 +41,8 @@ target_link_libraries(elevation_planner_core
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
 )
+
+if (CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_path_simplifier test/path_simplifier_test.cpp)
+  target_link_libraries(test_path_simplifier elevation_planner_core ${catkin_LIBRARIES})
+endif()

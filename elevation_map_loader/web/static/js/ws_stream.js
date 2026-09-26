@@ -2,7 +2,7 @@
  * WebSocket 流式增量数据同步模块 (WebSocket Stream)
  * 完整保留原版：全双工通道、图层差量版本同步(unchanged 跳过)、状态主动分发与断线重连
  */
-export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, corridorVisualizer = null) {
+export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, corridorVisualizer = null, sfcDebugVisualizer = null, onSfcDebugUpdated = null) {
     let ws = null;
     let isConnecting = false;
     const clientLayerVersions = {};
@@ -79,13 +79,20 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             }
         }
 
-        // 3. 3D 拓扑流形管道更新 (后端 C++ 实时计算局部前瞻管道与真 3D 边界)
+        // 3. 3D 拓扑流形管道更新 (后端 C++ 实时计算局部前瞻管道与真 3D 边界线框)
         if (corridorVisualizer) {
-            if (frame.corridor_nodes) {
-                corridorVisualizer.update(frame.corridor_nodes, frame.corridor_lines, frame.corridor_walls);
+            if (frame.corridor_nodes || frame.corridor_lines) {
+                corridorVisualizer.update(frame.corridor_nodes, frame.corridor_lines);
             }
-            if (frame.teb_obstacles !== undefined) {
-                corridorVisualizer.updateTebObstacles(frame.teb_obstacles);
+        }
+
+        // 3.1 局部可通行走廊单步扩散调试数据更新
+        if (frame.sfc_corridors_debug) {
+            if (sfcDebugVisualizer) {
+                sfcDebugVisualizer.updateData(frame.sfc_corridors_debug);
+            }
+            if (onSfcDebugUpdated) {
+                onSfcDebugUpdated(frame.sfc_corridors_debug);
             }
         }
 

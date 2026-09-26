@@ -575,52 +575,12 @@ public:
     line_marker.color.b = 1.0f;
     line_marker.color.a = 0.90f;
 
-    visualization_msgs::Marker wall_marker;
-    wall_marker.header.frame_id = frame_id;
-    wall_marker.header.stamp = now;
-    wall_marker.ns = "corridor_walls";
-    wall_marker.id = 1;
-    wall_marker.type = visualization_msgs::Marker::TRIANGLE_LIST;
-    wall_marker.action = visualization_msgs::Marker::ADD;
-    wall_marker.scale.x = 1.0;
-    wall_marker.scale.y = 1.0;
-    wall_marker.scale.z = 1.0;
-    wall_marker.color.r = 0.0f;
-    wall_marker.color.g = 0.80f;
-    wall_marker.color.b = 0.95f;
-    wall_marker.color.a = 0.25f;
-
-    const size_t N = waypoints_.size();
-    for (size_t i = 0; i + 1 < N; ++i)
-    {
-      const auto& p1 = waypoints_[i];
-      const auto& p2 = waypoints_[i + 1];
-
-      geometry_msgs::Point l1, r1, l2, r2;
-      geometry_msgs::Point l1_top, r1_top, l2_top, r2_top;
-
-      l1.x = p1.x + p1.left_width * p1.nx;
-      l1.y = p1.y + p1.left_width * p1.ny;
-      l1.z = p1.z;
-
-      r1.x = p1.x - p1.right_width * p1.nx;
-      r1.y = p1.y - p1.right_width * p1.ny;
-      r1.z = p1.z;
-
-      l2.x = p2.x + p2.left_width * p2.nx;
-      l2.y = p2.y + p2.left_width * p2.ny;
-      l2.z = p2.z;
-
-      r2.x = p2.x - p2.right_width * p2.nx;
-      r2.y = p2.y - p2.right_width * p2.ny;
-      r2.z = p2.z;
-
       l1_top = l1; l1_top.z += wall_height;
       r1_top = r1; r1_top.z += wall_height;
       l2_top = l2; l2_top.z += wall_height;
       r2_top = r2; r2_top.z += wall_height;
 
-      // 1. 边界线 (左底线, 右底线, 左顶轨, 右顶轨)
+      // 边界线 (左底线, 右底线, 左顶轨, 右顶轨)
       line_marker.points.push_back(l1); line_marker.points.push_back(l2);
       line_marker.points.push_back(r1); line_marker.points.push_back(r2);
       line_marker.points.push_back(l1_top); line_marker.points.push_back(l2_top);
@@ -633,22 +593,9 @@ public:
         line_marker.points.push_back(l1); line_marker.points.push_back(l1_top);
         line_marker.points.push_back(r1); line_marker.points.push_back(r1_top);
       }
-
-      // 2. 踏面缎带底面 (Ribbon Floor)
-      wall_marker.points.push_back(l1); wall_marker.points.push_back(r1); wall_marker.points.push_back(l2);
-      wall_marker.points.push_back(r1); wall_marker.points.push_back(r2); wall_marker.points.push_back(l2);
-
-      // 3. 左侧护栏侧壁
-      wall_marker.points.push_back(l1); wall_marker.points.push_back(l1_top); wall_marker.points.push_back(l2);
-      wall_marker.points.push_back(l1_top); wall_marker.points.push_back(l2_top); wall_marker.points.push_back(l2);
-
-      // 4. 右侧护栏侧壁
-      wall_marker.points.push_back(r1); wall_marker.points.push_back(r2); wall_marker.points.push_back(r1_top);
-      wall_marker.points.push_back(r2); wall_marker.points.push_back(r2_top); wall_marker.points.push_back(r1_top);
     }
 
     out_markers.markers.push_back(line_marker);
-    out_markers.markers.push_back(wall_marker);
   }
 
 private:

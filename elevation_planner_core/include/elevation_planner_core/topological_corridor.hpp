@@ -282,21 +282,6 @@ public:
     line_marker.color.b = 1.0f;
     line_marker.color.a = 0.85f;
 
-    visualization_msgs::Marker wall_marker;
-    wall_marker.header.frame_id = frame_id;
-    wall_marker.header.stamp = line_marker.header.stamp;
-    wall_marker.ns = "corridor_walls";
-    wall_marker.id = 1;
-    wall_marker.type = visualization_msgs::Marker::TRIANGLE_LIST;
-    wall_marker.action = visualization_msgs::Marker::ADD;
-    wall_marker.scale.x = 1.0;
-    wall_marker.scale.y = 1.0;
-    wall_marker.scale.z = 1.0;
-    wall_marker.color.r = 0.0f;
-    wall_marker.color.g = 0.7f;
-    wall_marker.color.b = 1.0f;
-    wall_marker.color.a = 0.18f;
-
     const double res = graph.getResolution();
     const double hres = res * 0.5;
     const float max_dz = static_cast<float>(max_step_height + 0.05);
@@ -353,7 +338,7 @@ public:
           p2_top = p2;
           p2_top.z += wall_height;
 
-          // 1. 边界线 (底线, 顶护栏线, 垂直立柱)
+          // 边界线 (底线, 顶护栏线, 垂直立柱)
           line_marker.points.push_back(p1);
           line_marker.points.push_back(p2);
 
@@ -362,21 +347,11 @@ public:
 
           line_marker.points.push_back(p1);
           line_marker.points.push_back(p1_top);
-
-          // 2. 防护墙 (两三角形)
-          wall_marker.points.push_back(p1);
-          wall_marker.points.push_back(p2);
-          wall_marker.points.push_back(p2_top);
-
-          wall_marker.points.push_back(p1);
-          wall_marker.points.push_back(p2_top);
-          wall_marker.points.push_back(p1_top);
         }
       }
     }
 
     out_markers.markers.push_back(line_marker);
-    out_markers.markers.push_back(wall_marker);
   }
 };
 
