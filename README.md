@@ -156,10 +156,10 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 | 模块 | 功能描述 |
 | :--- | :--- |
 | **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`，含柱表生成/逐柱融合/建边压平两段式管线)、进程级共享存储 (`GraphStore`)、跨层门户 (`LayerPortal`)、代价评估器 (`CostEvaluator`)、统一的 A\* 搜索实现 (`ManifoldSearch`)、路径直线连通性检查与航点合并工具 (`PathSimplifier`) |
-| **`elevation_map_loader`** | 点云加载、流形森林生成器 (`ManifoldForest`)、FastAPI 服务端与 Web 3D 可视化交互编辑器、仿真伪 TF 广播 |
+| **`elevation_sim`** | 仿真与可视化套件：FastAPI/Web 3D 前端、伪 TF 广播、PCD 先验地图提供节点 (`pcd_to_grid_map_node`)、障碍物注入器 (`obstacle_injector`)、bag 回放模式 |
 | **`elevation_global_planner`** | move_base 全局规划器插件 (`ElevationGlobalPlanner`)：离线 PCD 先验建图、跨层 A* (`ManifoldAStar`)、防割角平滑 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
 | **`elevation_local_planner`** | move_base 局部规划器插件 (`AStarLocalPlanner`)：基于 3D 流形拓扑图的局部 A* 动态避障寻优与前瞻平滑跟踪控制，速度指令生成 (`/cmd_vel`) |
-| **`elevation_costmap`** | move_base 局部代价地图插件 (`ManifoldCostmapLayer`)：基于纯几何 1:1 地毯算法的高频局部流形代价地图生成器，零拷贝共享全局先验，供局部规划与可视化消费 |
+| **`elevation_costmap`** | move_base 进程内融合宿主插件 (`ManifoldCostmapLayer`)：承载 `ManifoldFusionEngine` 以 10Hz 维护实时点云融合图并写入 GraphStore，供局部规划器零拷贝读图做动态避障 (地毯渲染链路已随 TEB 移除删除) |
 
 ---
 
@@ -236,10 +236,10 @@ flowchart TD
 
 ```bash
 # 1. 仿真模式
-roslaunch elevation_map_loader navigation.launch
+roslaunch elevation_sim navigation.launch
 
 # 2. 实机运行 (关闭伪 TF)
-roslaunch elevation_map_loader navigation.launch sim:=false
+roslaunch elevation_sim navigation.launch sim:=false
 ```
 
 - **设置起点 = 触发 TF 变换**：Web 端吸附踏面节点设置起点时，仿真模式下机器人位姿立即跳转该处（直接采用吸附节点的踏面高程，不在二次贴地探测中掉层）；实机模式下仅发布 `/initialpose`，不动 TF
@@ -282,7 +282,7 @@ roslaunch elevation_map_loader navigation.launch sim:=false
 - **伪 TF 贴地坠落修复**：贴地跟随的地形探测过滤禁行节点——楼梯下方净空不足的主层地面不再把站在楼梯上的狗"吸"下去。
 - **黄线跳层修复**：局部轨迹 z 投影增加分层带过滤（优先 |Δz| ≤ max_step_height 的同层航点），跨层路径在 2D 上重叠堆叠时不再吸附到其它楼层的航点高度。
 
-### 4. Web 调试工具与交互 (elevation_map_loader)
+### 4. Web 调试工具与交互 (elevation_sim)
 
 - **"调试代价地图"独立工具与面板**：点击地毯任意格子显示格子坐标、代价值、成因分类与说明、实际盖章节点（id/坐标/高度，含融合图降级显示）、最近踏面节点及距离；支持按成因染色（紫=无节点盖章、品红=拓扑缝、橙红=净空、红=侧向、黄=闭运算填充）、悬停实时高亮、一键复制诊断。
 - **纹理采样改为 NearestFilter**：移除格间双线性插值——插值产生的中间色不属于任何真实格子，掩盖格子级真相。
@@ -430,3 +430,133 @@ roslaunch elevation_map_loader navigation.launch sim:=false
 | `los_max_segment` | `0.60` | 合并后允许的最大航点间距 (m) |
 | `sfc_corridor_mode` | `segment` | 走廊生成方式：`segment` 按路径段生成；`point` 沿单个航点生成（旧行为，可回退） |
 | `sfc_seed_robot_state` | `true` | 是否把机器人当前位置与前瞻位置并入最前方的两个走廊 |
+
+
+---
+
+## 十、2026-09-27 更新：融合架构重构（属性原位刷新）、动态避障子图边界、障碍注入器与 bag 回放模式
+
+### 1. 目标到达判定 3D 化 (AStarLocalPlanner)
+
+- **进入终点对齐的门槛**由 2D 直线距离改为**剩余 3D 路程长度**（沿当前路径弧长，在跟踪锚点附近做 3D 投影消除航点合并的量化误差）：楼梯高程与绕行形状计入，跨层投影重合不再误判"到达"；
+- **最终到达判定增加 z 轴分轴容差**（`goal_z_tolerance`，默认 0.15m）：x/y 与 z 分开判据，不把定位 z 噪声揉进平面半径；终点接近降速同样改用剩余 3D 弧长（上楼梯提前减速）；
+- 到达日志输出实际 xy/dz/yaw 偏差，替换原"3D precision"字样。
+
+### 2. 融合架构重构：属性原位刷新 (ManifoldFusionEngine)
+
+废除"每帧重建 ROI 独立融合图"的方案，改为**全局流形图上的属性原位刷新**：
+
+- 融合引擎对 ROI 内、且处于机器人当前层带内的全局图节点，用"先验柱面 ⊕ 观测柱面"重算 traversability/headroom 并**原位写回**；
+- **节点集合与 id 永不改变**——全局规划透传给局部的 node_id（orientation.x）重新有效，之前因 id 空间错位导致的"局部规划静默失败/卡死"从根上消除；
+- **快照/恢复语义**：首次改写记录 {先验 traversability, headroom}；障碍离开观测范围（含空帧）自动恢复先验；换图（全局重建设）快照作废；
+- **永不解锁不变量**：动态障碍只会让通行性变差（`eff_trav = max(先验, 动态)`、`eff_head = min(先验, 动态)`），从数学上杜绝"不可行走节点被重算成可走"（bag 实测曾出现 44 个静态禁行节点被错误解锁、导致伪 TF 走上天花板）；
+- **层带过滤**：只刷新机器人当前层带（裁剪高度带 ±0.3m）内的节点，跨层节点一律不碰；落出层带/ROI 的已改写节点按无状态语义恢复。
+
+### 3. 动态避障 A* 子图边界与全链路动态感知
+
+- 统一 A\* 内核新增 `max_xy_radius`（扩展空间半径，距起点 6.0m）与 `max_expansions`（弹出节点预算 5000）两个**硬边界**：阻挡时不再可能对 19 万节点全图穷举（bag 实测曾出现单次绕障 828ms、200 次 control-loop miss），超限按"局部子图内无解"返回并沿用原路径；
+- 全链路感知动态阻挡：A\* 邻居扩展、`getSingleStepNeighbors`（走廊 BFS/局部绕障）、`isPathBlocked`（`findClosestNode` 新增 `include_blocked` 参数，含阻挡节点的通行性评分惩罚在 include_blocked 模式下取消）均以当前 traversability 为准。
+
+### 4. PCD 加载管线统一 (pcd_map_io)
+
+全局规划器与 Web 展示节点各自复制的 `CropBoxConfig` + 解析 + 裁剪代码合并为 core 的 `loadAndCropPcd(path, yaml)` 单一入口，裁剪口径与日志只维护一份。
+
+### 5. elevation_costmap 瘦身：融合宿主化
+
+- 删除 TEB 遗留：`ManifoldObstacleExtractor`、障碍物数组发布、`costmap_converter` 依赖、`TrajectoryValidator`（孤儿头文件）；
+- 删除 1:1 地毯渲染链路（builder/测试/三个话题）：其规划侧消费者随 TEB 移除已不存在，回收工作线程约一半算力；
+- `ManifoldCostmapLayer` 保留插件身份作为**融合宿主**（GraphStore 进程级单例要求融合写入者与局部规划器同进程），代价网格更新为空实现。
+
+### 6. 包改名：elevation_map_loader → elevation_sim
+
+原包专注仿真与可视化：FastAPI/Web 前端、伪 TF、PCD 预览、`pcd_to_grid_map_node`、障碍注入器。Python 模块 `elevation_nav` 同步更名 `elevation_sim`（消除与元包同名混淆），全部 36 处引用迁移，并正式声明对 `elevation_planner_core` 的依赖。
+
+### 7. 障碍物注入器 (obstacle_injector)
+
+按参数化规则在全局路径上生成障碍物表面点云，驱动「融合 → 图上封锁 → 阻挡检测 → Kinematic A\* 绕障」全链路测试：
+
+- **等距多实例放置**：`interval`（沿路径弧长每 N 米一个）+ `start_offset` + `end_margin`（距终点不放），替代旧的 s_ratio 比例语义；
+- **目标冻结锚点**：设置导航目标后按当时计划**一次成型**并冻结世界坐标，重规划/机器人推进不移动障碍；新目标到来才按新路径重新布置（订阅 `/move_base/current_goal`）；
+- **踏面高程吸附**：锚点 z 吸附到 latched 全局图节点的真实踏面高程，障碍不会插进楼层之间；
+- **采样规格对齐融合判据**：面间距 0.04m（体素降采样后每柱 ≥2 点、SOR 安全）、底离地 0.02m（顶头封锁）、高 ≥0.45m（侧向膨胀成墙）；
+- 四种运动规则：`static_on_path` / `crossing` / `oncoming`（逐实例抵近消失+冷却重现）/ `blink`（同步周期出现消失）；
+- 无激活障碍时发布空点云帧：融合图按无状态语义自动清除封锁。
+
+### 8. bag 回放模式 (navigation.launch `bag:=true`)
+
+- 不启动 `move_base`（无规划、bag 中的 goal 无接收者）与障碍注入器，伪 TF 强制关闭；
+- 机器人位姿/规划/障碍/动态节点全部来自 rosbag 回放（建议 `rosbag play --latch` 加话题过滤，避开 `/grid_map` 交叠）；
+- 无需 `use_sim_time`：桥接与 Web 均按消息到达时序处理。
+
+### 9. Web 可视化
+
+- **注入障碍真值**：红/橙半透明方块与圆柱（`/elevation_injected_obstacles`），与封锁节点空间重合，"注入即所见"；
+- **动态封锁点实时渲染**：融合引擎被改写节点以踏面同尺寸（0.092m）方块实时显示——封锁红（与静态禁行同色）、软代价橙，障碍离开自动消失；
+- 清理死图层：局部/融合 Octomap 开关（旧项目移植残留，后端从未供数）；
+- 新增话题：`/elevation_dynamic_nodes`（PointCloud2, x/y/z/intensity=traversability）。
+
+### 10. 新增/变更参数
+
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `goal_z_tolerance` | `0.15` | 到达判定的 z 轴容差 (m)，与踏面高程同基准 |
+| `max_xy_radius` / `max_expansions` | `6.0` / `5000` | 局部绕障 A\* 子图硬边界（半径 m / 弹出预算） |
+| `interval` / `start_offset` / `end_margin` | `3.0` / `1.5` / `1.0` | 注入器沿路径等距布置参数 (m) |
+| `anchor_mode` | 已移除 | 障碍锚点固定为"目标冻结"语义，不再提供跟随计划模式 |
+
+
+---
+
+## 十一、2026-09-28 更新：伪 TF 安全体系、走廊凸性保证、rebound 定向排斥与冻结调试模式
+
+### 1. 伪 TF 贴地安全体系 (elevation_sim/ros_bridge.py)
+
+- **落脚点预检 (平移闸)**：运动积分前预检前方位置——`body_hard_radius` (0.17m) 范围内的本层踏面节点**必须全部可通行** (静态禁行与融合动态封锁均否决) 才允许平移，杜绝骑缝穿越障碍与越过禁行补丁边界向内渗透 (0.35m 宽口径实测可深入禁行区卡死)；被拦时原地锁止并 1Hz 报"落脚点缺失"
+- **锚定收紧**：流形锚点仅允许局部邻域 (±0.6m) 锚定，**删除全图最近节点兜底** (禁行/天花板/异层节点从根上进不了锚点)；z 容差收紧至 `2×max_step_height`、z 权重 ×16；锚点自身禁行 (历史脏锚点) 自动重锚定；锚定失败原地保持 + 1Hz 报错——宁可卡住，绝不吸附到天花板或其它楼层
+- **z 变化门控**：贴地目标高度单步 `|Δz| ≥ max_step_height` 拒绝并保持当前高度 (楼梯上下行正常放行)
+
+### 2. 动态封锁链路修复
+
+- **桥接回调合并**：`_dynamic_nodes_callback` 曾被重复定义 (后者静默覆盖前者)，`dynamic_nodes` (Web 红点渲染源) 永远为空——合并为单次遍历同时更新前端列表与 `dynamic_trav` 查询覆盖层
+- **z 键失配修复**：`/elevation_dynamic_nodes` 发布端曾带 +0.03 可视化偏移，导致覆盖层 `(x,y,z)` 键与查询端真实节点 z 永不匹配——**动态封锁在贴地/锚定/择优全部消费点静默失效**。现发布真实节点高程，渲染抬升由前端自理
+
+### 3. SFC 走廊凸性保证 (elevation_local_planner/sfc_corridor.hpp)
+
+- **覆盖性检验**：对每段 BFS 扩散节点团取中心点凸包，扫描凸包内本层带 (|dz| ≤ max_step_height) 被禁行节点占据的格——**凸包吞障碍** (非凸地皮) 即判非凸；贴凸包边界的空洞簇按斜边伪影过滤，内部真孔洞 ≥3 格才拆分
+- **段级递归切分**：非凸时取孔洞质心向 LOS 支撑链的投影节点 M，把链切成 `[首..M]` 与 `[M..尾]` 两个子链各自递归 BFS——**相邻子走廊共享真实切分节点 M** (两端点必为 BFS 种子、必在凸包内)，拼接约束 `C_i ∩ C_{i+1} ∋ M` 恒可行，杜绝"优化器约束不可行 → 24 轮拒解" (深度 ≤3、片数 ≤4 封顶)
+- **逐面受限膨胀 (per-face capped offset)**：每条边外推 `min(r, 该方向最近禁行格余量) − margin`——凸性由半空间交集性质保证、无障碍由逐面封顶的数学性质保证，**无需任何事后复检**；顶点由相邻半平面求交重建
+- **航点重采样**：多片时航点 = 各子链末端真实 A\* 节点 (可通行性天然成立)，`corridors == waypoints` 1:1 由构造保证，优化器零改动
+
+### 4. rebound 定向排斥 (EGO 式碰撞事件驱动, 零 A\* 调用)
+
+- `ScanBsplineOptimizer` 外循环每轮 L-BFGS 前逐控制点查占据 (body_hard_radius 内本层禁行节点)，碰撞者装上 `(base_point, direction)` 定向弹簧——从触发碰撞的禁行节点径向弹到 clearance 之外；分段 C2 惩罚 (近距三次 / 深穿透二次+线性延拓)，梯度方向 = 排斥方向
+- 与走廊 ALM 双保险：rebound 处理"贴太近"，走廊 ALM 锁"不越界"；图外/悬空不装弹簧交走廊兜底
+- 可视化：RViz / Web (`/elevation_rebound_debug` → ws 帧 `rebound_arrows`)，红 = 受压中 / 绿 = 已弹开，箭头出现即说明拟牛顿识别到了障碍
+- 参数：`rebound_weight` (默认 100)、`rebound_clearance` (默认 0.17 = body_hard_radius)
+
+### 5. 侧向软膨胀带加宽
+
+- `GraphBuildConfig` 新增 `inflation_radius` (默认 0.50m)：软代价衰减带从 `(body_hard_radius, footprint_radius)` = 0.09m 加宽到 `(body_hard_radius, inflation_radius)` = 0.41m——原 0.26m 外障碍零代价梯度导致 A\* 全程"感知不到"障碍距离而贴墙；`footprint_radius` 回归本职 (侧向障碍垂直结构扫描窗口)
+- 建图与融合引擎同口径修改，软代价上限仍 0.7 (不触发前端 0.8 红色阈值)
+
+### 6. 冻结调试模式 (`freeze:=true`)
+
+```bash
+roslaunch elevation_sim navigation.launch freeze:=true
+```
+
+- **狗不响应 cmd_vel**：桥接层 `cmd_vel_freeze` 丢弃一切来源的速度指令 (伪 TF 仍 100Hz 发布, 下游正常工作)
+- **按需规划**：设置终点 (move_base setPlan) 或 Web 摆放/移除障碍后自动重规划一轮；其余时间控制器廉价空转 (恒返回成功 + 零速, 不进 recovery/abort)
+- **Web 编辑器障碍**：栅格编辑栏新增"添加障碍物"工具——点踏面放/移除圆柱 (r0.25 × h0.5, 与注入器同规格)，桥接 2Hz 采样点云发 `/lidar_points` 供融合引擎封锁流形图，渲染与注入障碍同款红圆柱；变更后 0.15s 延迟重发 last_goal 触发全局+局部完整重规划
+- **约束**：障碍须在机体周边 `crop_radius_xy` (3.5m) 融合 ROI 内才生效 (toggle 响应自带距离判定)；freeze 下脚本化障碍注入器自动禁用
+- 图层栏移除"通行代价(渐变)""局部地图(流形地毯)"
+
+### 7. 规划分段性能打点
+
+- `[Perf][local] total/band/detour/los/sfc/alm/drape` (RAII, 任意出口自动打印；>80ms 无条件 WARN) 与 `[Perf][global] astar/smooth/total`
+- 实测: 局部全管线 1.5~9.7ms (detour 4.4ms 上限、sfc 3.7ms、alm 1.3ms)，全局 0.5~1.5ms——计算非瓶颈，规划延迟来自融合摄取节拍的人为等待
+
+### 8. Web 前端
+
+- `dynamic_nodes_visualizer` 方块放平修复 (Y-up 项目的 `rotateX(-π/2)` 写法残留, Z-up 场景下方块立起)
+- 新增 `rebound_visualizer` (排斥向量红/绿) 与"添加障碍物"工具；删除重复订阅

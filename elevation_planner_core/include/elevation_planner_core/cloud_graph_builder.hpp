@@ -7,6 +7,8 @@
 #include <pcl/point_types.h>
 #include <memory>
 #include <string>
+#include <vector>
+#include <functional>
 
 namespace elevation_planner
 {
@@ -83,8 +85,10 @@ struct GraphBuildConfig
   double sor_std_mul{1.5};          ///< SOR 标准差倍数阈值 (越大越保守, 极大值等效关闭)
 
   // ---- 机体碰撞建模 (足印膨胀 + 建边扫掠) ----
-  double footprint_radius{0.30};    ///< 机体足印外接半径 (m): 软代价膨胀边界
+  double footprint_radius{0.30};    ///< 机体足印外接半径 (m): 侧向障碍硬/软判据的垂直结构扫描窗口
   double body_hard_radius{0.15};    ///< 机体硬阻挡半径 (m): 约半身宽+安全余量, 侧向障碍进入此范围则节点不可通行
+  double inflation_radius{0.50};    ///< 侧向软代价膨胀半径 (m): 硬半径外到此距离线性衰减软代价;
+                                    ///< 原取 footprint_radius 时膨胀带仅 0.09m 宽, 0.26m 外障碍零代价梯度致 A*/优化贴墙
   double sweep_penalty_weight{1.0}; ///< 建边时机体扫掠区软代价权重
 };
 
@@ -117,6 +121,31 @@ public:
   static void toPointCloudMsg(const ManifoldGraph & graph,
                               const std::string & frame_id,
                               sensor_msgs::PointCloud2 & out_cloud);
+
+  /// @brief 合并两根柱的曲面列表 (与 fuseColumnTables 的逐格并集同规则:
+  ///        同一物理面合并几何取观测, 其余按 z 升序归并)。用于融合引擎的
+  ///        单节点属性重算——观测列与先验列在共用格位上就地合并。
+  static std::vector<ColumnSurface> mergeColumnSurfaces(
+      const std::vector<ColumnSurface> & observed,
+      const std::vector<ColumnSurface> & prior,
+      double same_surface_tol);
+
+  /// @brief 单节点通行性重算 (与 buildGraphFromColumnTable 的净空+侧向膨胀完全同口径)。
+  ///        融合引擎对 ROI 内的全局图节点逐个调用, 依据"先验+观测"合并后的柱面
+  ///        环境刷新 traversability/headroom, 实现动态障碍的原位属性更新。
+  /// @param tread_z 节点踏面高程 (z_top)
+  /// @param self_surfaces 节点所在柱的合并曲面 (z 升序)
+  /// @param fetch_surfaces(dr, dc) 取 (r+dr, c+dc) 邻格合并曲面; 越界/无数据返回 nullptr
+  /// @param out_headroom 输出重算后的上方净空
+  /// @param lateral_hard 输出是否被侧向结构硬阻挡
+  /// @return 重算后的 traversability (0.0 可通行 ~ 1.0 致命)
+  static float computeNodeTraversability(
+      float tread_z,
+      const std::vector<ColumnSurface> & self_surfaces,
+      const std::function<const std::vector<ColumnSurface> * (int dr, int dc)> & fetch_surfaces,
+      const GraphBuildConfig & config,
+      float & out_headroom,
+      bool & lateral_hard);
 
   /// @brief 将图中的拓扑边导出为 RViz MarkerArray (用于三维连通性可视化)
   /// @note max_edges 须大于无向边总数, 否则地图后半段 (按栅格行序) 的边会被截断,

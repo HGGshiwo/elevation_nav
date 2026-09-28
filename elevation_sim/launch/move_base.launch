@@ -1,0 +1,42 @@
+<launch>
+    <!-- move_base 节点: 全局 = 流形图 A* 插件; 局部 = Kinematic A* + 三次 B 样条局部规划器 (AStarLocalPlanner) -->
+    <arg name="pcd_file" default=""/>
+    <arg name="map_config_file" default=""/>
+    <arg name="map_frame" default="map"/>
+    <arg name="base_frame" default="base_link"/>
+    <arg name="point_cloud_topic" default="/lidar_points"/>
+    <arg name="planning_freeze" default="false"/>
+
+    <!-- move_base 导航容器 (ManifoldCostmapLayer 作为内部插件运行，零拷贝共享 GraphStore) -->
+    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+        <rosparam file="$(find elevation_sim)/config/move_base/costmap_common_params.yaml" command="load" ns="global_costmap" />
+        <rosparam file="$(find elevation_sim)/config/move_base/costmap_common_params.yaml" command="load" ns="local_costmap" />
+        <rosparam file="$(find elevation_sim)/config/move_base/global_costmap_params.yaml" command="load" />
+        <rosparam file="$(find elevation_sim)/config/move_base/local_costmap_params.yaml" command="load" />
+        <rosparam file="$(find elevation_sim)/config/move_base/move_base_params.yaml" command="load" />
+
+        <param name="base_global_planner" value="elevation_global_planner/ElevationGlobalPlanner"/>
+        <param name="base_local_planner"  value="elevation_local_planner/AStarLocalPlanner"/>
+
+        <!-- 明确指定 frame ids -->
+        <param name="global_costmap/global_frame"     value="$(arg map_frame)"/>
+        <param name="global_costmap/robot_base_frame" value="$(arg base_frame)"/>
+        <param name="local_costmap/global_frame"      value="$(arg map_frame)"/>
+        <param name="local_costmap/robot_base_frame"  value="$(arg base_frame)"/>
+
+        <!-- 局部流形图层插件配置: 注入点云话题与建图参数 -->
+        <param name="local_costmap/elevation_manifold_layer/cloud_topic" value="$(arg point_cloud_topic)"/>
+        <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load" ns="local_costmap/elevation_manifold_layer"/>
+
+        <!-- 全局插件配置: 离线 PCD 先验建图 (建图产物写入同进程 GraphStore 供局部图层零拷贝访问) -->
+        <param name="ElevationGlobalPlanner/map_frame" value="$(arg map_frame)"/>
+        <param name="ElevationGlobalPlanner/pcd_file"  value="$(arg pcd_file)"/>
+        <param name="ElevationGlobalPlanner/map_config_file" value="$(arg map_config_file)"/>
+        <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load" ns="ElevationGlobalPlanner"/>
+
+        <!-- 局部插件配置: AStarLocalPlanner 专用参数 -->
+        <rosparam file="$(find elevation_sim)/config/move_base/astar_local_planner_params.yaml" command="load" ns="AStarLocalPlanner"/>
+        <param name="AStarLocalPlanner/planning_freeze" value="$(arg planning_freeze)"/>
+        <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load" ns="AStarLocalPlanner"/>
+    </node>
+</launch>

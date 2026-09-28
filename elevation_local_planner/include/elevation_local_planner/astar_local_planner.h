@@ -9,10 +9,13 @@
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Path.h>
 #include <std_msgs/String.h>
+#include <std_msgs/Empty.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <vector>
 #include <string>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <Eigen/Core>
 
 #include <elevation_planner_core/manifold_graph.hpp>
@@ -43,6 +46,10 @@ public:
   virtual void initialize(std::string name, tf2_ros::Buffer* tf, costmap_2d::Costmap2DROS* costmap_ros) override;
   virtual bool setPlan(const std::vector<geometry_msgs::PoseStamped>& plan) override;
   virtual bool computeVelocityCommands(geometry_msgs::Twist& cmd_vel) override;
+
+  /// 冻结模式的实际规划体 (wrapper 按需调用; 冻结时输出零速、恒返回 true)
+  bool computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_vel);
+
   virtual bool isGoalReached() override;
 
 private:
@@ -51,6 +58,7 @@ private:
   bool lookupRobotPose3D(double & x, double & y, double & z);
   bool transformToBase(const geometry_msgs::PoseStamped & pose_in, geometry_msgs::PoseStamped & pose_out);
   bool computeFinalYawErrorXY(const geometry_msgs::PoseStamped & final_pose_in, double & yaw_error);
+  double remainingPlanLength3D(const RobotPose2D & robot_pose) const;
 
   // 局部路径截取与图内运动学主动重搜
   std::vector<geometry_msgs::PoseStamped> extractLocalBand(const RobotPose2D & robot_pose, double horizon_dist);
@@ -88,8 +96,15 @@ private:
   double los_max_segment_{0.60};           ///< 剪枝最大段长 (m, 2D)
   std::string sfc_corridor_mode_{"segment"};  ///< 走廊模式: segment=段式(沿线发散) / point=点式(旧行为)
   bool sfc_seed_robot_state_{true};           ///< 起始两条段走廊并入机器人位姿/锚点种子 (转角交集覆盖动力学锚点)
+  double rebound_weight_{100.0};              ///< 样条优化 rebound 定向排斥权重 (0 = 关闭)
+  double rebound_clearance_{0.17};            ///< rebound 安全间距 (= body_hard_radius, 与代价地图同口径)
+
+  // ---- 冻结调试模式 (freeze:=true): 狗不动、不自动重规划, 摆障碍/设终点时按需规划一轮 ----
+  bool planning_freeze_{false};               ///< 冻结总开关
+  std::atomic<bool> plan_once_pending_{false};///< 单次规划请求 (setPlan/摆障碍直接触发/手动话题置位)
 
   double goal_pos_tol_{0.08};
+  double goal_z_tol_{0.15};   ///< 到达判定的 z 轴容差 (m), 与踏面高程同基准 (base_link 贴地)
   double goal_yaw_tol_{0.10};
   double linear_gain_{1.2};
   double lateral_gain_{0.4};
@@ -115,6 +130,7 @@ private:
   ros::Publisher local_corridor_pub_;
   ros::Publisher local_corridor_debug_pub_;
   ros::Publisher local_se_debug_pub_;      ///< 起终点高亮 + 样条线违例着色 (调试)
+  ros::Publisher rebound_debug_pub_;       ///< rebound 定向排斥向量可视化 (障碍面 → 控制点箭头)
 
   /**
    * @brief [DBG] 起终点高亮 + 线级约束检查 MarkerArray

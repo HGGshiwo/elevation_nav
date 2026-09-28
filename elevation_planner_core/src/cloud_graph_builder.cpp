@@ -261,6 +261,85 @@ ColumnTable fuseColumnTables(const ColumnTable & prior,
   return fused;
 }
 
+std::vector<ColumnSurface> CloudGraphBuilder::mergeColumnSurfaces(
+    const std::vector<ColumnSurface> & observed,
+    const std::vector<ColumnSurface> & prior,
+    double same_surface_tol)
+{
+  std::vector<ColumnSurface> merged;
+  merged.reserve(observed.size() + prior.size());
+  size_t i = 0, j = 0;
+  while (i < observed.size() || j < prior.size()) {
+    if (j >= prior.size()) { merged.push_back(observed[i++]); continue; }
+    if (i >= observed.size()) { merged.push_back(prior[j++]); continue; }
+    const ColumnSurface & a = observed[i];
+    const ColumnSurface & b = prior[j];
+    if (std::abs(static_cast<double>(a.z_top) - static_cast<double>(b.z_top)) <= same_surface_tol) {
+      ColumnSurface m = a;                   // 同一物理面: 几何取观测 (反映当前状态)
+      m.count = std::max(a.count, b.count);  // 一次稀疏观测不推翻先验支撑面
+      merged.push_back(m);
+      ++i; ++j;
+    } else if (b.z_top < a.z_top) {
+      merged.push_back(b); ++j;              // 仅先验: 保留
+    } else {
+      merged.push_back(a); ++i;              // 仅观测: 新增
+    }
+  }
+  return merged;
+}
+
+float CloudGraphBuilder::computeNodeTraversability(
+    float tread_z,
+    const std::vector<ColumnSurface> & self_surfaces,
+    const std::function<const std::vector<ColumnSurface> * (int dr, int dc)> & fetch_surfaces,
+    const GraphBuildConfig & config,
+    float & out_headroom,
+    bool & lateral_hard)
+{
+  lateral_hard = false;
+
+  // ---- 净空: 本踏面上方第一个有效面层的底板 (与 buildGraphFromColumnTable 同口径) ----
+  // 自身面以 z_top <= tread_z + tol/2 排除; 单柱内相邻面层间距 > cluster_height_diff,
+  // 因此合并后仍严格高于该阈值的面层必在本踏面之上
+  out_headroom = 3.0f; // 默认室外无上顶
+  for (const auto & S : self_surfaces) {
+    if (S.count < config.min_cluster_points) continue;
+    if (static_cast<double>(S.z_top) <= static_cast<double>(tread_z) + 0.5 * config.cluster_height_diff) continue;
+    out_headroom = S.z_bottom - tread_z;
+    break;
+  }
+  if (out_headroom < config.dog_height) {
+    return 1.0f; // 顶头禁行: 与建图一致, 不再叠加侧向膨胀
+  }
+
+  // ---- 侧向膨胀: inflation_radius 内垂直范围跨越攀爬包络的结构 (公式与建图逐行一致) ----
+  const int rad = std::max(1, static_cast<int>(std::ceil(config.inflation_radius / config.resolution)));
+  const float soft_band = std::max(1e-3f, static_cast<float>(config.inflation_radius - config.body_hard_radius));
+  float worst = 0.0f;
+  for (int dr = -rad; dr <= rad; ++dr) {
+    for (int dc = -rad; dc <= rad; ++dc) {
+      // double 计算: 与建图同理由, 硬半径边界格不因 float 舍入漏成软代价
+      const double d = std::hypot(dr, dc) * config.resolution;
+      if (d > config.inflation_radius) continue;
+      const auto * surfaces = fetch_surfaces(dr, dc);
+      if (!surfaces) continue;
+      for (const auto & S : *surfaces) {
+        if (S.count < config.min_cluster_points) continue;
+        // 攀爬包络判据: 结构底面贴近本层踏面、顶面超过 tread_z + k*max_step_height
+        // (k 为格距) 才判墙, 楼梯本体可逐级攀爬不误判 —— 与建图口径一致
+        const int k = std::max(std::abs(dr), std::abs(dc));
+        const float top_limit = tread_z + static_cast<float>(k * config.max_step_height);
+        if (!(S.z_bottom < tread_z + config.max_step_height &&
+              S.z_top > top_limit)) continue;
+        if (d <= config.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
+        float soft = 0.7f * (config.inflation_radius - d) / soft_band;          // 距离衰减软代价
+        worst = std::max(worst, soft);
+      }
+    }
+  }
+  return worst;
+}
+
 bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, ManifoldGraph & out_graph)
 {
   const GridExtent & ext = table.extent;
@@ -275,13 +354,13 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
   out_graph.initSpatialGrid(res, min_x, min_y, rows, cols); // 内部 clear, 支持重复建图
   const auto & cell_surfaces = table.cells;
 
-  // 机体足印侧向碰撞膨胀: 扫描足印半径内 "垂直范围跨越踏步极限" 的结构 (墙体/台沿,
+  // 机体侧向碰撞膨胀: 扫描 inflation_radius 内 "垂直范围跨越踏步极限" 的结构 (墙体/台沿,
   // 即从本层踏面高度附近向上生长、高到迈不上去的竖直结构), 硬半径内硬阻挡, 外围软代价
   auto inflatedTraversability = [&](int r, int c, float tread_z, bool & lateral_hard) -> float {
-    const int rad = std::max(1, static_cast<int>(std::ceil(config_.footprint_radius / res)));
+    const int rad = std::max(1, static_cast<int>(std::ceil(config_.inflation_radius / res)));
     float worst = 0.0f;
     lateral_hard = false;
-    const float soft_band = std::max(1e-3f, static_cast<float>(config_.footprint_radius - config_.body_hard_radius));
+    const float soft_band = std::max(1e-3f, static_cast<float>(config_.inflation_radius - config_.body_hard_radius));
     for (int dr = -rad; dr <= rad; ++dr) {
       int nr = r + dr;
       if (nr < 0 || nr >= rows) continue;
@@ -290,7 +369,7 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
         if (nc < 0 || nc >= cols) continue;
         // double 计算: float 乘法会让 "整 2 格 = 0.2m" 恰好落在硬半径边界时因舍入差 3e-9 漏成软代价
         const double d = std::hypot(dr, dc) * res;
-        if (d > config_.footprint_radius) continue;
+        if (d > config_.inflation_radius) continue;
 
         for (const auto & S : cell_surfaces[static_cast<size_t>(nr * cols + nc)]) {
           if (S.count < config_.min_cluster_points) continue;
@@ -311,7 +390,7 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
                 S.z_top > top_limit)) continue;
 
           if (d <= config_.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
-          float soft = 0.7f * (config_.footprint_radius - d) / soft_band; // 距离衰减软代价 (上限0.7, 低于前端0.8禁行显示阈值)
+          float soft = 0.7f * (config_.inflation_radius - d) / soft_band; // 距离衰减软代价 (上限0.7, 低于前端0.8禁行显示阈值)
           worst = std::max(worst, soft);
         }
       }

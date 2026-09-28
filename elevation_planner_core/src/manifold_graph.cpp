@@ -75,7 +75,8 @@ void ManifoldGraph::finalizeCSR()
 bool ManifoldGraph::findClosestNode(double x, double y, double z,
                                     uint32_t & out_node_id,
                                     double max_dist_xy,
-                                    double max_dist_z) const
+                                    double max_dist_z,
+                                    bool include_blocked) const
 {
   if (nodes_.empty() || rows_ <= 0 || cols_ <= 0) return false;
 
@@ -100,14 +101,15 @@ bool ManifoldGraph::findClosestNode(double x, double y, double z,
       const auto & cell_nodes = spatial_grid_[static_cast<size_t>(r * cols_ + c)];
       for (uint32_t nid : cell_nodes) {
         const auto & nd = nodes_[nid];
-        if (nd.traversability >= 0.95f) continue; // 忽略不可通行障碍
+        if (!include_blocked && nd.traversability >= 0.95f) continue; // 默认忽略不可通行障碍
         double dxy = std::hypot(nd.x - x, nd.y - y);
         if (dxy > max_dist_xy) continue;
         double dz = std::abs(nd.z - z);
         if (dz > max_dist_z) continue;
 
         // 优先距离近且高度高度一致的踏面 (严禁跨楼层)
-        double score = dxy + 6.0 * dz + nd.traversability * 2.0;
+        // include_blocked 模式下不加通行性惩罚: 调用方明确要求感知被封锁的最近节点
+        double score = dxy + 6.0 * dz + (include_blocked ? 0.0 : nd.traversability * 2.0);
         if (score < best_cost) {
           best_cost = score;
           out_node_id = nid;
@@ -358,6 +360,9 @@ void ManifoldGraph::getSingleStepNeighbors(uint32_t node_id,
     uint32_t nid = edges[i].target_id;
     if (nid >= nodes_.size()) continue;
     const auto & v = nodes_[nid];
+    // 禁行节点不作为单步邻域返回 (先验阻挡在建图期无边, 天然不出现;
+    // 融合引擎属性原位刷新后的动态阻挡靠此过滤, 供走廊 BFS / 局部绕障消费)
+    if (v.traversability >= 0.95f) continue;
     if (isSingleStepNeighbor(u, v, max_step_height, max_stride_length)) {
       out_neighbor_ids.push_back(nid);
     }

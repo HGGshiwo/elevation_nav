@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Elevation Nav 总装: move_base 插件化导航 + Web 3D 交互 -->
+    <!-- sim=true: Web 端 RosBridge 广播伪 TF (积分 /cmd_vel), 起点设置即触发 TF 变换;
+         sim=false: 实机自带 map->odom->base_link 定位 TF, 伪 TF 不启用 -->
+    <!-- bag=true: bag 回放模式, 不启动 move_base (无规划/无 goal 触发点)、不启动障碍注入器、
+         伪 TF 强制关闭; 机器人位姿/规划/障碍/动态节点全部来自 rosbag 回放,
+         配合 rosbag play 的 latch 参数 (建议话题过滤避开 /grid_map 与 /rosout) 使用 -->
+    <arg name="sim" default="true"/>
+    <arg name="bag" default="false"/>
+    <arg name="sim_init_x" default="0.0"/>
+    <arg name="sim_init_y" default="0.0"/>
+    <arg name="sim_init_z" default="0.0"/>
+    <arg name="sim_init_yaw" default="0.0"/>
+    <arg name="sim_noise_linear" default="0.008"/>
+    <arg name="sim_noise_lateral" default="0.008"/>
+    <arg name="sim_noise_angular" default="0.006"/>
+
+    <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/pcd/map.pcd"/>
+    <arg name="config_file" default="$(find elevation_sim)/config/parameters.yaml"/>
+    <arg name="map_config_file" default="$(find elevation_sim)/config/map_crop_config.yaml"/>
+    <arg name="resolution" default="0.10"/>
+    <arg name="web_port" default="8080"/>
+    <arg name="point_cloud_topic" default="/lidar_points"/>
+    <arg name="obstacle_injector" default="true"/>
+    <!-- freeze=true: 冻结调试模式 —— 狗不响应 cmd_vel、不自动重规划;
+         设置终点/摆放障碍(footprint变化)时自动规划一轮, 也可手动 rostopic pub /elevation_plan_once -->
+    <arg name="freeze" default="false"/>
+
+    <!-- 1. 地图与流形生成节点 (Web 端 GridMap 展示数据源) -->
+    <node pkg="elevation_sim" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+        <param name="config_file" value="$(arg config_file)"/>
+        <param name="map_config_file" value="$(arg map_config_file)"/>
+        <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
+        <param name="grid_map_topic" value="/grid_map"/>
+        <param name="frame_id" value="map"/>
+        <param name="resolution" value="$(arg resolution)"/>
+        <param name="max_step_height" value="0.25"/>
+        <param name="max_slope_deg" value="30.0"/>
+        <param name="max_stride_length" value="0.35"/>
+        <param name="dog_height" value="0.50"/>
+    </node>
+
+    <!-- 2. move_base: 全局流形 A* 插件 + 局部 Kinematic A* + B 样条规划器 (bag 模式不启动) -->
+    <include if="$(eval not arg('bag'))" file="$(find elevation_sim)/launch/move_base.launch">
+        <arg name="pcd_file" value="$(arg pcd_file)"/>
+        <arg name="map_config_file" value="$(arg map_config_file)"/>
+        <arg name="point_cloud_topic" value="$(arg point_cloud_topic)"/>
+        <arg name="planning_freeze" value="$(arg freeze)"/>
+    </include>
+
+    <!-- 3. Web 服务端与三维可视化 (FastAPI + Three.js); sim 时广播伪 TF, bag 模式强制关闭 -->
+    <node pkg="elevation_sim" type="elevation_server.py" name="elevation_web_server" output="screen">
+        <param name="web_port" value="$(arg web_port)"/>
+        <param name="publish_fake_tf" value="$(eval False if arg('bag') else arg('sim'))"/>
+        <param name="cmd_vel_freeze" value="$(arg freeze)"/>
+        <param name="tf_child_frame" value="base_link"/>
+        <param name="init_x" value="$(arg sim_init_x)"/>
+        <param name="init_y" value="$(arg sim_init_y)"/>
+        <param name="init_z" value="$(arg sim_init_z)"/>
+        <param name="init_yaw" value="$(arg sim_init_yaw)"/>
+        <param name="linear_noise_std" value="$(arg sim_noise_linear)"/>
+        <param name="lateral_noise_std" value="$(arg sim_noise_lateral)"/>
+        <param name="angular_noise_std" value="$(arg sim_noise_angular)"/>
+    </node>
+
+    <!-- 4. 障碍物注入器 (仅仿真且非 bag 模式): 按规则在全局路径上生成障碍物表面点云, 驱动融合避障测试;
+            实机 (sim=false) 不启动, 避免伪造障碍进入真实感知; bag 模式不启动 (bag 里有录制的障碍数据) -->
+    <!-- freeze 模式: 障碍全部由 Web 手动摆放, 禁用脚本化自动注入 -->
+    <group if="$(eval arg('obstacle_injector') and arg('sim') and not arg('bag') and not arg('freeze'))">
+        <node pkg="elevation_sim" type="obstacle_injector.py" name="obstacle_injector" output="screen">
+            <rosparam file="$(find elevation_sim)/config/obstacle_injector.yaml" command="load"/>
+        </node>
+    </group>
+</launch>

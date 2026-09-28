@@ -1,0 +1,40 @@
+# AStarLocalPlanner 局部规划与平滑控制参数
+# 基于 3D 流形图运动学 A* 搜索与三次 B 样条解析速度前馈
+
+# 坐标系与前瞻避障参数
+map_frame: map
+local_horizon_distance: 2.50       # 截取全局路径的最大前向视距 (m)
+obstacle_check_distance: 1.50      # 前向路径障碍检测探测距离 (m)
+max_step_height: 0.25              # 单步踏步垂直高度极限/立体防穿层容差 (m)
+collision_footprint_radius: 0.10   # 机身核心紧贴硬防碰检测半径 (m)
+
+# 运动学 A* 与平滑参数
+weight_turn: 1.50                  # 三点转角平滑惩罚权重 (抑制急转弯, 诱导大圆弧)
+max_lateral_acc: 0.80              # 弯道最大向心加速度 (m/s^2, 用于曲率自适应降速)
+
+# 样条优化 rebound 定向排斥 (EGO 式碰撞事件驱动, 零 A* 调用)
+rebound_weight: 100.0              # 排斥项权重 (0 = 关闭); 与平滑/贴合项同量级平衡
+rebound_clearance: 0.17            # 安全间距 (m) = body_hard_radius, 碰撞控制点被弹到离障碍面之外
+
+# 目标容差与反馈增益
+goal_position_tolerance: 0.08
+goal_z_tolerance: 0.15             # 到达判定的 z 轴容差 (m), 与踏面高程同基准; 设大可退化为近似 2D 判定
+goal_yaw_tolerance: 0.10
+linear_gain: 1.20
+lateral_gain: 0.40
+heading_gain: 1.20
+final_yaw_gain: 0.60
+enable_lateral_motion: true
+align_final_yaw: true
+
+# 速度与加速度动力学限幅
+max_linear_speed: 0.60
+max_lateral_speed: 0.30
+max_angular_speed: 1.00
+max_linear_acc: 0.80
+max_lateral_acc: 0.50
+max_angular_acc: 1.50
+enable_lateral_decoupling: true
+linear_deadband: 0.02
+lateral_deadband: 0.02
+angular_deadband: 0.02

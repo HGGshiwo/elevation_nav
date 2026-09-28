@@ -83,10 +83,13 @@ public:
   void finalizeCSR();
 
   /// @brief 极速 O(1) 查找给定三维位置附近最近的可行踏面节点
+  /// @brief 查询最近节点 (默认跳过禁行节点, 用于起终点吸附;
+  ///        include_blocked=true 时返回真正的最近节点, 供阻挡检测/路径锚定感知动态障碍)
   bool findClosestNode(double x, double y, double z,
                        uint32_t & out_node_id,
                        double max_dist_xy = 0.5,
-                       double max_dist_z = 0.6) const;
+                       double max_dist_z = 0.6,
+                       bool include_blocked = false) const;
 
   /// @brief 结合车头朝向约束查找起点踏面节点 (严格防止向身后倒退吸附)
   bool findStartNode(double x, double y, double z,
@@ -97,6 +100,9 @@ public:
 
   /// @brief 访问节点与邻居边 (零开销)
   inline const GraphNode & getNode(uint32_t id) const { return nodes_[id]; }
+  /// 融合引擎专用: 原位刷新节点属性 (traversability/headroom)。
+  /// 仅允许改属性, 节点集合/id/边结构不可动 (全局-局部 id 透传的前提)。
+  inline GraphNode & nodeMutable(uint32_t id) { return nodes_[id]; }
   inline const GraphEdge * getEdges(uint32_t id, uint16_t & count) const
   {
     count = nodes_[id].edge_count;

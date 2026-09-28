@@ -1,5 +1,44 @@
 #include "elevation_local_planner/astar_local_planner.h"
 #include <pluginlib/class_list_macros.h>
+#include <chrono>
+#include <string>
+#include <vector>
+
+namespace
+{
+// 规划分段耗时打点: RAII, 函数任意出口 (含提前 return false) 都会自动打印阶段表
+struct PerfTrace
+{
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point t0_;
+  Clock::time_point t_mark_;
+  std::vector<std::pair<std::string, double>> marks_;
+  std::string name_;
+
+  explicit PerfTrace(std::string name) : t0_(Clock::now()), t_mark_(t0_), name_(std::move(name)) {}
+  void mark(const std::string & stage)
+  {
+    auto now = Clock::now();
+    marks_.emplace_back(stage, std::chrono::duration<double, std::milli>(now - t_mark_).count());
+    t_mark_ = now;
+  }
+  ~PerfTrace()
+  {
+    double total = std::chrono::duration<double, std::milli>(Clock::now() - t0_).count();
+    std::ostringstream oss;
+    oss << "[Perf][" << name_ << "] total=" << total << "ms";
+    for (auto & m : marks_) oss << " " << m.first << "=" << m.second << "ms";
+    // 慢规划 (>80ms) 无条件打印, 快的节流 5s 防刷屏
+    if (total > 80.0)
+      ROS_WARN("%s", oss.str().c_str());
+    else
+      ROS_INFO_THROTTLE(5.0, "%s", oss.str().c_str());
+  }
+};
+} // namespace
+#include <std_msgs/Empty.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <angles/angles.h>
@@ -52,6 +91,7 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
 
   // ---- 控制与容差参数 ----
   private_nh.param<double>("goal_position_tolerance", goal_pos_tol_, 0.08);
+  private_nh.param<double>("goal_z_tolerance",        goal_z_tol_,  0.15);
   private_nh.param<double>("goal_yaw_tolerance",      goal_yaw_tol_, 0.10);
   private_nh.param<double>("linear_gain",             linear_gain_,  1.20);
   private_nh.param<double>("lateral_gain",            lateral_gain_, 0.40);
@@ -59,6 +99,11 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
   private_nh.param<double>("final_yaw_gain",          final_yaw_gain_, 0.60);
   private_nh.param<bool>  ("enable_lateral_motion",    enable_lateral_motion_, true);
   private_nh.param<bool>  ("align_final_yaw",         align_final_yaw_, true);
+  private_nh.param<double>("rebound_weight",          rebound_weight_, 100.0);
+  private_nh.param<double>("rebound_clearance",       rebound_clearance_, 0.17);
+  private_nh.param<bool>  ("planning_freeze",         planning_freeze_, false);
+  if (planning_freeze_)
+    ROS_WARN("[AStarLocalPlanner] FREEZE mode: robot will not move; planning on goal/obstacle-change (goal republish)");
 
   // 配置运动学 A* 搜索器参数
   KinematicAStarConfig k_cfg;
@@ -89,6 +134,7 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
   local_corridor_pub_    = nh.advertise<visualization_msgs::MarkerArray>("/move_base/local_sfc_corridor", 1);
   local_corridor_debug_pub_ = nh.advertise<std_msgs::String>("/elevation_local_corridors_debug", 1);
   local_se_debug_pub_       = nh.advertise<visualization_msgs::MarkerArray>("/move_base/local_se_debug", 1);
+  rebound_debug_pub_        = nh.advertise<visualization_msgs::MarkerArray>("/elevation_rebound_debug", 1);
 
   initialized_ = true;
   ROS_INFO("[AStarLocalPlanner] Initialized with Kinematic A* + Uniform Cubic B-Spline Velocity Engine (horizon: %.2fm, turn_w: %.2f)",
@@ -98,6 +144,9 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
 bool AStarLocalPlanner::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan)
 {
   if (!initialized_) return false;
+
+  // 冻结模式: 新全局计划 (设置终点) 到达 → 自动规划一轮局部管线
+  if (planning_freeze_) plan_once_pending_ = true;
 
   velocity_smoother_.reset();
   last_control_time_ = ros::Time(0);
@@ -152,6 +201,23 @@ bool AStarLocalPlanner::setPlan(const std::vector<geometry_msgs::PoseStamped>& p
 
 bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
 {
+  if (planning_freeze_)
+  {
+    // 消费单次规划请求; 无请求时廉价空转 (跳过走廊/优化/绕障检测)
+    if (!plan_once_pending_.exchange(false))
+    {
+      cmd_vel = geometry_msgs::Twist();
+      return true;   // 恒成功, 避免 move_base 进入 recovery/abort
+    }
+    const bool ok = computeVelocityCommandsImpl(cmd_vel);
+    cmd_vel = geometry_msgs::Twist();   // 只看轨迹不动狗 (伪 TF 侧另有 cmd_vel_freeze 双保险)
+    return true;
+  }
+  return computeVelocityCommandsImpl(cmd_vel);
+}
+
+bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_vel)
+{
   if (!initialized_) return false;
 
   if (global_plan_.empty())
@@ -174,12 +240,11 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
     return false;
   }
 
-  // 1. 获取全局共享的最新流形图 (同进程零拷贝)
-  auto graph = elevation_planner::GraphStore::instance().getFusedGraph();
-  if (!graph || graph->numNodes() == 0)
-  {
-    graph = elevation_planner::GraphStore::instance().getGlobalGraph();
-  }
+  // 1. 获取全局共享流形图 (同进程零拷贝)。
+  //    融合引擎对这份图原位刷新节点属性 (动态障碍 traversability/headroom),
+  //    节点集合与 id 永不改变 —— 全局规划透传的 node_id (orientation.x) 在此有效。
+  PerfTrace perf("local");
+  auto graph = elevation_planner::GraphStore::instance().getGlobalGraph();
 
   ros::Time now = ros::Time::now();
   double dt = 0.05;
@@ -216,13 +281,16 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
     }
 
     const bool pos_ok = std::hypot(final_pose_base.pose.position.x, final_pose_base.pose.position.y) < goal_pos_tol_;
+    const bool z_ok = std::abs(final_pose_base.pose.position.z) < goal_z_tol_;
     const bool yaw_ok = !align_final_yaw_ || std::abs(final_yaw_error) < goal_yaw_tol_;
-    if (pos_ok && yaw_ok)
+    if (pos_ok && z_ok && yaw_ok)
     {
       goal_reached_ = true;
       velocity_smoother_.reset();
       cmd_vel = geometry_msgs::Twist();
-      ROS_INFO("[AStarLocalPlanner] Goal successfully reached with 3D precision.");
+      ROS_INFO("[AStarLocalPlanner] Goal successfully reached (xy: %.3fm, dz: %.3fm, yaw: %.3frad).",
+               std::hypot(final_pose_base.pose.position.x, final_pose_base.pose.position.y),
+               final_pose_base.pose.position.z, final_yaw_error);
       return true;
     }
 
@@ -233,20 +301,56 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
 
   // 3. 截取前方局部切片 (2.5m 视距，严格单调向前推进，彻底防止发夹弯跳点)
   std::vector<geometry_msgs::PoseStamped> local_band = extractLocalBand(robot_pose, local_horizon_distance_);
+  perf.mark("band");
   if (local_band.empty())
   {
     cmd_vel = geometry_msgs::Twist();
     return false;
   }
 
-  // 4. 【提取局部拓扑 node_id 序列 (方案 B 全链路透传，零查图开销)】
+  // 4. 提取局部拓扑 node_id 序列
+  //    全局先验图上, 路径 pose 的 orientation.x 透传全局图 node_id (方案 B 零查图透传);
+  //    实时融合图逐帧重建, 节点 id 与全局图完全不同源 —— 把全局 id 当融合图索引用,
+  //    轻则全部越界过滤 (路径节点序列清空 → 走廊/优化静默跳过), 重则错指到无关节点。
+  //    故仅当当前图即全局先验图时信任透传 id, 否则按坐标在当前图上重新锚定。
   std::vector<uint32_t> path_node_ids;
-  for (const auto& ps : local_band)
+  if (graph && graph->numNodes() > 0)
   {
-    uint32_t nid = static_cast<uint32_t>(std::round(ps.pose.orientation.x));
-    if (graph && nid < graph->numNodes())
+    const auto & global_graph = elevation_planner::GraphStore::instance().getGlobalGraph();
+    const bool ids_from_same_graph = (graph.get() == global_graph.get());
+    size_t dropped = 0;
+    for (const auto& ps : local_band)
     {
-      path_node_ids.push_back(nid);
+      if (ids_from_same_graph)
+      {
+        uint32_t nid = static_cast<uint32_t>(std::round(ps.pose.orientation.x));
+        if (nid < graph->numNodes())
+        {
+          path_node_ids.push_back(nid);
+        }
+        else
+        {
+          ++dropped;
+        }
+      }
+      else
+      {
+        uint32_t nid = 0;
+        // include_blocked=true: 路径锚定要感知动态障碍封锁的节点 ( id 与图同源后按坐标映射)
+        if (graph->findClosestNode(ps.pose.position.x, ps.pose.position.y, ps.pose.position.z, nid, 0.4, 0.6, true))
+        {
+          path_node_ids.push_back(nid);
+        }
+        else
+        {
+          ++dropped;
+        }
+      }
+    }
+    if (dropped > 0)
+    {
+      ROS_WARN_THROTTLE(2.0, "[AStarLocalPlanner] %zu/%zu path waypoints not anchored on active graph (%s).",
+                        dropped, local_band.size(), ids_from_same_graph ? "global-prior" : "fused");
     }
   }
 
@@ -286,6 +390,7 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
 
   // 4.2 SC-LOS 带内剪枝: 与全局规划共用同一支撑链直线连通检测器,
   //     合并直线可通行的节点段 (楼梯区 z 链断裂自动保留密集点, 安全兜底)
+  perf.mark("detour");
   if (los_prune_enabled_ && graph && path_node_ids.size() > 2)
   {
     if (simplifier_graph_ != graph.get() || band_simplifier_.boundNodeCount() != graph->numNodes())
@@ -302,6 +407,7 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
     }
   }
 
+  perf.mark("los");
   // 5. 纯通过 A* 的 node_id 序列直接提取 2D 坐标 (零坐标查图)
   std::vector<Eigen::Vector2d> waypoints_2d;
   waypoints_2d.reserve(path_node_ids.size());
@@ -366,11 +472,20 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
       {
         state_points = {robot_start_2d, anchor_2d};
       }
+      // 凸性保证走廊: 非凸节点团拆分为凸子片, waypoints 按航线穿入点重采样 ——
+      // waypoints_2d 必须同步替换为重采样序列, 保持 corridors==waypoints 1:1 硬约束
+      std::vector<Eigen::Vector2d> resampled_waypoints;
       corridors_2d = SFCGenerator::generateSegmentCorridors(path_node_ids, *graph, band_simplifier_,
                                                             0.50, max_step_height_, max_stride_length_,
-                                                            state_points, robot_pose.z);
+                                                            state_points, robot_pose.z, &resampled_waypoints);
+      // 对齐校验: 数量不匹配 (拆分后数量变动但采样失败等异常) 时退回原航点序列
+      if (resampled_waypoints.size() == corridors_2d.size() && !resampled_waypoints.empty())
+      {
+        waypoints_2d = resampled_waypoints;
+      }
       // 转角交集拼接: 转角控制点 q_{i+1} ∈ C_i ∩ C_{i+1}, 凸性锁死控制折线不穿墙
       SFCGenerator::stackAdjacentCorridors(corridors_2d);
+      perf.mark("sfc");
     }
     else
     {
@@ -394,14 +509,125 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
 
     // 6.3 1:1 物理点 ALM 内外循环优化求解 (Jerk 极小化 + 线性凸约束穿墙三次重罚 + 外循环拉格朗日乘子更新)
     scan_optimizer_.setParams(1.0, 1000.0, 2.0, 1.0, cruise_speed, 1.5);
+    scan_optimizer_.setReboundParams(rebound_weight_, rebound_clearance_);
+
+    // rebound 占据查询回调: 与伪 TF 落脚点预检同语义 —— 控制点 body_hard_radius 内
+    // 存在本层 (|dz| <= max_step_height) 禁行节点即碰撞, 输出最近禁行节点作排斥参考点;
+    // 融合引擎对全局图原位刷新 traversability, 动态障碍天然生效; 图外/悬空返回 false
+    // (不装弹簧, 交走廊 ALM 项兜底)。零 A* 调用: 排斥方向取径向, 绕行侧已由
+    // 上游阻挡检测绕障与 SFC 走廊拓扑确定
+    auto* graph_ptr = graph.get();
+    const double occ_band = max_step_height_;
+    const double occ_radius2 = rebound_clearance_ * rebound_clearance_;
+    scan_optimizer_.setOccupancyCallback(
+        [graph_ptr, occ_band, occ_radius2](double x, double y, double z,
+                                           Eigen::Vector2d* obstacle_pt) -> bool {
+          int r = 0, c = 0;
+          if (!graph_ptr->toGridIndex(x, y, r, c)) return false;  // 图外: 不装弹簧
+          double best_d2 = occ_radius2;
+          bool hit = false;
+          for (int dr = -3; dr <= 3; ++dr)
+          {
+            for (int dc = -3; dc <= 3; ++dc)
+            {
+              for (uint32_t nid : graph_ptr->getSpatialCellNodes(r + dr, c + dc))
+              {
+                const auto& nd = graph_ptr->getNode(nid);
+                if (std::fabs(nd.z - z) > occ_band) continue;      // 异层节点不参与
+                if (nd.traversability < 0.95f) continue;           // 只关心禁行节点
+                const double dx = nd.x - x, dy = nd.y - y;
+                const double d2 = dx * dx + dy * dy;
+                if (d2 <= best_d2)
+                {
+                  best_d2 = d2;
+                  if (obstacle_pt) *obstacle_pt = Eigen::Vector2d(nd.x, nd.y);
+                  hit = true;
+                }
+              }
+            }
+          }
+          return hit;
+        });
+
     if (scan_optimizer_.optimize(waypoints_2d, corridors_2d, robot_start_2d, v_start_2d, knot_dt, opt_control_points_2d))
     {
       if (bspline_traj_.initialize2D(opt_control_points_2d, knot_dt))
       {
         opt_success = true;
       }
+      else
+      {
+        // 样条初始化静默失败会让 move_base 无任何解释地停止 —— 必须留痕
+        ROS_ERROR("[AStarLocalPlanner] B-spline initialize2D failed: %zu ctrl pts, dt=%.3f (waypoints=%zu, corridors=%zu)",
+                  opt_control_points_2d.size(), knot_dt, waypoints_2d.size(), corridors_2d.size());
+      }
+    }
+    else
+    {
+      ROS_WARN("[AStarLocalPlanner] ALM optimize rejected trajectory (corridor violation > 1cm after %d outer rounds)", 24);
     }
 
+    // 6.4 rebound 定向排斥可视化与诊断:
+    //     每个激活约束发布一支箭头 (障碍面参考点 → 控制点), 高度取走廊节点高程贴地;
+    //     红 = 控制点仍在 clearance 内 (弹簧受压中), 绿 = 已弹到安全间距之外;
+    //     箭头出现即说明拟牛顿识别到了障碍物, 数量与颜色直观反映收敛进度
+    {
+      const auto& constraints = scan_optimizer_.getReboundConstraints();
+      visualization_msgs::MarkerArray arr;
+      visualization_msgs::Marker del;
+      del.header.frame_id = map_frame_;
+      del.action = visualization_msgs::Marker::DELETEALL;
+      arr.markers.push_back(del);
+
+      const int active = scan_optimizer_.getReboundActiveCount();
+      if (active > 0 && opt_control_points_2d.size() == static_cast<size_t>(scan_optimizer_.getControlPointCount()))
+      {
+        const ros::Time stamp = ros::Time::now();
+        int mid = 0;
+        double worst_err = 0.0;
+        for (int i = 1; i < static_cast<int>(waypoints_2d.size()); ++i)
+        {
+          const auto& rc = constraints[i + 1];
+          if (rc.direction.squaredNorm() < 0.5) continue;
+
+          const Eigen::Vector2d& q = opt_control_points_2d[i + 1];
+          const double z_base = corridors_2d[i].queryZFromNodes(rc.base_point.x(), rc.base_point.y());
+          const double z_q = corridors_2d[i].queryZFromNodes(q.x(), q.y());
+
+          visualization_msgs::Marker arrow;
+          arrow.header.frame_id = map_frame_;
+          arrow.header.stamp = stamp;
+          arrow.ns = "rebound_spring";
+          arrow.id = mid++;
+          arrow.type = visualization_msgs::Marker::ARROW;
+          arrow.action = visualization_msgs::Marker::ADD;
+          geometry_msgs::Point p0, p1;
+          p0.x = rc.base_point.x(); p0.y = rc.base_point.y(); p0.z = z_base + 0.05;
+          p1.x = q.x();             p1.y = q.y();             p1.z = z_q + 0.05;
+          arrow.points = {p0, p1};
+          arrow.scale.x = 0.02;   // 杆径
+          arrow.scale.y = 0.05;   // 头径
+          arrow.scale.z = 0.08;   // 头长
+          const double dist = (q - rc.base_point).dot(rc.direction);
+          const double err = rebound_clearance_ - dist;
+          worst_err = std::max(worst_err, err);
+          arrow.color.r = 1.0f; arrow.color.g = (err <= 0.0f) ? 1.0f : 0.2f; arrow.color.b = 0.2f;
+          arrow.color.a = 0.9f;
+          arrow.lifetime = ros::Duration(0.5);
+          arr.markers.push_back(arrow);
+        }
+        rebound_debug_pub_.publish(arr);
+        ROS_INFO_THROTTLE(2.0,
+            "[AStarLocalPlanner] rebound active: %d control points, worst clearance violation %.3fm (red arrows = still compressed)",
+            active, worst_err);
+      }
+      else
+      {
+        rebound_debug_pub_.publish(arr);  // 无碰撞: 清空上一帧箭头
+      }
+    }
+
+    perf.mark("alm");
     // 发布 3D 走廊调试详细 JSON 数据 (包含 1:1 对应的优化后物理点与违约量)
     if (local_corridor_debug_pub_.getNumSubscribers() > 0)
     {
@@ -435,6 +661,9 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
 
   // 7. 将 2D 轨迹披覆 (Drape) 回 3D 流形表面并发布 (纯使用走廊节点数据，零二次图查表)
   nav_msgs::Path spline_path = bspline_traj_.toPathMsgFromCorridors(map_frame_, corridors_2d, 0.05);
+  perf.mark("drape");
+  ROS_INFO_THROTTLE(5.0, "[AStarLocalPlanner] spline published: %zu poses (waypoints=%zu corridors=%zu dt=%.3f)",
+                    spline_path.poses.size(), waypoints_2d.size(), corridors_2d.size(), knot_dt);
   if (local_spline_plan_pub_.getNumSubscribers() > 0 || local_plan_pub_.getNumSubscribers() > 0)
   {
     local_spline_plan_pub_.publish(spline_path);
@@ -462,13 +691,13 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
                           &opt_control_points_2d, knot_dt, 0.05);
   }
 
-  // 8. 终点距离判断
-  const auto& goal_pos = global_plan_.back().pose.position;
-  double dist_to_goal_2d = std::hypot(robot_pose.x - goal_pos.x, robot_pose.y - goal_pos.y);
-  if (dist_to_goal_2d < goal_pos_tol_ + 0.10)
+  // 8. 终点距离判断: 剩余 3D 路程长度 (沿路径弧长, 楼梯高程与绕行形状计入, 跨层投影重合不再误判)
+  const double remaining_dist_3d = remainingPlanLength3D(robot_pose);
+  if (remaining_dist_3d < goal_pos_tol_ + 0.10)
   {
     pose_adjusting_ = true;
-    ROS_INFO("[AStarLocalPlanner] Near final goal (dist: %.2fm). Entering final alignment.", dist_to_goal_2d);
+    ROS_INFO("[AStarLocalPlanner] Near final goal (remaining 3D path length: %.2fm). Entering final alignment.",
+             remaining_dist_3d);
     return computeVelocityCommands(cmd_vel);
   }
 
@@ -506,7 +735,7 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
   {
     curve_speed_limit = std::min(cruise_speed, std::sqrt(max_lateral_acc_ / kappa));
   }
-  double goal_scale = (dist_to_goal_2d < 0.60) ? std::max(0.30, dist_to_goal_2d / 0.60) : 1.0;
+  double goal_scale = (remaining_dist_3d < 0.60) ? std::max(0.30, remaining_dist_3d / 0.60) : 1.0;
   // 保底保留 0.20 系数保证转弯时持续前行出弯
   double heading_scale = std::max(0.20, std::cos(heading_error));
   double forward_speed = std::min(cruise_speed, curve_speed_limit) * goal_scale * heading_scale;
@@ -613,15 +842,16 @@ bool AStarLocalPlanner::isPathBlocked(
 {
   if (path.size() < 2) return false;
 
-  double accum = 0.0;
-  for (size_t i = 1; i < path.size(); ++i)
-  {
-    const auto & prev = path[i - 1].pose.position;
-    const auto & curr = path[i].pose.position;
-    accum += std::hypot(curr.x - prev.x, curr.y - prev.y);
+    double accum = 0.0;
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+      const auto & prev = path[i - 1].pose.position;
+      const auto & curr = path[i].pose.position;
+      accum += std::hypot(curr.x - prev.x, curr.y - prev.y);
 
-    uint32_t nid = 0;
-    if (graph.findClosestNode(curr.x, curr.y, curr.z, nid, 0.4, 0.6))
+      uint32_t nid = 0;
+      // include_blocked=true: 动态障碍封锁的节点也要找得到, 否则阻挡检测失明
+      if (graph.findClosestNode(curr.x, curr.y, curr.z, nid, 0.4, 0.6, true))
     {
       const auto & node = graph.getNode(nid);
       // 节点不可通行: 障碍物阻挡或顶头净空不足
@@ -771,6 +1001,64 @@ bool AStarLocalPlanner::computeFinalYawErrorXY(
   const double goal_yaw = tf2::getYaw(final_pose_in.pose.orientation);
   yaw_error = angles::shortest_angular_distance(robot_pose.yaw, goal_yaw);
   return true;
+}
+
+double AStarLocalPlanner::remainingPlanLength3D(const RobotPose2D & robot_pose) const
+{
+  const size_t n = global_plan_.size();
+  if (n == 0) return std::numeric_limits<double>::max();
+  const size_t seg_count = n - 1;
+  if (seg_count == 0)
+  {
+    const auto& g = global_plan_.back().pose.position;
+    return std::sqrt(std::pow(g.x - robot_pose.x, 2) + std::pow(g.y - robot_pose.y, 2) +
+                     std::pow(g.z - robot_pose.z, 2));
+  }
+
+  // 在跟踪索引附近的小窗口内做 3D 投影取沿路径进度, 消除航点合并后索引点间距 (0.6m) 的量化误差;
+  // z 加权 4.0 与 extractLocalBand 同口径, 防止异层重叠段抢走投影
+  size_t start = static_cast<size_t>(std::max(0, global_tracking_index_ - 1));
+  size_t end = std::min(seg_count, start + 4);
+
+  size_t best_seg = seg_count;
+  double best_t = 0.0, best_d_sq = std::numeric_limits<double>::max();
+  for (size_t i = start; i < end; ++i)
+  {
+    const auto& p1 = global_plan_[i].pose.position;
+    const auto& p2 = global_plan_[i + 1].pose.position;
+    double vx = p2.x - p1.x, vy = p2.y - p1.y, vz = p2.z - p1.z;
+    double v_sq = vx * vx + vy * vy + vz * vz;
+    if (v_sq < 1e-9) continue;
+    double t = ((robot_pose.x - p1.x) * vx + (robot_pose.y - p1.y) * vy +
+                (robot_pose.z - p1.z) * vz) / v_sq;
+    t = std::max(0.0, std::min(1.0, t));
+    double dx = robot_pose.x - (p1.x + t * vx);
+    double dy = robot_pose.y - (p1.y + t * vy);
+    double dz = robot_pose.z - (p1.z + t * vz);
+    double d_sq = dx * dx + dy * dy + 4.0 * dz * dz;
+    if (d_sq < best_d_sq) { best_d_sq = d_sq; best_seg = i; best_t = t; }
+  }
+
+  if (best_seg >= seg_count)
+  {
+    const auto& g = global_plan_.back().pose.position;
+    return std::sqrt(std::pow(g.x - robot_pose.x, 2) + std::pow(g.y - robot_pose.y, 2) +
+                     std::pow(g.z - robot_pose.z, 2));
+  }
+
+  const auto& p1 = global_plan_[best_seg].pose.position;
+  const auto& p2 = global_plan_[best_seg + 1].pose.position;
+  double remaining = (1.0 - best_t) * std::sqrt(std::pow(p2.x - p1.x, 2) +
+                                                std::pow(p2.y - p1.y, 2) +
+                                                std::pow(p2.z - p1.z, 2));
+  for (size_t i = best_seg + 1; i < seg_count; ++i)
+  {
+    const auto& a = global_plan_[i].pose.position;
+    const auto& b = global_plan_[i + 1].pose.position;
+    remaining += std::sqrt(std::pow(b.x - a.x, 2) + std::pow(b.y - a.y, 2) +
+                           std::pow(b.z - a.z, 2));
+  }
+  return remaining;
 }
 
 // ===== [DBG] 起终点高亮 + 线级约束检查 =====

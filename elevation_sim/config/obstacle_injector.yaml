@@ -1,0 +1,59 @@
+# 障碍物注入器 (仿真测试专用): 在 /elevation_global_plan 路径上按规则生成障碍物表面点云
+# 采样规格对齐融合管线判据: 间距 0.04m (≥2点/柱), 底部离地 0.02m (顶头封锁),
+# 高度 ≥0.45m (>max_step_height, 侧向膨胀成墙), 宽深 ≥0.4m (不可绕胯)
+rate: 5.0                    # 点云发布频率 (Hz), 喂 10Hz 融合节拍
+sample_spacing: 0.04         # 表面采样间距 (m)
+point_noise: 0.005           # 采样点高斯噪声 (m), 模拟真实雷达
+activation_radius: 6.0       # 规则激活半径 (m): 机器人靠近才发点, 保证落入融合 ROI (crop_radius_xy 3.5m)
+goal_topic: /move_base/current_goal  # 新目标检测: 新目标 → 障碍按新计划重新一次成型
+
+rules:
+  # 沿路径每 3m 一堵静止的"墙" (yaw 对齐切向正对机器人), 距起点 1.5m 开始,
+  # 距终点 1.0m 内不放; 目标设置后一次成型, 世界坐标冻结
+  - name: wall_box
+    type: static_on_path
+    shape: box
+    size_w: 0.4              # 沿路径切向 (m)
+    size_d: 0.4              # 垂直路径方向 (m)
+    height: 0.5
+    interval: 3.0            # 沿路径等间距 (m)
+    start_offset: 1.5        # 首个障碍距起点 (m)
+    end_margin: 1.0          # 距终点该距离内不放 (防堵目标点)
+
+  # 每隔 4m 一个圆柱从侧向横穿, 往返循环 (各实例同相)
+  - name: crosser
+    type: crossing
+    shape: cylinder
+    radius: 0.25
+    height: 0.5
+    interval: 4.0
+    start_offset: 2.0
+    end_margin: 1.0
+    lateral_range: 1.5       # 侧向往返幅度 (m)
+    speed: 0.2               # 横穿速度 (m/s)
+
+  # 每隔 5m 一个箱子周期出现/消失 (8s 开 / 5s 关), 验证封锁清除与路径恢复
+  - name: blinker
+    type: blink
+    shape: box
+    size_w: 0.4
+    size_d: 0.4
+    height: 0.5
+    interval: 5.0
+    start_offset: 3.0
+    end_margin: 1.0
+    period_on: 8.0
+    period_off: 5.0
+
+  # 迎面而来的圆柱 (默认关闭, 需要时打开): 各实例沿路径反方向朝机器人移动
+  # - name: oncomer
+  #   type: oncoming
+  #   shape: cylinder
+  #   radius: 0.25
+  #   height: 0.5
+  #   interval: 4.0
+  #   start_offset: 2.0
+  #   end_margin: 1.0
+  #   speed: 0.25
+  #   stop_dist: 0.8          # 距机器人小于此距离即消失 (逐实例)
+  #   cooldown: 5.0           # 消失后冷却再重现 (s)

@@ -17,6 +17,8 @@ struct KinematicAStarConfig
   double weight_traversability = 3.0; // 踏面阻尼/障碍物代价权重
   double max_step_height = 0.25;      // 最大单步踏步台阶高度 (m)
   double max_stride_length = 0.35;    // 最大单步水平跨步步长 (m)
+  double max_xy_radius = 6.0;         // 绕障子图半径 (m): 距起点 XY 硬边界, 防阻挡时全图穷举
+  int    max_expansions = 5000;       // 绕障 A* 弹出节点预算: 超限判定局部无解
 };
 
 /**
@@ -58,7 +60,8 @@ public:
       return false;
     }
 
-    // 局部绕障模式: 与原实现完全一致的代价模型, 由统一内核执行
+    // 局部绕障模式: 与原实现完全一致的代价模型, 由统一内核执行;
+    // 子图边界 (起点 XY 半径 + 扩展预算) 防止阻挡时在 19 万节点全图上穷举
     elevation_planner::ManifoldAstarParams prm;
     prm.filter_single_step = true;
     prm.max_step_height = cfg_.max_step_height;
@@ -72,6 +75,8 @@ public:
     prm.h_z_weight = cfg_.weight_z;
     prm.use_closed = false;
     prm.stale_push_limit = 200.0;
+    prm.max_xy_radius = cfg_.max_xy_radius;
+    prm.max_expansions = cfg_.max_expansions;
 
     if (!elevation_planner::manifoldAstarSearch(graph, start_nid, goal_nid, prm, path_nids))
     {

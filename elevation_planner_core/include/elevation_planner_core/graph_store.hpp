@@ -39,7 +39,7 @@ public:
     return global_table_;
   }
 
-  void setGlobalGraph(std::shared_ptr<const ManifoldGraph> graph)
+  void setGlobalGraph(std::shared_ptr<ManifoldGraph> graph)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     global_graph_ = std::move(graph);
@@ -51,16 +51,13 @@ public:
     return global_graph_;
   }
 
-  void setFusedGraph(std::shared_ptr<const ManifoldGraph> graph)
+  /// 融合引擎专用: 全局图的非 const 访问, 用于原位刷新节点属性 (动态障碍通行性)。
+  /// 图的结构 (节点集合/id/边) 不可改动, 只允许写 traversability/headroom;
+  /// 引擎负责在动态阻挡消失后恢复先验值 (见 ManifoldFusionEngine)。
+  std::shared_ptr<ManifoldGraph> getGlobalGraphMutable() const
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    fused_graph_ = std::move(graph);
-  }
-
-  std::shared_ptr<const ManifoldGraph> getFusedGraph() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return fused_graph_;
+    return global_graph_;
   }
 
   void setLocalElevationGrid(std::shared_ptr<const LocalElevationGrid> grid)
@@ -94,8 +91,7 @@ private:
 
   mutable std::mutex mutex_;
   std::shared_ptr<const ColumnTable> global_table_;
-  std::shared_ptr<const ManifoldGraph> global_graph_;
-  std::shared_ptr<const ManifoldGraph> fused_graph_;
+  std::shared_ptr<ManifoldGraph> global_graph_;
   std::shared_ptr<const LocalElevationGrid> local_elevation_grid_;
   std::shared_ptr<const TopologicalCorridor> topological_corridor_;
 };

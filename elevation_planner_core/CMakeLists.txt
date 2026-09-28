@@ -14,14 +14,16 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   costmap_2d
+  tf2_ros
 )
 
 find_package(PCL REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES elevation_planner_core
-  CATKIN_DEPENDS roscpp grid_map_core grid_map_msgs geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions costmap_2d
+  CATKIN_DEPENDS roscpp grid_map_core grid_map_msgs geometry_msgs nav_msgs sensor_msgs visualization_msgs pcl_ros pcl_conversions costmap_2d tf2_ros
   DEPENDS PCL
 )
 
@@ -29,6 +31,7 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  ${YAML_CPP_INCLUDE_DIRS}
 )
 
 add_library(elevation_planner_core
@@ -36,10 +39,13 @@ add_library(elevation_planner_core
   src/cloud_graph_builder.cpp
   src/layer_portal.cpp
   src/cost_evaluator.cpp
+  src/pcd_map_io.cpp
+  src/manifold_fusion_engine.cpp
 )
 target_link_libraries(elevation_planner_core
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
+  ${YAML_CPP_LIBRARIES}
 )
 
 if (CATKIN_ENABLE_TESTING)

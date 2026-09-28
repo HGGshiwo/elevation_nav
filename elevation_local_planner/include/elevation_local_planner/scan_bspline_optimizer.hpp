@@ -11,6 +11,7 @@
 #include <sstream>
 #include <iomanip>
 #include <ros/ros.h>
+#include <functional>
 
 namespace elevation_local_planner
 {
@@ -52,6 +53,36 @@ public:
    * @brief [DBG] 调试日志开关 (默认开启; 排查结束后可调用 setDebugVerbose(false) 关闭)
    */
   void setDebugVerbose(bool verbose) { debug_verbose_ = verbose; }
+
+  /// 占据查询回调: (x, y, z) 处机体周围本层带内是否存在禁行节点;
+  /// 命中时输出最近禁行节点坐标 (障碍面参考点), 供 rebound 定向排斥使用。
+  /// 图外/悬空 (无本层节点) 返回 false —— 不装弹簧, 交走廊 ALM 项兜底
+  using OccupancyCallback = std::function<bool(double, double, double, Eigen::Vector2d*)>;
+
+  void setOccupancyCallback(OccupancyCallback cb) { occupancy_cb_ = std::move(cb); }
+
+  /// rebound 参数: 排斥项权重与安全间距 (= body_hard_radius)
+  void setReboundParams(double lambda_rebound, double clearance)
+  {
+    lambda_rebound_ = lambda_rebound;
+    rebound_clearance_ = clearance;
+  }
+
+  /// rebound 约束结构 (可视化/诊断用): base_point=障碍面参考点, direction=排斥单位向量 (零向量=未激活)
+  struct ReboundConstraint
+  {
+    Eigen::Vector2d base_point{0.0, 0.0};
+    Eigen::Vector2d direction{0.0, 0.0};
+  };
+
+  /// 当前轮的 rebound 约束快照 (下标对齐控制点), 供宿主发布可视化箭头
+  const std::vector<ReboundConstraint>& getReboundConstraints() const { return rebound_; }
+
+  /// 控制点总数 (N + 2)
+  int getControlPointCount() const { return num_ctrl_pts_; }
+
+  /// 本轮优化最后一次刷新时激活 (碰撞) 的约束数量
+  int getReboundActiveCount() const { return rebound_active_count_; }
 
   /**
    * @brief 执行 2D 样条控制点 ALM 内外循环优化 (1:1 物理点与凸包严格对应)
@@ -123,6 +154,9 @@ public:
       multipliers_[i] = Eigen::VectorXd::Zero(num_constraints);
     }
 
+    // rebound 定向排斥约束清零 (每轮外循环结束后由 checkCollisionAndRebound 按碰撞实测刷新)
+    rebound_.assign(num_ctrl_pts_, ReboundConstraint());
+
     // ===== [DBG-1] 初始化快照: 初始穿墙量与微型/退化走廊检测 (区分数据问题 vs 优化发散) =====
     if (debug_verbose_)
     {
@@ -188,6 +222,10 @@ public:
 
     for (int outer_iter = 0; outer_iter < max_outer_iters; ++outer_iter)
     {
+      // rebound 刷新: 每轮 L-BFGS 之前按上一轮末控制点 (首轮为 A* 初值) 检测碰撞并装弹簧,
+      // 保证本轮内循环能实际消费排斥约束 —— 刷新放在轮末会因早退 break 使弹簧永远空转
+      checkCollisionAndRebound();
+
       double final_cost = 0.0;
       int ret = lbfgs::lbfgs_optimize(
           static_cast<int>(x.size()),
@@ -282,13 +320,15 @@ public:
           if (j_worst >= 0 && max_viol_idx < static_cast<int>(multipliers_.size()))
             mu_worst = multipliers_[max_viol_idx](j_worst);
         }
-        ROS_INFO("[ScanBspline][DBG] outer=%d ret=%s fx=%.3f [sm=%.2f feas=%.2f fit=%.2f cor=%.2f alm=%.2f] gnorm=%.3f | viol=%.4f@cor%d(q%d,row%d) mu=%.1f lam=%.0f",
+        ROS_INFO("[ScanBspline][DBG] outer=%d ret=%s fx=%.3f [sm=%.2f feas=%.2f fit=%.2f cor=%.2f alm=%.2f reb=%.2f] gnorm=%.3f | viol=%.4f@cor%d(q%d,row%d) mu=%.1f lam=%.0f",
                  outer_iter, lbfgsRetName(ret), fx_final,
-                 dbg_cost_smooth_, dbg_cost_feas_, dbg_cost_fitness_, dbg_cost_corridor_, dbg_cost_alm_, dbg_gnorm_,
+                 dbg_cost_smooth_, dbg_cost_feas_, dbg_cost_fitness_, dbg_cost_corridor_, dbg_cost_alm_, dbg_cost_rebound_, dbg_gnorm_,
                  max_violation, max_viol_idx, max_viol_idx + 1, j_worst, mu_worst, cur_lambda_alm_);
       }
 
       // 若控制点穿墙量已满足 <= 0.0001m，则提前收敛退出
+      // (rebound 刷新已移至本轮 L-BFGS 之前; 此处的控制点状态由规划器在 optimize 返回后
+      //  通过 getReboundConstraints 快照发布可视化)
       if (max_violation <= violation_tol)
       {
         break;
@@ -348,6 +388,74 @@ public:
   }
 
 private:
+  // ===== rebound 定向排斥 (EGO 式碰撞事件驱动, 无 A* 依赖; 结构体定义见 public 区) =====
+
+  /**
+   * @brief 逐控制点查占据, 碰撞者装上 (base_point, direction) 定向弹簧。
+   *        语义与伪 TF 落脚点预检对齐: 本层带内任一禁行节点 = 碰撞;
+   *        图外/悬空 (无本层节点) 不惩罚, 交走廊 ALM 项兜底。
+   */
+  void checkCollisionAndRebound()
+  {
+    rebound_.assign(num_ctrl_pts_, ReboundConstraint());
+    rebound_active_count_ = 0;
+    if (!occupancy_cb_) return;
+
+    for (int i = 1; i < num_waypoints_; ++i)
+    {
+      const int cp = i + 1;
+      const Eigen::Vector2d q = ctrl_pts_.col(cp);
+      const double z = corridors_[i].queryZFromNodes(q.x(), q.y());
+
+      Eigen::Vector2d obstacle_pt(0.0, 0.0);
+      if (!occupancy_cb_(q.x(), q.y(), z, &obstacle_pt)) continue;
+
+      ReboundConstraint rc;
+      rc.base_point = obstacle_pt;
+      const Eigen::Vector2d d = q - obstacle_pt;
+      const double n = d.norm();
+      rc.direction = (n > 1.0e-6) ? (d / n) : Eigen::Vector2d(0.0, 0.0);
+      rebound_[cp] = rc;
+      ++rebound_active_count_;
+    }
+  }
+
+  /**
+   * @brief 定向排斥代价项 (EGO calcDistanceCostRebound 分段 C2 公式的 2D 版):
+   *        dist = (q − base_point)·direction, 要求 dist ≥ clearance;
+   *        err < demarcation 三次项, 深穿透切换二次+线性延拓, 梯度方向 = direction。
+   */
+  void calcReboundCost(const Eigen::Matrix2Xd& q, double& cost, Eigen::Matrix2Xd& grad)
+  {
+    cost = 0.0;
+    if (lambda_rebound_ <= 0.0 || rebound_.empty()) return;
+
+    const double demarcation = rebound_clearance_;
+    const double a = 3.0 * demarcation;
+    const double b = -3.0 * demarcation * demarcation;
+    const double c = demarcation * demarcation * demarcation;
+
+    for (int i = 1; i < num_waypoints_; ++i)
+    {
+      const int cp = i + 1;
+      const auto& rc = rebound_[cp];
+      if (rc.direction.squaredNorm() < 0.5) continue;  // 未激活 (单位向量模长恒 1)
+
+      const double dist = (q.col(cp) - rc.base_point).dot(rc.direction);
+      const double err = rebound_clearance_ - dist;
+      if (err <= 0.0) continue;  // 已弹到安全间距之外
+
+      if (err < demarcation)
+        cost += err * err * err;
+      else
+        cost += a * err * err + b * err + c;
+
+      // d(cost)/d(err), 再乘 d(err)/dq = -direction
+      const double dJ_de = (err < demarcation) ? (3.0 * err * err) : (2.0 * a * err + b);
+      grad.col(cp) += (-lambda_rebound_ * dJ_de) * rc.direction;
+    }
+  }
+
   static double costFunctionCallback(void* instance,
                                      const double* x,
                                      double* g,
@@ -368,13 +476,14 @@ private:
     }
 
     double cost_smooth = 0.0, cost_feas = 0.0, cost_fitness = 0.0;
-    double cost_corridor = 0.0, cost_alm = 0.0;
+    double cost_corridor = 0.0, cost_alm = 0.0, cost_rebound = 0.0;
 
     Eigen::Matrix2Xd grad_smooth = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_feas = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_fitness = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_corridor = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_alm = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
+    Eigen::Matrix2Xd grad_rebound = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
 
     // 1. Jerk 加加速度平滑项
     calcSmoothnessCost(ctrl_pts_, cost_smooth, grad_smooth);
@@ -391,18 +500,23 @@ private:
     // 5. 凸包本质: 直接对控制点 q_{i+1} 施加增广拉格朗日项 J_ALM
     calcALMCost(ctrl_pts_, cost_alm, grad_alm);
 
-    // 6. 线性合成总代价与总梯度
+    // 6. rebound 定向排斥项: 碰撞控制点沿 (base_point, direction) 弹离障碍至 clearance 之外
+    calcReboundCost(ctrl_pts_, cost_rebound, grad_rebound);
+
+    // 线性合成总代价与总梯度
     double total_cost = lambda1_smooth_ * cost_smooth +
                         lambda3_feas_ * cost_feas +
                         lambda4_fitness_ * cost_fitness +
                         cost_corridor +
-                        cost_alm;
+                        cost_alm +
+                        cost_rebound;
 
     Eigen::Matrix2Xd grad_all = lambda1_smooth_ * grad_smooth +
                                 lambda3_feas_ * grad_feas +
                                 lambda4_fitness_ * grad_fitness +
                                 grad_corridor +
-                                grad_alm;
+                                grad_alm +
+                                grad_rebound;
 
     for (int i = 0; i < num_free; ++i)
     {
@@ -417,6 +531,7 @@ private:
     dbg_cost_fitness_ = lambda4_fitness_ * cost_fitness;
     dbg_cost_corridor_ = cost_corridor;
     dbg_cost_alm_ = cost_alm;
+    dbg_cost_rebound_ = cost_rebound;
     double g_sq = 0.0;
     for (int i = 0; i < n; ++i) g_sq += g[i] * g[i];
     dbg_gnorm_ = std::sqrt(g_sq);
@@ -763,6 +878,13 @@ private:
   std::vector<ConvexCorridor2D> corridors_;
   std::vector<Eigen::VectorXd> multipliers_;
 
+  // ===== rebound 定向排斥成员 =====
+  OccupancyCallback occupancy_cb_;             ///< 占据查询回调 (astar_local_planner 注入, 图零耦合)
+  std::vector<ReboundConstraint> rebound_;     ///< 控制点下标对齐的排斥约束 (零方向 = 未激活)
+  double lambda_rebound_{0.0};                 ///< 排斥项权重 (0 = 功能关闭)
+  double rebound_clearance_{0.17};             ///< 安全间距 (= body_hard_radius)
+  int rebound_active_count_{0};                ///< 最近一次刷新时激活的约束数量 (诊断用)
+
   // ===== [DBG] 调试观测成员 =====
   bool debug_verbose_{true};
   double dbg_cost_smooth_{0.0};
@@ -770,6 +892,7 @@ private:
   double dbg_cost_fitness_{0.0};
   double dbg_cost_corridor_{0.0};
   double dbg_cost_alm_{0.0};
+  double dbg_cost_rebound_{0.0};
   double dbg_gnorm_{0.0};
   std::string dbg_viol_history_;
 };
