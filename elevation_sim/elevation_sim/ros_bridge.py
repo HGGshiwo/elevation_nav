@@ -23,6 +23,7 @@ from sensor_msgs.msg import PointCloud2
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import MarkerArray, Marker
 import numpy as np
+from elevation_planner_core.srv import DiagnoseQuery
 
 def euler_to_quaternion(roll: float, pitch: float, yaw: float) -> Quaternion:
     """欧拉角转四元数 (移植自 jie_octomap ros_bridge)"""
@@ -78,6 +79,8 @@ class ElevationRosBridge:
         # 融合引擎动态改写节点的通行性覆盖层: {(x,y,z): trav}
         # 伪 TF 贴地跟随据此排除被障碍封锁的节点 (静态图不随融合更新)
         self.dynamic_trav: Dict[Tuple[float, float, float], float] = {}
+        # 融合引擎动态改写节点的区划类型覆盖层: {(x,y,z): zone} (0=FREE, 1=SOFT, 2=BODY_HARD, 3=FORBIDDEN)
+        self.dynamic_zone: Dict[Tuple[float, float, float], int] = {}
         # 注入障碍物 (供前端 3D 可视化)
         self.injected_obstacles: List[Dict[str, Any]] = []
         self.injected_obstacles_version = 0
@@ -89,6 +92,9 @@ class ElevationRosBridge:
         self.dynamic_nodes_version = 0
         self.rebound_arrows: List[Dict[str, Any]] = []
         self.rebound_arrows_version = 0
+        # 平移锁止/碰撞节点 (供前端高亮显示): [x, y, z, zone] (zone=3物理障碍/2机体禁行环/4顶盖)
+        self.collision_node: Optional[List[float]] = None
+        self.collision_node_time: float = 0.0
 
         # ROS 话题发布者与订阅者
         self._grid_map_pub: Optional[rospy.Publisher] = None
@@ -160,6 +166,10 @@ class ElevationRosBridge:
                 "/move_base/ElevationGlobalPlanner/max_step_height", 0.25)
             # 机体硬半径: 与 planner_common.yaml/代价地图同源, 平移闸的支撑距离上限
             self.body_hard_radius = float(rospy.get_param("body_hard_radius", 0.17))
+            # 机体站立高度: 与 planner_common.yaml 同源, 预检 R1 判据的机体高度上界
+            self.dog_height = float(rospy.get_param("dog_height", 0.45))
+            # 足印半径: 用于脚底大部分踏面方块高度聚类
+            self.footprint_radius = float(rospy.get_param("footprint_radius", 0.25))
             self.tf_broadcaster = tf2_ros.TransformBroadcaster()
             self._odom_pub = rospy.Publisher("/loc_base", Odometry, queue_size=10)
             rospy.Subscriber("/cmd_vel", Twist, self._cmd_vel_callback, queue_size=5)
@@ -195,6 +205,9 @@ class ElevationRosBridge:
             rospy.Subscriber("/elevation_dynamic_nodes", PointCloud2, self._dynamic_nodes_callback, queue_size=1)
             rospy.Subscriber("/elevation_rebound_debug", MarkerArray, self._rebound_callback, queue_size=1)
 
+            # 订阅仿真器发布的碰撞事件
+            rospy.Subscriber("/elevation_collision_node", RosString, self._collision_node_callback, queue_size=5)
+
             # 编辑器障碍点云: 与注入器同路径 /lidar_points (freeze 下注入器已禁用, 无交错;
             # 融合引擎对该话题的摄取链路被注入器时代反复验证过)
             self._editor_cloud_pub = rospy.Publisher("/lidar_points", PointCloud2, queue_size=1)
@@ -204,6 +217,23 @@ class ElevationRosBridge:
             rospy.loginfo("[ElevationRosBridge] ROS node and topic subscriptions ready")
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] ROS init exception: {e}")
+
+    def _collision_node_callback(self, msg: RosString):
+        """接收独立仿真器发出的碰撞事件"""
+        try:
+            if not msg.data:
+                with self._lock:
+                    self.collision_node = None
+                return
+            data = json.loads(msg.data)
+            if data and "x" in data:
+                with self._lock:
+                    self.collision_node = [float(data["x"]), float(data["y"]), float(data["z"]), int(data.get("type", 3))]
+            else:
+                with self._lock:
+                    self.collision_node = None
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 collision_node 异常: {e}")
 
     def _sfc_corridors_debug_callback(self, msg: RosString):
         """解析局部 SFC 凸多边形走廊调试数据 (包含各路径点坐标、node_id 及 8 邻域扩散节点群)"""
@@ -217,24 +247,41 @@ class ElevationRosBridge:
             rospy.logwarn(f"[ElevationRosBridge] 解析 sfc_corridors_debug 异常: {e}")
 
     def _dynamic_nodes_callback(self, msg: PointCloud2):
-        """接收融合引擎动态改写节点 (x,y,z,intensity=trav), 单次遍历同时维护两条消费链:
-        1. dynamic_nodes 列表 → Web 前端实时渲染 (封锁=红, 软代价=橙)
+        """接收融合引擎动态改写节点 (x,y,z,intensity=trav,zone), 单次遍历同时维护两条消费链:
+        1. dynamic_nodes 列表 → Web 前端实时渲染 (zone 三档配色: 禁行=红/机体硬环=橙/软代价=紫)
         2. dynamic_trav 覆盖层 → _effective_trav/贴地/锚定查询的融合实时值
-        覆盖层缺失的节点回退静态图值; 覆盖层存在的节点以融合实时值为准。"""
+        覆盖层缺失的节点回退静态图值; 覆盖层存在的节点以融合实时值为准。
+        zone 字段缺省 (旧发布端) 时置 None, 前端回退 trav 阈值配色。"""
         try:
+            has_zone = any(f.name == "zone" for f in msg.fields)
             nodes = []
-            overlay = {}
-            for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True):
-                x = round(float(p[0]), 3)
-                y = round(float(p[1]), 3)
-                z = round(float(p[2]), 3)
-                trav = round(float(p[3]), 2)
-                nodes.append([x, y, z, trav])
-                overlay[(x, y, z)] = trav
+            overlay_trav = {}
+            overlay_zone = {}
+            if has_zone:
+                for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity", "zone"), skip_nans=True):
+                    x = round(float(p[0]), 3)
+                    y = round(float(p[1]), 3)
+                    z = round(float(p[2]), 3)
+                    trav = round(float(p[3]), 2)
+                    zone = int(p[4])
+                    nodes.append([x, y, z, trav, zone])
+                    overlay_trav[(x, y, z)] = trav
+                    overlay_zone[(x, y, z)] = zone
+            else:
+                for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True):
+                    x = round(float(p[0]), 3)
+                    y = round(float(p[1]), 3)
+                    z = round(float(p[2]), 3)
+                    trav = round(float(p[3]), 2)
+                    zone = 3 if trav >= 0.95 else 0
+                    nodes.append([x, y, z, trav])
+                    overlay_trav[(x, y, z)] = trav
+                    overlay_zone[(x, y, z)] = zone
             with self._lock:
                 self.dynamic_nodes = nodes
                 self.dynamic_nodes_version += 1
-                self.dynamic_trav = overlay
+                self.dynamic_trav = overlay_trav
+                self.dynamic_zone = overlay_zone
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 dynamic_nodes 异常: {e}")
 
@@ -250,6 +297,19 @@ class ElevationRosBridge:
                 if abs(p[0] - x) < 0.02 and abs(p[1] - y) < 0.02 and abs(p[2] - z) < 0.02:
                     return p[3]
         return 0.0
+
+    def _effective_zone(self, x: float, y: float, z: float) -> int:
+        """节点有效区划类型 (CostZone: 0=FREE, 1=SOFT, 2=BODY_HARD, 3=FORBIDDEN)"""
+        key = (round(x, 3), round(y, 3), round(z, 3))
+        dyn_z = self.dynamic_zone.get(key)
+        if dyn_z is not None:
+            return dyn_z
+        cell = self.spatial_nodes.get((int(round(x / 0.10)), int(round(y / 0.10))))
+        if cell:
+            for p in cell:
+                if abs(p[0] - x) < 0.02 and abs(p[1] - y) < 0.02 and abs(p[2] - z) < 0.02:
+                    return int(p[4]) if len(p) >= 5 else (2 if p[3] >= 0.95 else 0)
+        return 0
 
     def _rebound_callback(self, msg: MarkerArray):
         """接收样条优化 rebound 定向排斥可视化箭头 (障碍面参考点 → 控制点)。
@@ -340,6 +400,14 @@ class ElevationRosBridge:
                     for k in range(n):
                         a = 2 * math.pi * k / n
                         pts.append((ox + r * math.cos(a), oy + r * math.sin(a), z0 + H))
+                # 内部填充: 中心轴竖线 + 半径 R/2 内环 —— 只采侧壁+顶盘时, 圆柱中心列
+                # 头顶只有 +0.5m 的顶盘一个面, 净空 0.5 >= dog_height 0.45 被判可通行,
+                # A* 会从圆柱正中心穿过去; 填充后整个投影面积净空 ≈ 0, 全面封锁
+                for z in self._arange_incl(0.0, H, spacing):
+                    pts.append((ox, oy, z0 + z))
+                    for k in range(4):
+                        a = math.pi / 2 * k + math.pi / 4
+                        pts.append((ox + R / 2 * math.cos(a), oy + R / 2 * math.sin(a), z0 + z))
             header = Header()
             header.stamp = rospy.Time.now()
             header.frame_id = "map"
@@ -416,16 +484,28 @@ class ElevationRosBridge:
             rospy.logwarn(f"[ElevationRosBridge] 解析 corridor nodes 点云异常: {e}")
 
     def _graph_nodes_callback(self, msg: PointCloud2):
-        """解析流形踏面节点点云并建立空间栅格哈希"""
+        """解析流形踏面节点点云并建立空间栅格哈希。
+        点云含 zone 字段 (CostZone: 0=自由/1=软代价/2=机体硬环/3=禁行) 时透传为第 5 元,
+        供前端三档配色; 旧格式 4 元照常解析。"""
         try:
+            has_zone = any(f.name == "zone" for f in msg.fields)
             pts = []
             spatial = {}
-            for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True):
-                pt = [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3), round(float(p[3]), 2)]
-                pts.append(pt)
-                r = int(round(pt[0] / 0.10))
-                c = int(round(pt[1] / 0.10))
-                spatial.setdefault((r, c), []).append(pt)
+            if has_zone:
+                for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity", "zone"), skip_nans=True):
+                    pt = [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3),
+                          round(float(p[3]), 2), int(p[4])]
+                    pts.append(pt)
+                    r = int(round(pt[0] / 0.10))
+                    c = int(round(pt[1] / 0.10))
+                    spatial.setdefault((r, c), []).append(pt)
+            else:
+                for p in pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True):
+                    pt = [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3), round(float(p[3]), 2)]
+                    pts.append(pt)
+                    r = int(round(pt[0] / 0.10))
+                    c = int(round(pt[1] / 0.10))
+                    spatial.setdefault((r, c), []).append(pt)
             with self._lock:
                 self.graph_nodes = pts
                 self.spatial_nodes = spatial
@@ -662,40 +742,170 @@ class ElevationRosBridge:
 
         return fallback_z
 
-    def _has_foothold(self, x: float, y: float, z: float) -> bool:
-        """平移闸落脚点预检: (x, y) 附近 body_hard_radius (0.17m) 范围内
-        (|dz| <= max_step_height 的本层节点) 必须全部可通行且至少存在一个踏面支撑 ——
-        静态禁行/融合动态封锁/无支撑均判失败 (质心贴着可通行踏面走, 防骑缝穿越障碍)。
-        踏面图未就绪时放行, 避免开机建图阶段锁死。"""
-        radius = self.body_hard_radius
+    def get_clustered_footprint_z(self, x: float, y: float, fallback_z: float, footprint_radius: float = 0.25) -> float:
+        """基于机器人足印包络下方大部分方块的高度聚类，自适应决定机体当前权威高度：
+        1. 在以 (x, y) 为中心、footprint_radius 半径内收集所有有效踏面节点；
+        2. 排除障碍禁行 (zone==3 或 trav>=0.95)；
+        3. 按 5cm 高度桶进行加权聚类 (距离质心越近权重越高)；
+        4. 选出权重最大 (即脚下大部分方块所处) 的主导高度簇，杜绝因台阶交界滞后导致的高度误判。
+        """
+        r0 = int(round(x / 0.10))
+        c0 = int(round(y / 0.10))
+        r_range = int(math.ceil(footprint_radius / 0.10)) + 1
+        r_sq = footprint_radius * footprint_radius
+
+        candidates = []
+        with self._lock:
+            spatial = self.spatial_nodes
+
+        if not spatial:
+            return fallback_z
+
+        for dr in range(-r_range, r_range + 1):
+            for dc in range(-r_range, r_range + 1):
+                cell = spatial.get((r0 + dr, c0 + dc))
+                if not cell:
+                    continue
+                for p in cell:
+                    # 排除障碍节点
+                    if p[3] >= 0.95 or self.dynamic_trav.get((p[0], p[1], p[2]), 0.0) >= 0.95:
+                        continue
+                    key = (p[0], p[1], p[2])
+                    if self.dynamic_zone.get(key, int(p[4]) if len(p) >= 5 else 0) >= 3:
+                        continue
+
+                    # 仅在阶梯单步垂直范围内聚类 (|dz| <= max_step_height + 0.10m)
+                    dz = p[2] - fallback_z
+                    if abs(dz) > self.max_step_height + 0.10:
+                        continue
+
+                    dx = p[0] - x
+                    dy = p[1] - y
+                    d2 = dx * dx + dy * dy
+                    if d2 <= r_sq:
+                        # 距离越近权重越高
+                        weight = 1.0 / (1.0 + 8.0 * d2)
+                        candidates.append((p[2], weight))
+
+        if not candidates:
+            return fallback_z
+
+        # 5cm 高度窗口聚类
+        clusters: Dict[int, List[float]] = {}  # bin_idx -> [total_weight, sum_weighted_z]
+        for pz, w in candidates:
+            bin_idx = int(round(pz / 0.05))
+            if bin_idx not in clusters:
+                clusters[bin_idx] = [0.0, 0.0]
+            clusters[bin_idx][0] += w
+            clusters[bin_idx][1] += w * pz
+
+        # 选出权重最高 (即大部分方块所在) 的主导高度簇
+        best_bin = max(clusters.keys(), key=lambda b: clusters[b][0])
+        dominant_weight, dominant_sum = clusters[best_bin]
+        if dominant_weight > 1e-4:
+            return dominant_sum / dominant_weight
+
+        return fallback_z
+
+    def _has_foothold(self, x: float, y: float, z: float) -> Tuple[bool, str, Optional[List[float]]]:
+        """平移闸落脚点预检:
+        1. 真实物理障碍 (zone=3 FORBIDDEN / 顶盖侵入): 必须在 body_hard_radius (0.17m) 外;
+        2. 机体硬禁行环 (zone=2 BODY_HARD): 是已膨胀 0.17m 的安全区, 机器狗质心不直接踩入 (中心落脚容差 ~0.08m) 即可;
+        3. 必须在 0.17m 邻域内存在有效支撑踏面 (|dz| <= max_step_height)。
+        返回: (是否放行, 原因描述, 冲突节点[x, y, z, zone]或None)
+        """
+        body_radius = self.body_hard_radius
+        center_foot_tol = 0.08  # 质心落脚网格容差
         with self._lock:
             spatial = self.spatial_nodes
         if not spatial:
-            return True
+            return True, "map_not_ready", None
         r0 = int(round(x / 0.10))
         c0 = int(round(y / 0.10))
-        r2 = radius * radius
+        r_body_sq = body_radius * body_radius
+        r_center_sq = center_foot_tol * center_foot_tol
         has_support = False
         for dr in range(-3, 4):
             for dc in range(-3, 4):
                 cell = spatial.get((r0 + dr, c0 + dc))
                 if not cell:
                     continue
+
+                # 1. 顶盖/立面结构空间碰撞 (在 body_hard_radius 0.17m 范围内检查)
+                #    仅当处于机身高度区间的节点属于障碍/禁行实体时拦截；正常可通行的上行台阶踏面不构成顶盖
                 for p in cell:
-                    if abs(p[2] - z) > self.max_step_height:
-                        continue  # 异层节点不参与本层支撑判定
                     dx = p[0] - x
                     dy = p[1] - y
-                    if dx * dx + dy * dy > r2:
+                    dist_sq = dx * dx + dy * dy
+                    if dist_sq > r_body_sq:
                         continue
-                    # 支撑范围内 (机体正下方与周身) 任何禁行节点 (静态/动态) 都判无支撑:
-                    # 全部可通行才算有支撑, 杜绝骑缝站在禁行区上/贴缝穿过障碍
-                    if p[3] >= 0.95:
-                        return False
-                    if self.dynamic_trav.get((p[0], p[1], p[2]), 0.0) >= 0.95:
-                        return False
-                    has_support = True
-        return has_support
+                    if z + self.max_step_height < p[2] <= z + self.dog_height + 0.15:
+                        key = (p[0], p[1], p[2])
+                        effective_zone = self.dynamic_zone.get(key, int(p[4]) if len(p) >= 5 else (2 if p[3] >= 0.95 else 0))
+                        if effective_zone >= 2 or p[3] >= 0.8:
+                            return False, (f"顶盖碰撞: 邻域障碍节点({p[0]:.2f}, {p[1]:.2f}, z={p[2]:.2f}) "
+                                           f"高度差 dz={p[2]-z:.2f} 侵入机身带[+{self.max_step_height:.2f}, +{self.dog_height+0.15:.2f}]m"), [p[0], p[1], p[2], 4]
+
+                # 2. 按水平坐标 (x,y) 归集本层踏面候选 (|Δz| <= max_step_height)
+                #    如果同一个 (x,y) 存在多个 0.25m 以内的踏面层 (如楼梯踏面与楼梯下地面)，优先选择可通行的一层
+                col_layers: Dict[Tuple[float, float], List[Tuple[Any, float]]] = {}
+                for p in cell:
+                    dx = p[0] - x
+                    dy = p[1] - y
+                    dist_sq = dx * dx + dy * dy
+                    if dist_sq > r_body_sq:
+                        continue
+                    if abs(p[2] - z) > self.max_step_height:
+                        continue
+
+                    col_key = (round(p[0], 2), round(p[1], 2))
+                    if col_key not in col_layers:
+                        col_layers[col_key] = []
+                    col_layers[col_key].append((p, dist_sq))
+
+                for col_key, cand_list in col_layers.items():
+                    # 评估该水平位置所有候选层的有效 zone (0=FREE, 1=SOFT, 2=BODY_HARD, 3=FORBIDDEN)
+                    # 只要存在可通行的层 (zone 最小)，直接选定该可通行层
+                    best_cand = None
+                    best_zone = 999
+                    best_dist_sq = 0.0
+
+                    for p, dist_sq in cand_list:
+                        key = (p[0], p[1], p[2])
+                        effective_zone = self.dynamic_zone.get(key, int(p[4]) if len(p) >= 5 else (2 if p[3] >= 0.95 else 0))
+                        if effective_zone < best_zone:
+                            best_zone = effective_zone
+                            best_cand = p
+                            best_dist_sq = dist_sq
+                        elif effective_zone == best_zone:
+                            if best_cand is None or abs(p[2] - z) < abs(best_cand[2] - z):
+                                best_cand = p
+                                best_dist_sq = dist_sq
+
+                    if best_cand is None:
+                        continue
+
+                    p = best_cand
+                    dist_sq = best_dist_sq
+                    effective_zone = best_zone
+
+                    # 真实物理障碍 (该 (x,y) 下所有候选层均为 zone == 3，无任何可通行踏面)
+                    if effective_zone == 3:
+                        return False, (f"触碰真实物理障碍(FORBIDDEN): 节点({p[0]:.2f}, {p[1]:.2f}, z={p[2]:.2f}) "
+                                       f"距中心 {math.sqrt(dist_sq):.2f}m <= {body_radius:.2f}m"), [p[0], p[1], p[2], 3]
+
+                    # 机体硬禁行环 (zone == 2 BODY_HARD)
+                    if effective_zone == 2 and dist_sq <= r_center_sq:
+                        return False, (f"质心踩入机体禁行环(BODY_HARD): 节点({p[0]:.2f}, {p[1]:.2f}, z={p[2]:.2f}) "
+                                       f"距中心 {math.sqrt(dist_sq):.2f}m <= 质心容差 {center_foot_tol:.2f}m"), [p[0], p[1], p[2], 2]
+
+                    # 只要选出的一层不是真实物理障碍，即构成本层有效支撑踏面
+                    if effective_zone < 3:
+                        has_support = True
+
+        if not has_support:
+            return False, f"无有效支撑踏面: 半径 {body_radius:.2f}m 内未检索到 |Δz|<={self.max_step_height:.2f}m 的合法支撑节点", None
+        return True, "ok", None
 
     def step_connected_terrain(self, target_x: float, target_y: float, fallback_z: float) -> float:
         """严格沿连通图拓扑邻域推进并吸附到当前踏面流形：
@@ -831,6 +1041,8 @@ class ElevationRosBridge:
                 self.sim_z = float(z) if z is not None else self.current_graph_node[2]
             else:
                 self.sim_z = float(z) if z is not None else self.get_terrain_z(self.sim_x, self.sim_y, 0.0)
+            self.collision_node = None
+            self.collision_node_time = 0.0
         self.cmd_vx, self.cmd_vy, self.cmd_wz = 0.0, 0.0, 0.0
         self.last_sim_time = rospy.Time.now()
         if self.publish_fake_tf:
@@ -851,6 +1063,7 @@ class ElevationRosBridge:
             return
         try:
             now_stamp = rospy.Time.now()
+            now_sec = now_stamp.to_sec()
 
             # 运动学积分更新
             if self.last_sim_time is not None:
@@ -877,29 +1090,28 @@ class ElevationRosBridge:
                     new_x = self.sim_x + dx_body * cos_y - dy_body * sin_y
                     new_y = self.sim_y + dx_body * sin_y + dy_body * cos_y
 
-                    # 落脚点预检: 前方 (x, y) 无合法踏面时锁止平移 (原地卡住), 1Hz 节流报错
-                    if (abs(dx_body) > 1e-9 or abs(dy_body) > 1e-9) \
-                            and not self._has_foothold(new_x, new_y, self.sim_z):
+                    is_translating = (abs(dx_body) > 1e-9 or abs(dy_body) > 1e-9)
+
+                    # 1. 严格沿拓扑连通图流形预测目标点 (new_x, new_y) 的真实地表高度 (连续线段插值, 无阶跃)
+                    expected_z = self.step_connected_terrain(new_x, new_y, self.sim_z) if is_translating else self.sim_z
+
+                    # 2. 落脚点预检: 基于前方 (new_x, new_y) 真实的踏面高度 expected_z 进行 3D 包络与障碍判定
+                    foothold_ok, foothold_reason, hit_node = self._has_foothold(new_x, new_y, expected_z) if is_translating else (True, "ok", None)
+                    with self._lock:
+                        if is_translating and not foothold_ok and hit_node:
+                            # 发生碰撞时记录/覆盖冲突节点，持续保留直至下一次碰撞覆盖
+                            self.collision_node = hit_node
+
+                    if is_translating and not foothold_ok:
                         rospy.logerr_throttle(
                             1.0,
-                            f"[ElevationRosBridge] 落脚点缺失: 前方 ({new_x:.2f}, {new_y:.2f}) 无合法踏面, "
-                            f"平移锁止于 ({self.sim_x:.2f}, {self.sim_y:.2f}, z={self.sim_z:.2f})")
+                            f"[ElevationRosBridge] 落脚点预检失败 (平移锁止于 x={self.sim_x:.2f}, y={self.sim_y:.2f}, z={self.sim_z:.2f}): "
+                            f"前方 ({new_x:.2f}, {new_y:.2f}, z={expected_z:.2f}) -> {foothold_reason}")
                     else:
                         self.sim_x = new_x
                         self.sim_y = new_y
+                        self.sim_z = expected_z
                     self.sim_yaw = normalize_angle(self.sim_yaw + dyaw)
-
-                    # 严格沿拓扑连通图流形跟随地表高度 (平滑低通滤波过渡)
-                    target_z = self.step_connected_terrain(self.sim_x, self.sim_y, self.sim_z)
-                    # z 变化门控: 目标 (x,y) 的可通行性已由平移闸每 tick 全查,
-                    # 此处只约束垂直单步极限 —— |Δz| < max_step_height 才允许过渡
-                    if abs(target_z - self.sim_z) >= self.max_step_height:
-                        rospy.logwarn_throttle(
-                            1.0,
-                            f"[ElevationRosBridge] z 目标越限: {self.sim_z:.2f} -> {target_z:.2f} "
-                            f"(单步极限 {self.max_step_height:.2f}), 保持当前高度")
-                        target_z = self.sim_z
-                    self.sim_z = 0.85 * self.sim_z + 0.15 * target_z
 
             self.last_sim_time = now_stamp
             q = euler_to_quaternion(0.0, 0.0, self.sim_yaw)
@@ -1041,31 +1253,40 @@ class ElevationRosBridge:
             rospy.loginfo(f"[ElevationRosBridge] Sent PCD path command: {pcd_path}")
 
     def _debug_result_callback(self, msg: RosString):
-        """接收 C++ 规划器节点返回的权威诊断结果"""
+        """接收 C++ 规划器节点返回的权威诊断结果 (兼容 Topic 降级)"""
         with self._lock:
             self._last_debug_result = msg.data
             self._debug_event.set()
 
+    def _call_diagnose_service(self, query_str: str, timeout: float = 1.0) -> Dict[str, Any]:
+        """通过 ROS Service 同步请求 C++ 权威诊断 (天然线程安全, 彻底杜绝并发串包)"""
+        try:
+            rospy.wait_for_service("/elevation_debug_diagnose", timeout=timeout)
+            proxy = rospy.ServiceProxy("/elevation_debug_diagnose", DiagnoseQuery)
+            resp = proxy(query_str)
+            return json.loads(resp.result)
+        except rospy.ROSException:
+            # 容错降级: 若 service 尚未就绪或不可用，尝试通过旧 Topic 机制
+            if self._debug_query_pub:
+                self._debug_event.clear()
+                self._debug_query_pub.publish(RosString(data=query_str))
+                return self._wait_debug_result(timeout)
+            return {"status": "error", "message": "Diagnose service unavailable"}
+        except Exception as e:
+            return {"status": "error", "message": f"Diagnose call failed: {e}"}
+
     def diagnose_edge(self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float, timeout: float = 1.0) -> Dict[str, Any]:
         """向 C++ 节点请求两踏面方块的权威拓扑邻边关系与物理原因诊断"""
-        if not self._debug_query_pub:
-            return {"status": "error", "message": "ROS bridge publisher not ready"}
-        self._debug_event.clear()
         query_str = json.dumps({"x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2})
-        self._debug_query_pub.publish(RosString(data=query_str))
-        return self._wait_debug_result(timeout)
+        return self._call_diagnose_service(query_str, timeout)
 
     def diagnose_node(self, x: float, y: float, z: float, timeout: float = 1.0) -> Dict[str, Any]:
         """向 C++ 节点请求单个踏面方块的权威通行状态与禁行原因诊断"""
-        if not self._debug_query_pub:
-            return {"status": "error", "message": "ROS bridge publisher not ready"}
-        self._debug_event.clear()
         query_str = json.dumps({"mode": "node", "x1": x, "y1": y, "z1": z})
-        self._debug_query_pub.publish(RosString(data=query_str))
-        return self._wait_debug_result(timeout)
+        return self._call_diagnose_service(query_str, timeout)
 
     def _wait_debug_result(self, timeout: float) -> Dict[str, Any]:
-        """等待 C++ 节点在 /elevation_debug_result 上的权威诊断回包"""
+        """等待 C++ 节点在 /elevation_debug_result 上的权威诊断回包 (Topic 降级备用)"""
         if self._debug_event.wait(timeout=timeout):
             with self._lock:
                 try:
@@ -1075,16 +1296,15 @@ class ElevationRosBridge:
         return {"status": "timeout", "message": "C++ planner node did not respond in time"}
 
     def get_live_state(self) -> Dict[str, Any]:
-        """获取当前实时状态快照"""
+        """获取当前高频轻量实时状态快照 (静态大地图通过 get_static_graph 按需拉取)"""
         with self._lock:
             return {
                 "robot_pose": dict(self.robot_pose),
                 "global_path": list(self.global_path),
                 "local_path": list(self.local_path),
+                "collision_node": list(self.collision_node) if self.collision_node else None,
                 "path_version": self.path_version,
-                "graph_nodes": list(self.graph_nodes),
                 "graph_nodes_version": self.graph_nodes_version,
-                "graph_edges": list(self.graph_edges),
                 "graph_edges_version": self.graph_edges_version,
                 "corridor_nodes": list(self.corridor_nodes),
                 "corridor_lines": list(self.corridor_lines),
@@ -1101,6 +1321,16 @@ class ElevationRosBridge:
                 "dynamic_nodes_version": self.dynamic_nodes_version,
                 "rebound_arrows": list(self.rebound_arrows),
                 "rebound_arrows_version": self.rebound_arrows_version
+            }
+
+    def get_static_graph(self) -> Dict[str, Any]:
+        """获取全量静态 3D 流形拓扑图 (仅供 HTTP 接口按需拉取，避免高频锁竞争)"""
+        with self._lock:
+            return {
+                "graph_nodes": list(self.graph_nodes),
+                "graph_nodes_version": self.graph_nodes_version,
+                "graph_edges": list(self.graph_edges),
+                "graph_edges_version": self.graph_edges_version
             }
 
 

@@ -128,9 +128,12 @@ export class GraphVisualizer {
         const travNodes = [];
         const blockNodes = [];
 
-        const colorOk = new THREE.Color(0x00e676);   // 可通行 (绿)
-        const colorWarn = new THREE.Color(0xffb300); // 复杂台阶 (橙黄)
-        const colorBlock = new THREE.Color(0xf44336);// 禁行/低净空 (红)
+        const colorOk = new THREE.Color(0x00e676);   // 自由区 (zone=0, 绿)
+        const colorWarn = new THREE.Color(0xffb300); // (旧格式回退用) 复杂台阶 (橙黄)
+        const colorBlock = new THREE.Color(0xf44336);// 障碍禁行 (zone=3, 红)
+        const colorRing = new THREE.Color(0xfb8c00); // 机体硬禁行环 (zone=2, 橙, 不可入)
+        const costNear = new THREE.Color(0x8e24aa);  // 软代价带内侧 (深紫, 代价高)
+        const costFar = new THREE.Color(0xd1c4e9);   // 软代价带外侧 (淡紫, 代价低)
 
         let minX = Infinity, maxX = -Infinity;
         let minY = Infinity, maxY = -Infinity;
@@ -147,10 +150,24 @@ export class GraphVisualizer {
             if (pz < minZ) minZ = pz; if (pz > maxZ) maxZ = pz;
 
             const trav = (n[3] !== undefined) ? Math.max(0, Math.min(1, n[3])) : 0;
-            const isBlocked = (trav >= 0.8);
+            const zone = (n.length >= 5 && Number.isFinite(n[4])) ? n[4] : null;
+            const isBlocked = (zone !== null) ? (zone >= 2) : (trav >= 0.8);
 
             const c = new THREE.Color();
-            if (isBlocked) {
+            if (zone !== null) {
+                // 新格式: 按 CostZone 三档显式配色 (与动态节点渲染器同一色板)
+                if (zone >= 3) {
+                    c.copy(colorBlock);
+                } else if (zone === 2) {
+                    c.copy(colorRing);
+                } else if (zone === 1) {
+                    // 软代价带: trav 0.8→0.05 映射 深紫→淡紫 渐变
+                    const t = Math.max(0, Math.min(1, (trav - 0.05) / 0.75));
+                    c.lerpColors(costNear, costFar, t);
+                } else {
+                    c.copy(colorOk);
+                }
+            } else if (isBlocked) {
                 c.copy(colorBlock);
             } else if (trav >= 0.3) {
                 c.lerpColors(colorWarn, colorBlock, (trav - 0.3) / 0.5);
@@ -165,6 +182,7 @@ export class GraphVisualizer {
                 z: n[2],       // 真实踏面高度 (供 A* 规划与高度差计算)
                 renderZ: pz,   // 3D 渲染高度
                 traversability: trav,
+                zone: zone,
                 isBlocked: isBlocked,
                 color: c
             };
@@ -202,7 +220,7 @@ export class GraphVisualizer {
             this.scene.add(this.traversableNodesObject);
         }
 
-        // 2. 创建阻挡/禁行水平踏面矩阵 (亮红)
+        // 2. 创建阻挡水平踏面矩阵 (逐实例配色: 障碍禁行红 / 机体硬禁行环橙)
         if (blockNodes.length > 0) {
             const blockCount = blockNodes.length;
             const blockMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, transparent: true, opacity: 0.85, depthWrite: true });
@@ -236,7 +254,7 @@ export class GraphVisualizer {
             this.hasAdjustedView = true;
         }
 
-        console.log(`[GraphVisualizer] 渲染 3D 踏面: 可通行 ${travNodes.length} 个, 禁行 ${blockNodes.length} 个`);
+        console.log(`[GraphVisualizer] 渲染 3D 踏面: 可通行 ${travNodes.length} 个, 禁行/机体环 ${blockNodes.length} 个`);
     }
 
     updateEdges(edges) {
@@ -449,6 +467,71 @@ export class GraphVisualizer {
             this.scene.remove(this.debugLinkLine);
             this.debugLinkLine = null;
         }
+    }
+
+    /**
+     * 根据输入文本 (支持 "x,y", "x,y,z" 浮点坐标或 "node_id" 数字) 在全图踏面中检索匹配方块
+     * @param {string|number} query
+     * @returns {Object|null} 匹配到的踏面节点对象 {id, x, y, z, renderZ, ...}
+     */
+    findNodeByCoordOrId(query) {
+        if (!this.allNodeList || this.allNodeList.length === 0) return null;
+        if (query === null || query === undefined) return null;
+
+        const str = String(query).trim();
+        if (!str) return null;
+
+        // 1. 若为纯整数 (Node ID)
+        if (/^\d+$/.test(str)) {
+            const targetId = parseInt(str, 10);
+            if (targetId >= 0 && targetId < this.allNodeList.length) {
+                const direct = this.allNodeList[targetId];
+                if (direct && direct.id === targetId) return direct;
+            }
+            const found = this.allNodeList.find(n => n.id === targetId);
+            if (found) return found;
+        }
+
+        // 2. 坐标解析 (提取所有浮点数，支持正负数)
+        const matches = str.match(/[-+]?[0-9]*\.?[0-9]+/g);
+        if (matches && matches.length >= 2) {
+            const qx = parseFloat(matches[0]);
+            const qy = parseFloat(matches[1]);
+            const qz = matches.length >= 3 ? parseFloat(matches[2]) : null;
+
+            let bestNode = null;
+            let bestScore = Infinity;
+
+            for (let i = 0; i < this.allNodeList.length; i++) {
+                const n = this.allNodeList[i];
+                const dxy2 = (n.x - qx) ** 2 + (n.y - qy) ** 2;
+                if (dxy2 > 0.8 * 0.8) continue; // 仅在 0.8m 水平邻域检索
+
+                let score = dxy2;
+                if (qz !== null) {
+                    const dz = Math.abs(n.z - qz);
+                    score += dz * 4.0; // 优先匹配同高程层
+                }
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestNode = n;
+                }
+            }
+            if (bestNode) return bestNode;
+        }
+
+        return null;
+    }
+
+    /**
+     * 将相机视角平滑移至指定踏面方块并居中对准
+     */
+    focusOnNode(node) {
+        if (!node || !this.controls || !this.camera) return;
+        const rz = node.renderZ !== undefined ? node.renderZ : node.z;
+        this.controls.target.set(node.x, node.y, rz);
+        this.camera.position.set(node.x - 1.5, node.y - 1.5, rz + 1.8);
+        this.controls.update();
     }
 
     setTraversableVisible(visible) {

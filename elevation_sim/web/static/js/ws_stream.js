@@ -51,11 +51,46 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
         }));
     }
 
+    let currentGraphNodesVersion = -1;
+    let currentGraphEdgesVersion = -1;
+    let isFetchingStaticGraph = false;
+
+    async function fetchStaticGraph() {
+        if (isFetchingStaticGraph || !graphVisualizer) return;
+        isFetchingStaticGraph = true;
+        try {
+            console.log("[WsStream] 正在通过 HTTP 一次性请求静态 3D 流形图 (/api/map/static_graph)...");
+            const res = await fetch('/api/map/static_graph');
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data.graph_nodes) {
+                console.log(`[WsStream] 静态 3D 流形节点加载完成: ${data.graph_nodes.length} 个 (v=${data.graph_nodes_version})`);
+                graphVisualizer.updateNodes(data.graph_nodes);
+                currentGraphNodesVersion = data.graph_nodes_version;
+            }
+            if (data.graph_edges) {
+                console.log(`[WsStream] 静态 3D 流形步态边加载完成: ${data.graph_edges.length} 条 (v=${data.graph_edges_version})`);
+                graphVisualizer.updateEdges(data.graph_edges);
+                currentGraphEdgesVersion = data.graph_edges_version;
+            }
+        } catch (e) {
+            console.error("[WsStream] 请求静态 3D 流形图失败:", e);
+        } finally {
+            isFetchingStaticGraph = false;
+        }
+    }
+
+    // 页面初次载入时一次性拉取静态图
+    fetchStaticGraph();
+
     // 处理接收到的增量帧
     function handleLiveFrame(frame) {
         // 1. 机器人位姿与路径更新
         if (frame.robot_pose && robotTracker) {
             robotTracker.updatePose(frame.robot_pose);
+        }
+        if (robotTracker && robotTracker.updateCollisionNode) {
+            robotTracker.updateCollisionNode(frame.collision_node);
         }
         if (frame.global_path && robotTracker) {
             robotTracker.updatePath(frame.global_path);
@@ -67,15 +102,12 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             robotTracker.updateLocalAStarPath(frame.local_astar_path);
         }
 
-        // 2. 3D 流形拓扑图更新 (踏面节点与连通边)
+        // 2. 3D 流形拓扑图版本感知与按需更新 (仅版本号变更时通过 HTTP 重载 1 次)
         if (graphVisualizer) {
-            if (frame.graph_nodes) {
-                console.log(`[WsStream] 收到 3D 流形节点: ${frame.graph_nodes.length} 个`);
-                graphVisualizer.updateNodes(frame.graph_nodes);
-            }
-            if (frame.graph_edges) {
-                console.log(`[WsStream] 收到 3D 流形步态边: ${frame.graph_edges.length} 条`);
-                graphVisualizer.updateEdges(frame.graph_edges);
+            const nv = frame.graph_nodes_version !== undefined ? frame.graph_nodes_version : -1;
+            const ev = frame.graph_edges_version !== undefined ? frame.graph_edges_version : -1;
+            if ((nv > 0 && nv !== currentGraphNodesVersion) || (ev > 0 && ev !== currentGraphEdgesVersion)) {
+                fetchStaticGraph();
             }
         }
 

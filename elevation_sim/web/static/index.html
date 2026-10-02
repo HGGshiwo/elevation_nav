@@ -123,7 +123,7 @@
             <label><input type="checkbox" id="show-preblocked" checked> 禁行(红)</label>
             <label><input type="checkbox" id="show-traversable" checked> 可通行(绿)</label>
             <label><input type="checkbox" id="show-injected-obstacles" checked> 注入障碍(红)</label>
-            <label><input type="checkbox" id="show-dynamic-nodes" checked> 动态封锁点(红/橙)</label>
+            <label><input type="checkbox" id="show-dynamic-nodes" checked> 动态代价层</label>
             <label><input type="checkbox" id="show-rebound" checked> 排斥向量(红/绿)</label>
             <label><input type="checkbox" id="show-emergency-stop"> 紧急制动探针</label>
             <label><input type="checkbox" id="show-robot" checked> 狗定位(蓝)</label>
@@ -131,6 +131,13 @@
             <label><input type="checkbox" id="show-local-path" checked> 局部规划(黄)</label>
             <label><input type="checkbox" id="show-sfc-debug"> 调试可通行走廊</label>
             <label><input type="checkbox" id="follow-robot"> 跟随视角</label>
+        </div>
+        <div class="row" style="display: flex; gap: 12px; align-items: center; font-size: 12px; color: #bbb;">
+            <span>代价三区图例:</span>
+            <span style="color:#f44336;">■ 障碍禁行 (zone=3)</span>
+            <span style="color:#fb8c00;">■ 机体硬禁行环 (zone=2, 不可入)</span>
+            <span style="color:#8e24aa;">■ 软代价带 (zone=1, 紫=近墙)</span>
+            <span style="color:#00e676;">■ 自由区 (zone=0)</span>
         </div>
         <div style="display: flex; gap: 8px; margin-top: 8px;">
             <button id="btn-cancel-goal" class="btn-sync btn-danger" style="margin-top:0; flex:1;">取消导航目标</button>
@@ -149,8 +156,14 @@
             点击下方路径点/3D小球：<span style="color:#ffd600; font-weight:bold;">原始点与优化点同步高亮为亮黄色</span>，并以黄色虚线直观配对；浅紫为合规物理点，红色为违约。
         </div>
 
+        <!-- 快速搜索走廊点 -->
+        <div style="display: flex; gap: 4px; margin-bottom: 8px;">
+            <input id="sfc-search-input" type="text" placeholder="输入 X,Y,Z / root_id / 序号" style="flex: 1; min-width: 0; background: #1e1e1e; border: 1px solid #555; color: #fff; padding: 3px 6px; font-size: 11px; border-radius: 3px;">
+            <button id="btn-sfc-search" style="background: #009688; color: #fff; border: none; padding: 3px 8px; font-size: 11px; border-radius: 3px; cursor: pointer; white-space: nowrap;">查找聚焦</button>
+        </div>
+
         <div style="font-weight: bold; color: #00e5ff; font-size: 12px; margin-bottom: 4px;">局部规划路径点列表:</div>
-        <div id="sfc-points-list" style="max-height: 200px; overflow-y: auto; margin-bottom: 10px; padding-right: 4px;">
+        <div id="sfc-points-list" style="max-height: 180px; overflow-y: auto; margin-bottom: 10px; padding-right: 4px;">
             <div style="color: #888; font-size: 12px; text-align: center; padding: 20px 0;">等待局部规划走廊数据...</div>
         </div>
 
@@ -199,6 +212,17 @@
     <div id="debug-panel">
         <div class="debug-title">3D 方块与临边调试诊断</div>
         <div style="font-size: 11px; color: #aaa; margin-bottom: 8px;">提示：依次点击方块 A 与方块 B，可直接诊断两者为何未能建立连通边</div>
+
+        <!-- 快速查找定位方块 -->
+        <div style="background: rgba(255,255,255,0.06); padding: 6px 8px; border-radius: 4px; margin-bottom: 10px; border: 1px solid #444;">
+            <div style="font-size: 11px; color: #00e5ff; font-weight: bold; margin-bottom: 4px;">🔍 定位方块 (输入 X,Y,Z 或 Node ID):</div>
+            <div style="display: flex; gap: 4px; margin-bottom: 4px;">
+                <input id="debug-search-input" type="text" placeholder="例: -8.24, -2.57, 0.04 或 ID" style="flex: 1; min-width: 0; background: #1e1e1e; border: 1px solid #555; color: #fff; padding: 4px 6px; font-size: 11px; border-radius: 3px;">
+                <button id="btn-debug-locate-a" style="background: #0288d1; color: #fff; border: none; padding: 4px 8px; font-size: 11px; border-radius: 3px; cursor: pointer; white-space: nowrap;">设为A并聚焦</button>
+                <button id="btn-debug-locate-b" style="background: #f57c00; color: #fff; border: none; padding: 4px 8px; font-size: 11px; border-radius: 3px; cursor: pointer; white-space: nowrap;">设为B</button>
+            </div>
+            <div id="debug-search-msg" style="font-size: 10px; color: #888;">支持输入 x,y 或 x,y,z 或节点ID后回车</div>
+        </div>
 
         <div style="font-weight: bold; color: #00e5ff; font-size: 13px; margin: 4px 0;">方块 A (基准点)</div>
         <div class="row"><span>位置坐标 (X, Y):</span> <span id="debug-node-a-xy">-</span></div>

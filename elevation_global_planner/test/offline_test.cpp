@@ -236,6 +236,23 @@ int main(int argc, char ** argv)
   printf("ON : nodes=%zu edges=%zu hard_blocked=%zu soft_inflated=%zu\n", graph_on.numNodes(), graph_on.numEdges(), hard_on, soft_on);
   printf("newly hard-blocked by body model: %zu\n", newly_blocked);
   {
+    // CostZone 直方图 (0=自由 1=软代价 2=机体硬环 3=禁行) + 合成不变量校验
+    size_t zone_hist[4] = {0, 0, 0, 0};
+    size_t invariant_violations = 0;
+    for (size_t i = 0; i < graph_on.numNodes(); ++i) {
+      const auto & nd = graph_on.getNode(static_cast<uint32_t>(i));
+      zone_hist[nd.cost_zone]++;
+      const bool zone_hard = nd.cost_zone >= static_cast<uint8_t>(elevation_planner::CostZone::BODY_HARD);
+      const bool trav_hard = nd.traversability >= 0.95f;
+      if (zone_hard != trav_hard) invariant_violations++;
+    }
+    printf("ON : zone histogram free=%zu soft=%zu body_hard=%zu forbidden=%zu\n",
+           zone_hist[0], zone_hist[1], zone_hist[2], zone_hist[3]);
+    if (invariant_violations > 0)
+      printf("WARN: %zu nodes violate zone<->trav invariant (zone>=BODY_HARD <=> trav>=0.95)\n",
+             invariant_violations);
+  }
+  {
     std::map<int, size_t> buckets;
     for (uint32_t id : newly_blocked_ids)
       buckets[static_cast<int>(std::floor(graph_off.getNode(id).z / 0.5))]++;

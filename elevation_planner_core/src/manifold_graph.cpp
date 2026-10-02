@@ -223,6 +223,8 @@ void ManifoldGraph::initializeFromGridMap(const grid_map::GridMap & map, int num
         node.y = static_cast<float>(p(1));
         node.z = z;
         node.traversability = trav;
+        node.static_trav = trav;      // 静态层基值 (grid_map 建图路径)
+        node.static_headroom = 2.0f;  // 静态层净空
         node.headroom = 2.0f;
         addNode(node);
       }
@@ -246,7 +248,9 @@ void ManifoldGraph::initializeFromGridMap(const grid_map::GridMap & map, int num
           float dz = std::abs(u.z - v.z);
           if (dz > 0.25f) continue;
           float dxy = std::hypot(u.x - v.x, u.y - v.y);
-          float cost = std::sqrt(dxy * dxy + dz * dz) + 0.5f * (u.traversability + v.traversability);
+          // 静态层边代价: 3D 距离 + 软代价 (两端通行性均值 × weight_traversability 3.0),
+        // 与内核动态重算分支同口径 —— 节点被融合叠加前后代价连续无跳变
+        float cost = std::sqrt(dxy * dxy + dz * dz) + 1.5f * (u.traversability + v.traversability);
           addEdge(i, nid, cost);
         }
       }

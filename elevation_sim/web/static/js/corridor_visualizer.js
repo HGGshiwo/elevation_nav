@@ -33,9 +33,9 @@ export class CorridorVisualizer {
             depthWrite: false
         });
 
-        // 管道侧壁边界线材质 (亮青色高反差荧光线)
+        // 管道侧壁边界线材质 (深橙色高反差荧光线, 与青蓝色全局路径区分)
         this.boundaryLineMaterial = new THREE.LineBasicMaterial({
-            color: 0x00f5ff,
+            color: 0xff6d00,
             linewidth: 2.5,
             transparent: true,
             opacity: 0.95

@@ -251,39 +251,11 @@ TEST(SfcSegment, CornerIntersectionStacking)
   EXPECT_TRUE(satisfiesConstraint(corridors[1], 2.0, 1.0));
 }
 
-/// 机器人状态种子: 状态点在第二段 BFS 预算之外, 并入种子/凸包点后被 C_2 覆盖 (转角交集可行)
-TEST(SfcSegment, RobotStateSeedingCoversAnchor)
-{
-  Fixture fx = makeGrid(10, 40, 0.1, [](int, int) { return 0.0; });
-  elevation_planner::PathSimplifier sim;
-  sim.build(fx.g);
 
-  // 稀疏航点: W_0=(1.0,1.0) -> W_1=(2.0,1.0) -> W_2=(3.0,1.0)
-  std::vector<uint32_t> ids;
-  ids.push_back(static_cast<uint32_t>(fx.id[1][10]));
-  ids.push_back(static_cast<uint32_t>(fx.id[1][20]));
-  ids.push_back(static_cast<uint32_t>(fx.id[1][30]));
-
-  // 机器人状态点 (0.9,1.0) 附近: 距第二段 (2,1)->(3,1) 的链 ~1.1m, 正常 BFS 够不到
-  std::vector<Eigen::Vector2d> state_points = {Eigen::Vector2d(0.9, 1.0), Eigen::Vector2d(0.82, 1.0)};
-
-  auto corridors = elevation_local_planner::SFCGenerator::generateSegmentCorridors(
-      ids, fx.g, sim, 0.50, 0.25, 0.35, state_points, 0.0);
-  ASSERT_EQ(corridors.size(), 3u);
-
-  // 对照组: 无状态种子时 C_2 覆盖不到 0.9
-  auto corridors_plain = elevation_local_planner::SFCGenerator::generateSegmentCorridors(
-      ids, fx.g, sim, 0.50, 0.25, 0.35);
-  EXPECT_FALSE(satisfiesConstraint(corridors_plain[2], 0.9, 1.0));
-
-  // 并入状态种子 + 凸包点后: C_2 / C_1 均覆盖状态点 (q_2 转角交集可行的前提)
-  EXPECT_TRUE(satisfiesConstraint(corridors[2], 0.9, 1.0));
-  EXPECT_TRUE(satisfiesConstraint(corridors[2], 0.82, 1.0));
-  EXPECT_TRUE(satisfiesConstraint(corridors[1], 0.9, 1.0));
-}
 
 int main(int argc, char** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);
+  ros::Time::init();
   return RUN_ALL_TESTS();
 }

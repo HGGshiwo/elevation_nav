@@ -2,6 +2,7 @@
 
 #include "manifold_graph.hpp"
 #include <queue>
+#include <string>
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -55,23 +56,35 @@ struct ManifoldAstarParams
  * @param goal_id  目标节点 ID
  * @param prm      搜索参数
  * @param[out] out_ids start→reached 的节点 ID 序列 (含两端, 顺序 start→goal)
+ * @param[out] fail_reason 可选失败原因 (成功时不清空) —— 预算耗尽/开集耗尽可区分
  * @return 是否到达目标 (精确匹配或容差早退)
  */
 inline bool manifoldAstarSearch(const ManifoldGraph& graph,
                                 uint32_t start_id,
                                 uint32_t goal_id,
                                 const ManifoldAstarParams& prm,
-                                std::vector<uint32_t>& out_ids)
+                                std::vector<uint32_t>& out_ids,
+                                std::string* fail_reason = nullptr,
+                                const std::vector<uint32_t>* prev_path_ids = nullptr,
+                                bool search_backward = false)
 {
   out_ids.clear();
   const size_t n = graph.numNodes();
-  if (n == 0 || start_id >= n || goal_id >= n) return false;
+  if (n == 0 || start_id >= n || goal_id >= n)
+  {
+    if (fail_reason) *fail_reason = "invalid node id (start/goal out of range)";
+    return false;
+  }
 
   if (start_id == goal_id)
   {
     out_ids.push_back(start_id);
     return true;
   }
+
+  // 若开启反向搜索 (从静态目标 Goal 反向搜索至动态起点 Start)，交换源与目标
+  const uint32_t src_id = search_backward ? goal_id : start_id;
+  const uint32_t dst_id = search_backward ? start_id : goal_id;
 
   const double INF = std::numeric_limits<double>::max();
   const uint32_t INVALID = std::numeric_limits<uint32_t>::max();
@@ -80,9 +93,20 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
   std::vector<uint32_t> came_from(static_cast<size_t>(n), INVALID);
   std::vector<uint8_t> closed(static_cast<size_t>(n), 0);
 
+  // 上一帧历史路径节点标记 (用于路径惯性折让与彻底消除路径震荡)
+  std::vector<uint8_t> on_prev_path;
+  if (prev_path_ids && !prev_path_ids->empty())
+  {
+    on_prev_path.assign(n, 0);
+    for (uint32_t pid : *prev_path_ids)
+    {
+      if (pid < n) on_prev_path[pid] = 1;
+    }
+  }
+
   auto heuristic = [&](uint32_t from_id) {
     const GraphNode& a = graph.getNode(from_id);
-    const GraphNode& b = graph.getNode(goal_id);
+    const GraphNode& b = graph.getNode(dst_id);
     const double dx = static_cast<double>(a.x) - b.x;
     const double dy = static_cast<double>(a.y) - b.y;
     const double dz = std::abs(static_cast<double>(a.z) - b.z);
@@ -93,13 +117,13 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
   typedef std::pair<double, uint32_t> QEntry;
   std::priority_queue<QEntry, std::vector<QEntry>, std::greater<QEntry>> open;
 
-  g[start_id] = 0.0;
-  open.push({heuristic(start_id), start_id});
+  g[src_id] = 0.0;
+  open.push({heuristic(src_id), src_id});
 
-  const GraphNode& start_node = graph.getNode(start_id);
-  const GraphNode& goal_node = graph.getNode(goal_id);
+  const GraphNode& src_node = graph.getNode(src_id);
+  const GraphNode& dst_node = graph.getNode(dst_id);
   bool reached = false;
-  uint32_t reached_id = goal_id;
+  uint32_t reached_id = dst_id;
   int expansions = 0;
 
   while (!open.empty())
@@ -118,13 +142,14 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
       continue;
     }
 
-    // 局部子图预算: 弹出节点数超限判定范围内无解 (阻断阻挡时的全图穷举)
     if (prm.max_expansions > 0 && ++expansions > prm.max_expansions)
     {
+      if (fail_reason) *fail_reason = "expansion budget exhausted (max_expansions=" +
+                                      std::to_string(prm.max_expansions) + ", subgraph too tight or obstacle too wide)";
       return false;
     }
 
-    if (curr == goal_id)
+    if (curr == dst_id)
     {
       reached = true;
       reached_id = curr;
@@ -132,9 +157,10 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
     }
 
     const GraphNode& curr_node = graph.getNode(curr);
+    const bool curr_dyn = curr_node.dynamic_trav > 0.f;
     if (prm.goal_tol_xy > 0.0 &&
-        std::hypot(curr_node.x - goal_node.x, curr_node.y - goal_node.y) < prm.goal_tol_xy &&
-        std::abs(curr_node.z - goal_node.z) < prm.goal_tol_z)
+        std::hypot(curr_node.x - dst_node.x, curr_node.y - dst_node.y) < prm.goal_tol_xy &&
+        std::abs(curr_node.z - dst_node.z) < prm.goal_tol_z)
     {
       reached = true;
       reached_id = curr;
@@ -151,14 +177,11 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
       if (nid >= n) continue;
       const GraphNode& nv = graph.getNode(nid);
 
-      // 禁行节点不可落足。先验图上禁行节点在建图期即无边, 此检查天然不触发;
-      // 融合引擎原位刷新属性后边结构仍在, 动态障碍靠此检查排除
-      if (nv.traversability >= 0.95f) continue;
+      if (nv.hardBlocked()) continue;
 
-      // 局部子图空间边界: 距起点 XY 超出半径的邻居不扩展 (动态避障限定在机器人邻域内)
       if (prm.max_xy_radius > 0.0 &&
-          std::hypot(static_cast<double>(nv.x) - start_node.x,
-                     static_cast<double>(nv.y) - start_node.y) > prm.max_xy_radius)
+          std::hypot(static_cast<double>(nv.x) - src_node.x,
+                     static_cast<double>(nv.y) - src_node.y) > prm.max_xy_radius)
       {
         continue;
       }
@@ -175,13 +198,20 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
       const double d3 = std::sqrt(dxy * dxy + dz * dz);
 
       double step_cost;
-      if (prm.use_edge_cost)
+      if (prm.use_edge_cost && !curr_dyn && nv.dynamic_trav <= 0.f)
       {
         step_cost = es[i].cost;
       }
       else
       {
-        step_cost = d3 + prm.weight_z * dz + prm.weight_traversability * nv.traversability;
+        step_cost = d3 + prm.weight_z * dz
+                  + 0.5 * prm.weight_traversability * (curr_node.traversability + nv.traversability);
+      }
+
+      // 上一帧历史路径惯性折扣 (0.85): 抑制等价分支间的随机震荡跳变
+      if (!on_prev_path.empty() && on_prev_path[nid])
+      {
+        step_cost *= 0.85;
       }
 
       if (prm.turn_weight > 0.0 && parent != INVALID)
@@ -211,14 +241,27 @@ inline bool manifoldAstarSearch(const ManifoldGraph& graph,
     }
   }
 
-  if (!reached) return false;
+  if (!reached)
+  {
+    if (fail_reason) *fail_reason = "open set exhausted (no path within subgraph radius " +
+                                    std::to_string(prm.max_xy_radius) + "m)";
+    return false;
+  }
 
+  // 路径重构: 保证输出总是 start -> ... -> goal 顺序
   for (uint32_t c = reached_id; c != INVALID; c = came_from[c])
   {
     out_ids.push_back(c);
-    if (c == start_id) break;
+    if (c == src_id) break;
   }
-  std::reverse(out_ids.begin(), out_ids.end());
+
+  if (!search_backward)
+  {
+    // 正向搜索: 回溯是从 goal 到 start，需反转为 start -> goal
+    std::reverse(out_ids.begin(), out_ids.end());
+  }
+  // 反向搜索: 回溯是从 reached (start_id) 到 goal_id，天然就是 start -> goal 顺序，无需反转!
+
   return true;
 }
 

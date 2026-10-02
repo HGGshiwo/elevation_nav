@@ -49,11 +49,6 @@ public:
     max_acc_ = max_acc;
   }
 
-  /**
-   * @brief [DBG] 调试日志开关 (默认开启; 排查结束后可调用 setDebugVerbose(false) 关闭)
-   */
-  void setDebugVerbose(bool verbose) { debug_verbose_ = verbose; }
-
   /// 占据查询回调: (x, y, z) 处机体周围本层带内是否存在禁行节点;
   /// 命中时输出最近禁行节点坐标 (障碍面参考点), 供 rebound 定向排斥使用。
   /// 图外/悬空 (无本层节点) 返回 false —— 不装弹簧, 交走廊 ALM 项兜底
@@ -66,6 +61,15 @@ public:
   {
     lambda_rebound_ = lambda_rebound;
     rebound_clearance_ = clearance;
+  }
+
+  /// 动力学锚点软约束: 软拉首自由控制点 q2 靠近 机器人位姿 + dt·当前速度 (起步运动连续性)。
+  /// 硬约束是 q2 ∈ C1 ∩ C2 (走廊堆叠); 锚点出走廊时硬约束赢, 软项自然妥协 —— 无拒绝风险
+  void setDynamicsAnchor(const Eigen::Vector2d& anchor, double lambda_dyn)
+  {
+    dyn_anchor_ = anchor;
+    has_dyn_anchor_ = true;
+    lambda_dyn_ = lambda_dyn;
   }
 
   /// rebound 约束结构 (可视化/诊断用): base_point=障碍面参考点, direction=排斥单位向量 (零向量=未激活)
@@ -158,7 +162,6 @@ public:
     rebound_.assign(num_ctrl_pts_, ReboundConstraint());
 
     // ===== [DBG-1] 初始化快照: 初始穿墙量与微型/退化走廊检测 (区分数据问题 vs 优化发散) =====
-    if (debug_verbose_)
     {
       double min_area = std::numeric_limits<double>::max();
       int min_area_idx = -1;
@@ -182,14 +185,14 @@ public:
             max_init_viol_idx = i;
           }
           if (v_init > 1.0e-6)
-            ROS_INFO("[ScanBspline][DBG] corridor %d: initial violation %.4fm (waypoint outside its own corridor, data issue)", i, v_init);
+            ROS_DEBUG("[ScanBspline][DBG] corridor %d: initial violation %.4fm (waypoint outside its own corridor, data issue)", i, v_init);
         }
         if (area < 0.02)
-          ROS_INFO("[ScanBspline][DBG] corridor %d: tiny corridor area=%.4fm^2 verts=%zu (degenerate fallback square?)", i, area, cst.vertices.size());
+          ROS_DEBUG("[ScanBspline][DBG] corridor %d: tiny corridor area=%.4fm^2 verts=%zu (degenerate fallback square?)", i, area, cst.vertices.size());
       }
-      ROS_INFO("[ScanBspline][DBG] init: waypoints=%d ctrl=%d dt=%.3f free=[%d,%d] lam_cor=%.0f lam_alm=%.0f | min_area=%.4f@cor%d max_init_viol=%.4f@cor%d",
-               num_waypoints_, num_ctrl_pts_, dt_, free_start_idx_, free_end_idx_,
-               lambda2_corridor_, lambda_alm_, min_area, min_area_idx, max_init_viol, max_init_viol_idx);
+      ROS_DEBUG("[ScanBspline][DBG] init: waypoints=%d ctrl=%d dt=%.3f free=[%d,%d] lam_cor=%.0f lam_alm=%.0f | min_area=%.4f@cor%d max_init_viol=%.4f@cor%d",
+                num_waypoints_, num_ctrl_pts_, dt_, free_start_idx_, free_end_idx_,
+                lambda2_corridor_, lambda_alm_, min_area, min_area_idx, max_init_viol, max_init_viol_idx);
     }
 
     std::vector<double> x(num_free * 2);
@@ -251,12 +254,8 @@ public:
       }
 
       // [DBG] 以写回后的 x 为准刷新一次代价分解 (线搜索失败时 lbfgs 内部缓存的代价属于失败试探点)
-      double fx_final = 0.0;
-      if (debug_verbose_)
-      {
-        std::vector<double> g_dbg(num_free * 2, 0.0);
-        fx_final = evaluateCostAndGrad(x.data(), g_dbg.data(), static_cast<int>(x.size()));
-      }
+      std::vector<double> g_dbg(num_free * 2, 0.0);
+      double fx_final = evaluateCostAndGrad(x.data(), g_dbg.data(), static_cast<int>(x.size()));
 
       // 全程控制点穿墙量检查: 走廊 i 严格直接约束自由控制点 q_{i+1}
       // 注: 从 i=1 开始检查，机器人当前起始点 q_1 属于不可移动的初始约束，不计入穿墙阻断
@@ -290,41 +289,35 @@ public:
       final_max_viol_q = max_viol_q;
 
       // [DBG] 记录违例历史, 拒绝时一并输出
-      if (debug_verbose_)
-      {
-        std::ostringstream oss;
-        oss << outer_iter << ':' << std::fixed << std::setprecision(4) << max_violation;
-        if (!dbg_viol_history_.empty()) dbg_viol_history_ += " -> ";
-        dbg_viol_history_ += oss.str();
-      }
+      std::ostringstream oss;
+      oss << outer_iter << ':' << std::fixed << std::setprecision(4) << max_violation;
+      if (!dbg_viol_history_.empty()) dbg_viol_history_ += " -> ";
+      dbg_viol_history_ += oss.str();
 
       // ===== [DBG-2] 外循环逐轮追踪: ret 码 / 代价分解 / 梯度范数 / 最坏违例走廊与乘子 =====
-      if (debug_verbose_)
+      double mu_worst = 0.0;
+      int j_worst = -1;
+      if (max_viol_idx >= 1 && max_viol_idx < static_cast<int>(corridors_.size()) &&
+          corridors_[max_viol_idx].constraint.A.rows() > 0)
       {
-        double mu_worst = 0.0;
-        int j_worst = -1;
-        if (max_viol_idx >= 1 && max_viol_idx < static_cast<int>(corridors_.size()) &&
-            corridors_[max_viol_idx].constraint.A.rows() > 0)
+        const auto& cst_dbg = corridors_[max_viol_idx].constraint;
+        Eigen::VectorXd d_dbg = cst_dbg.A * max_viol_q - cst_dbg.b;
+        double dv_worst = -1e18;
+        for (int j = 0; j < d_dbg.size(); ++j)
         {
-          const auto& cst_dbg = corridors_[max_viol_idx].constraint;
-          Eigen::VectorXd d_dbg = cst_dbg.A * max_viol_q - cst_dbg.b;
-          double dv_worst = -1e18;
-          for (int j = 0; j < d_dbg.size(); ++j)
+          if (d_dbg(j) > dv_worst)
           {
-            if (d_dbg(j) > dv_worst)
-            {
-              dv_worst = d_dbg(j);
-              j_worst = j;
-            }
+            dv_worst = d_dbg(j);
+            j_worst = j;
           }
-          if (j_worst >= 0 && max_viol_idx < static_cast<int>(multipliers_.size()))
-            mu_worst = multipliers_[max_viol_idx](j_worst);
         }
-        ROS_INFO("[ScanBspline][DBG] outer=%d ret=%s fx=%.3f [sm=%.2f feas=%.2f fit=%.2f cor=%.2f alm=%.2f reb=%.2f] gnorm=%.3f | viol=%.4f@cor%d(q%d,row%d) mu=%.1f lam=%.0f",
-                 outer_iter, lbfgsRetName(ret), fx_final,
-                 dbg_cost_smooth_, dbg_cost_feas_, dbg_cost_fitness_, dbg_cost_corridor_, dbg_cost_alm_, dbg_cost_rebound_, dbg_gnorm_,
-                 max_violation, max_viol_idx, max_viol_idx + 1, j_worst, mu_worst, cur_lambda_alm_);
+        if (j_worst >= 0 && max_viol_idx < static_cast<int>(multipliers_.size()))
+          mu_worst = multipliers_[max_viol_idx](j_worst);
       }
+      ROS_DEBUG("[ScanBspline][DBG] outer=%d ret=%s fx=%.3f [sm=%.2f feas=%.2f fit=%.2f cor=%.2f alm=%.2f reb=%.2f] gnorm=%.3f | viol=%.4f@cor%d(q%d,row%d) mu=%.1f lam=%.0f",
+                outer_iter, lbfgsRetName(ret), fx_final,
+                dbg_cost_smooth_, dbg_cost_feas_, dbg_cost_fitness_, dbg_cost_corridor_, dbg_cost_alm_, dbg_cost_rebound_, dbg_gnorm_,
+                max_violation, max_viol_idx, max_viol_idx + 1, j_worst, mu_worst, cur_lambda_alm_);
 
       // 若控制点穿墙量已满足 <= 0.0001m，则提前收敛退出
       // (rebound 刷新已移至本轮 L-BFGS 之前; 此处的控制点状态由规划器在 optimize 返回后
@@ -373,10 +366,7 @@ public:
     if (final_max_violation > max_allowable_violation)
     {
       // ===== [DBG-3] 拒绝法证报告: 违例行/乘子/初始状态/邻走廊包含性/法向力平衡 =====
-      if (debug_verbose_)
-      {
-        logFailureForensics(final_max_viol_idx, final_max_viol_q, final_max_violation, max_allowable_violation);
-      }
+      logFailureForensics(final_max_viol_idx, final_max_viol_q, final_max_violation, max_allowable_violation);
       ROS_WARN_THROTTLE(1.0,
           "[ScanBsplineOptimizer] Trajectory rejected: Control point q_%d at (x=%.3f, y=%.3f) in Corridor %d violates constraint by %.3fm (exceeds safety threshold %.3fm), lambda_alm=%.3f",
           final_max_viol_idx + 1, final_max_viol_q.x(), final_max_viol_q.y(), final_max_viol_idx,
@@ -476,7 +466,7 @@ private:
     }
 
     double cost_smooth = 0.0, cost_feas = 0.0, cost_fitness = 0.0;
-    double cost_corridor = 0.0, cost_alm = 0.0, cost_rebound = 0.0;
+    double cost_corridor = 0.0, cost_alm = 0.0, cost_rebound = 0.0, cost_dyn = 0.0;
 
     Eigen::Matrix2Xd grad_smooth = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_feas = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
@@ -484,6 +474,7 @@ private:
     Eigen::Matrix2Xd grad_corridor = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_alm = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
     Eigen::Matrix2Xd grad_rebound = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
+    Eigen::Matrix2Xd grad_dyn = Eigen::Matrix2Xd::Zero(2, num_ctrl_pts_);
 
     // 1. Jerk 加加速度平滑项
     calcSmoothnessCost(ctrl_pts_, cost_smooth, grad_smooth);
@@ -503,20 +494,30 @@ private:
     // 6. rebound 定向排斥项: 碰撞控制点沿 (base_point, direction) 弹离障碍至 clearance 之外
     calcReboundCost(ctrl_pts_, cost_rebound, grad_rebound);
 
+    // 7. 起步动力学锚点软项: 拉 q2 靠近 机器人位姿 + dt·当前速度 (运动连续性, 硬约束是走廊)
+    if (has_dyn_anchor_)
+    {
+      const Eigen::Vector2d dq = ctrl_pts_.col(2) - dyn_anchor_;
+      cost_dyn = lambda_dyn_ * dq.squaredNorm();
+      grad_dyn.col(2) = (2.0 * lambda_dyn_) * dq;
+    }
+
     // 线性合成总代价与总梯度
     double total_cost = lambda1_smooth_ * cost_smooth +
                         lambda3_feas_ * cost_feas +
                         lambda4_fitness_ * cost_fitness +
                         cost_corridor +
                         cost_alm +
-                        cost_rebound;
+                        cost_rebound +
+                        cost_dyn;
 
     Eigen::Matrix2Xd grad_all = lambda1_smooth_ * grad_smooth +
                                 lambda3_feas_ * grad_feas +
                                 lambda4_fitness_ * grad_fitness +
                                 grad_corridor +
                                 grad_alm +
-                                grad_rebound;
+                                grad_rebound +
+                                grad_dyn;
 
     for (int i = 0; i < num_free; ++i)
     {
@@ -852,7 +853,7 @@ private:
        << " corridor=" << proj_cor << " alm=" << proj_alm
        << " SUM=" << (proj_s + proj_f + proj_fit + proj_cor + proj_alm);
 
-    ROS_WARN_THROTTLE(1.0, "%s", os.str().c_str());
+    ROS_DEBUG_THROTTLE(1.0, "%s", os.str().c_str());
   }
 
 private:
@@ -884,9 +885,11 @@ private:
   double lambda_rebound_{0.0};                 ///< 排斥项权重 (0 = 功能关闭)
   double rebound_clearance_{0.17};             ///< 安全间距 (= body_hard_radius)
   int rebound_active_count_{0};                ///< 最近一次刷新时激活的约束数量 (诊断用)
+  Eigen::Vector2d dyn_anchor_{0.0, 0.0};       ///< 动力学锚点 (机器人位姿 + dt·当前速度)
+  bool has_dyn_anchor_{false};                 ///< 锚点有效性
+  double lambda_dyn_{10.0};                    ///< 锚点软项权重
 
   // ===== [DBG] 调试观测成员 =====
-  bool debug_verbose_{true};
   double dbg_cost_smooth_{0.0};
   double dbg_cost_feas_{0.0};
   double dbg_cost_fitness_{0.0};

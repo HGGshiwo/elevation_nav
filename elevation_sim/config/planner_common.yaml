@@ -5,7 +5,7 @@
 robot_length: 0.36             # 机身长 (m)
 robot_width: 0.26              # 机身宽 (m)
 dog_height: 0.45               # 机器狗站立垂直净空要求 (m)
-obstacle_safety_margin: 0.04   # 障碍物安全缓冲余量 (m)
+obstacle_safety_margin: 0.07   # 障碍物安全缓冲余量 (m)
 
 # 运动越障几何极限
 max_step_height: 0.25          # 最大单步步高 (m)
@@ -20,10 +20,14 @@ sor_std_mul: 4                 # SOR 标准差倍数
 sweep_penalty_weight: 1.0      # 机体扫掠区软代价权重
 
 # 派生碰撞半径 (若未显式指定 robot_width/robot_length 则以此默认值生效; 若指定则由节点自适应几何推导)
-body_hard_radius: 0.17         # = robot_width / 2 + obstacle_safety_margin
-footprint_radius: 0.26         # = hypot(robot_length/2, robot_width/2) + obstacle_safety_margin
-inflation_radius: 0.50         # 侧向软代价膨胀半径 (m): 硬半径外到此距离线性衰减软代价;
+body_hard_radius: 0.20         # = robot_width / 2 + obstacle_safety_margin, 机体硬禁行环半径
+footprint_radius: 0.29         # = hypot(robot_length/2, robot_width/2) + obstacle_safety_margin
+inflation_radius: 0.60         # 侧向软代价膨胀半径 (m): 硬半径外到此距离线性衰减软代价;
                                # 加宽后 A* 全程感知障碍距离, 走廊中线/拐角外绕 (原 0.26 时膨胀带仅 0.09m)
+body_hard_ring_enabled: true   # 机体硬禁行环开关: 距侧向墙体 < body_hard_radius 的节点划为
+                               # CostZone::BODY_HARD (trav=1.0), 全局/局部 A* 一律硬排除 ——
+                               # 宽度 < 2*body_hard_radius (约 0.34m) 的缝隙全局直接无解 (明式 abort)。
+                               # false 退回纯软代价语义 (章节十三行为)
 
 # 拓扑流形管道参数 (A* 规划结果扩展为拓扑管道，供局部规划器 TEB 内部规划)
 corridor_radius: 3.0           # 拓扑管道最大展开半宽 (m)，沿连通图向外膨胀至此半径，遇悬空/断崖/不可达位置自然停止

@@ -24,13 +24,13 @@ namespace elevation_planner
  *        traversability/headroom → 原位写回全局图 (GraphStore 中同一份)。
  *
  * 节点集合与 id 永不改变 (全局-局部 node_id 透传的前提), 点云只改属性:
- *  - 障碍脚下净空归零 / 侧向结构跨越攀爬包络 → traversability 封锁 (原位写 1.0/软代价);
- *  - 障碍离开观测范围 → 重算值回到先验值 → 恢复快照;
- *  - 局部规划器/绕障/走廊/LOS 直接读图节点, 动态障碍天然生效;
- *  - 全局规划器 A* 读的是自己持有的先验图副本, 不受影响 (结构纯先验不变)。
- *
- * 快照语义: 首次改写某节点时记录 {先验 traversability, headroom};
- * 换图 (全局图重建) 时旧快照作废清空; restoreMutations() 销毁时恢复。
+ *  - 分层叠加: 节点保存 static_trav/static_headroom/static_zone (建图静态层) 与
+ *    dynamic_trav/dynamic_headroom/dynamic_zone (融合动态层, 含禁行 1.0、
+ *    机体硬环 BODY_HARD 与膨胀 <=0.9); 合成规则见 GraphNode::synthesize():
+ *    zone 取严 (max), trav = 环/禁行 ? 1.0 : min(1.0, 静态+动态), headroom = min;
+ *  - 动态层每帧全量重算: 清理区 (上帧 ∪ 本帧 ROI 外扩膨胀半径) 清零后,
+ *    按当前观测全量重写 —— 无快照、无变化检测, 障碍移除随清理区天然复原;
+ *  - 局部规划器/绕障/走廊/LOS 直接读合成 traversability, 动态障碍天然生效。
  *
  * 线程约定: ingestCloud 由宿主的 ROS 订阅回调调用; processLatestCloud 由宿主的
  * 工作线程周期调用。属性写入与控制器线程的读取为对齐 4 字节 float 的良性竞争
@@ -69,9 +69,10 @@ public:
   /// 恢复所有被动态改写的节点属性 (引擎销毁/停止时调用)
   void restoreMutations();
 
-  /// 当前被动态改写属性的节点快照 [{x, y, z, traversability}] (供宿主实时可视化;
-  /// 封锁=1.0 红, 软代价 0~1 橙; 障碍离开后自动清空)。仅 worker 线程访问。
-  const std::vector<std::array<float, 4>> & getDynamicNodes() const { return dynamic_nodes_; }
+  /// 当前被动态改写属性的节点快照 [{x, y, z, traversability, zone}] (供宿主实时可视化;
+  /// zone = CostZone 枚举: FORBIDDEN 禁行 / BODY_HARD 机体硬环 / SOFT 软代价, 配合 trav
+  /// 供前端三档配色; 障碍离开后自动清空)。仅 worker 线程访问。
+  const std::vector<std::array<float, 5>> & getDynamicNodes() const { return dynamic_nodes_; }
 
 private:
   Params params_;
@@ -85,12 +86,18 @@ private:
   std::mutex aux_mutex_;
   sensor_msgs::PointCloud2::ConstPtr latest_aux_;
 
-  // 属性改写快照: node_id -> {先验 traversability, 先验 headroom}
-  std::unordered_map<uint32_t, std::pair<float, float>> touched_nodes_;
-  std::shared_ptr<ManifoldGraph> mutated_graph_;  // 当前绑定的全局图 (换图时快照作废)
+  // 无状态分层刷新: 不做变化检测/快照, 每帧清理区(上帧∪本帧 ROI 外扩膨胀半径)
+  // 清零动态层后全量重写。仅记录上一帧窗口供清理, 换图时作废
+  std::shared_ptr<ManifoldGraph> mutated_graph_;  // 当前绑定的全局图 (换图时旧窗口作废)
+  bool prev_valid_{false};
+  int prev_r0_{0}, prev_c0_{0}, prev_r1_{0}, prev_c1_{0};
 
-  // 当前被动态改写节点快照 [{x, y, z, traversability}] (供宿主发布可视化)
-  std::vector<std::array<float, 4>> dynamic_nodes_;
+  // 动态层清零: 窗口内层带节点 dynamic_trav=0 / dynamic_headroom=3.0 / dynamic_zone=FREE 并重合成
+  void clearDynamicLayer(const std::shared_ptr<ManifoldGraph> & graph,
+                         int r0, int c0, int r1, int c1);
+
+  // 当前被动态层叠加的节点快照 [{x, y, z, 合成 traversability, 合成 zone}] (供宿主发布可视化)
+  std::vector<std::array<float, 5>> dynamic_nodes_;
 };
 
 } // namespace elevation_planner

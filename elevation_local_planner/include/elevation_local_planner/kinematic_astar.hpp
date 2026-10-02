@@ -2,6 +2,7 @@
 
 #include <elevation_planner_core/manifold_graph.hpp>
 #include <elevation_planner_core/manifold_search.hpp>
+#include <ros/console.h>
 #include <vector>
 #include <cmath>
 #include <Eigen/Core>
@@ -18,7 +19,10 @@ struct KinematicAStarConfig
   double max_step_height = 0.25;      // 最大单步踏步台阶高度 (m)
   double max_stride_length = 0.35;    // 最大单步水平跨步步长 (m)
   double max_xy_radius = 6.0;         // 绕障子图半径 (m): 距起点 XY 硬边界, 防阻挡时全图穷举
-  int    max_expansions = 5000;       // 绕障 A* 弹出节点预算: 超限判定局部无解
+  int    max_expansions = 30000;      // 绕障 A* 弹出节点预算: 超限判定局部无解。
+                                      // 5000 在宽障碍阵 (4m+) 下会预算耗尽误判无路,
+                                      // 失败后原封锁链直接进走廊 → 控制点钉在障碍上;
+                                      // 6m 半径子图最坏 ~1.1 万格, 3 万预算足够覆盖
 };
 
 /**
@@ -78,8 +82,13 @@ public:
     prm.max_xy_radius = cfg_.max_xy_radius;
     prm.max_expansions = cfg_.max_expansions;
 
-    if (!elevation_planner::manifoldAstarSearch(graph, start_nid, goal_nid, prm, path_nids))
+    std::string fail_reason;
+    if (!elevation_planner::manifoldAstarSearch(graph, start_nid, goal_nid, prm, path_nids, &fail_reason))
     {
+      // [DBG] 失败原因落日志 (此前该出口完全静默, "绕障失败但无人知晓"无法诊断):
+      //       budget exhausted = 子图太紧/障碍太宽; open set exhausted = 封锁真正贯通
+      ROS_WARN_THROTTLE(1.0, "[KinematicAStar] detour search FAILED: start=%u goal=%u, %s",
+                        start_nid, goal_nid, fail_reason.c_str());
       return false;
     }
 

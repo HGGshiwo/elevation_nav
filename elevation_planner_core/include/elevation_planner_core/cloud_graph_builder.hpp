@@ -5,10 +5,31 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/register_point_struct.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <functional>
+
+namespace elevation_planner
+{
+
+/// @brief 带 zone 字段的节点可视化点类型 (前端三档配色数据源)。
+///        intensity = 合成 traversability, zone = CostZone 枚举值
+struct ElevationZonePoint
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  std::uint8_t zone;
+  PCL_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+} // namespace elevation_planner (临时闭合: 点类型注册宏必须在全局命名空间展开)
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(elevation_planner::ElevationZonePoint,
+  (float, x, x)(float, y, y)(float, z, z)
+  (float, intensity, intensity)
+  (std::uint8_t, zone, zone))
 
 namespace elevation_planner
 {
@@ -86,10 +107,14 @@ struct GraphBuildConfig
 
   // ---- 机体碰撞建模 (足印膨胀 + 建边扫掠) ----
   double footprint_radius{0.30};    ///< 机体足印外接半径 (m): 侧向障碍硬/软判据的垂直结构扫描窗口
-  double body_hard_radius{0.15};    ///< 机体硬阻挡半径 (m): 约半身宽+安全余量, 侧向障碍进入此范围则节点不可通行
+  double body_hard_radius{0.15};    ///< 机体硬阻挡半径 (m): 由机器人几何推导 (robot_width/2+margin),
+                                    ///< 侧向障碍进入此距离范围节点划入机体硬禁行环 (CostZone::BODY_HARD)
   double inflation_radius{0.50};    ///< 侧向软代价膨胀半径 (m): 硬半径外到此距离线性衰减软代价;
                                     ///< 原取 footprint_radius 时膨胀带仅 0.09m 宽, 0.26m 外障碍零代价梯度致 A*/优化贴墙
   double sweep_penalty_weight{1.0}; ///< 建边时机体扫掠区软代价权重
+  bool body_hard_ring_enabled{true}; ///< 机体硬禁行环开关: true 时 d<body_hard_radius 的节点为
+                                     ///< CostZone::BODY_HARD (trav=1.0, 全局/局部 A* 硬排除);
+                                     ///< false 退回纯软代价语义 (第十三章行为)
 };
 
 class CloudGraphBuilder
@@ -130,22 +155,23 @@ public:
       const std::vector<ColumnSurface> & prior,
       double same_surface_tol);
 
-  /// @brief 单节点通行性重算 (与 buildGraphFromColumnTable 的净空+侧向膨胀完全同口径)。
-  ///        融合引擎对 ROI 内的全局图节点逐个调用, 依据"先验+观测"合并后的柱面
-  ///        环境刷新 traversability/headroom, 实现动态障碍的原位属性更新。
+  /// @brief 单节点三档区划重算 (建图与融合共用的唯一口径)。
+  ///        依据节点所在柱的合并曲面环境判定 CostZone:
+  ///        顶头净空不足 -> FORBIDDEN; 侧向墙体 d < body_hard_radius (ring 开启时) ->
+  ///        BODY_HARD; d <= inflation_radius -> SOFT (输出衰减软代价); 否则 FREE。
   /// @param tread_z 节点踏面高程 (z_top)
   /// @param self_surfaces 节点所在柱的合并曲面 (z 升序)
   /// @param fetch_surfaces(dr, dc) 取 (r+dr, c+dc) 邻格合并曲面; 越界/无数据返回 nullptr
+  /// @param out_soft_cost 输出软代价 (SOFT 区为距离衰减值 0~0.9, 其余区为 0)
   /// @param out_headroom 输出重算后的上方净空
-  /// @param lateral_hard 输出是否被侧向结构硬阻挡
-  /// @return 重算后的 traversability (0.0 可通行 ~ 1.0 致命)
-  static float computeNodeTraversability(
+  /// @return 节点区划 (CostZone)
+  static CostZone computeNodeZone(
       float tread_z,
       const std::vector<ColumnSurface> & self_surfaces,
       const std::function<const std::vector<ColumnSurface> * (int dr, int dc)> & fetch_surfaces,
       const GraphBuildConfig & config,
-      float & out_headroom,
-      bool & lateral_hard);
+      float & out_soft_cost,
+      float & out_headroom);
 
   /// @brief 将图中的拓扑边导出为 RViz MarkerArray (用于三维连通性可视化)
   /// @note max_edges 须大于无向边总数, 否则地图后半段 (按栅格行序) 的边会被截断,

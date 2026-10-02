@@ -18,7 +18,7 @@ bool CollisionChecker::checkCollision(double x, double y, double z,
 
   const auto & node = graph.getNode(nid);
 
-  // 2. 节点本身即为致命硬阻挡 (建图已膨胀硬半径 / 顶头撞梁)
+  // 2. 节点本身即为致命硬阻挡 (机体硬禁行环/障碍本体 CostZone>=BODY_HARD 且 trav=1.0 / 顶头撞梁)
   if (node.traversability >= 0.98f || node.headroom < clearance_min_) {
     return true; // 发生实质性硬碰撞
   }

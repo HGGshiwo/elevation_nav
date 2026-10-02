@@ -248,13 +248,17 @@ def load_pcd(req: LoadPcdRequest):
     return {"status": "ok", "message": f"已向 C++ 节点发送 PCD 加载指令: {cmd}"}
 
 
+@app.get("/api/map/static_graph")
+def get_static_map_graph():
+    """获取全量静态 3D 流形拓扑图 (支持 Gzip 压缩, 页面初次加载或重载时按需调用 1 次)"""
+    return ros_bridge.get_static_graph()
+
+
 @app.websocket("/ws/live")
 async def websocket_live(websocket: WebSocket):
-    """实时推送机器人位姿、导航规划路径、流形拓扑图与 C++ 节点发布的 GridMap"""
+    """实时推送机器人位姿、导航规划路径、流形拓扑图版本与 C++ 节点发布的 GridMap"""
     await websocket.accept()
     last_path_v = -1
-    last_nodes_v = -1
-    last_edges_v = -1
     last_corridor_v = -1
     last_sfc_corridors_v = -1
     last_obstacles_v = -1
@@ -266,22 +270,15 @@ async def websocket_live(websocket: WebSocket):
             state = ros_bridge.get_live_state()
             frame = {
                 "robot_pose": state["robot_pose"],
-                "local_path": state["local_path"]
+                "local_path": state["local_path"],
+                "collision_node": state.get("collision_node"),
+                "graph_nodes_version": state.get("graph_nodes_version", 0),
+                "graph_edges_version": state.get("graph_edges_version", 0)
             }
             if state["path_version"] != last_path_v:
                 frame["global_path"] = state["global_path"]
                 frame["path_version"] = state["path_version"]
                 last_path_v = state["path_version"]
-
-            if state.get("graph_nodes_version", 0) != last_nodes_v and state.get("graph_nodes"):
-                frame["graph_nodes"] = state["graph_nodes"]
-                frame["graph_nodes_version"] = state["graph_nodes_version"]
-                last_nodes_v = state["graph_nodes_version"]
-
-            if state.get("graph_edges_version", 0) != last_edges_v and state.get("graph_edges"):
-                frame["graph_edges"] = state["graph_edges"]
-                frame["graph_edges_version"] = state["graph_edges_version"]
-                last_edges_v = state["graph_edges_version"]
 
             if state.get("corridor_nodes_version", 0) != last_corridor_v:
                 frame["corridor_nodes"] = state.get("corridor_nodes", [])

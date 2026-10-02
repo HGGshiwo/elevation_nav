@@ -1,6 +1,7 @@
 #include "elevation_costmap/manifold_costmap_layer.h"
 #include <pluginlib/class_list_macros.h>
 #include <tf2/utils.h>
+#include "elevation_planner_core/crash_handler.hpp"
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -49,6 +50,7 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<double>("body_hard_radius",   build_cfg.body_hard_radius, 0.17);
   private_nh.param<double>("inflation_radius",   build_cfg.inflation_radius, 0.50);
   private_nh.param<double>("sweep_penalty_weight", build_cfg.sweep_penalty_weight, 1.0);
+  private_nh.param<bool>  ("body_hard_ring_enabled", build_cfg.body_hard_ring_enabled, true);
   private_nh.param<int>   ("sor_mean_k",         build_cfg.sor_mean_k, 16);
   private_nh.param<double>("sor_std_mul",        build_cfg.sor_std_mul, 1.5);
   private_nh.param<double>("cluster_height_diff", build_cfg.cluster_height_diff, 0.08);
@@ -72,6 +74,9 @@ void ManifoldCostmapLayer::onInitialize()
   fusion_params.crop_height_above = crop_height_above;
   fusion_params.crop_height_below = crop_height_below;
   fusion_engine_.setConfig(build_cfg, fusion_params);
+
+  // 崩溃捕获: 段错误/abort 时自动输出符号化调用栈到 /tmp/elevation_nav_crash.log
+  elevation_planner::CrashHandler::install("/tmp/elevation_nav_crash.log");
 
   enabled_ = true;
   current_ = true;
@@ -141,17 +146,19 @@ void ManifoldCostmapLayer::fusionLoop()
       fusion_engine_.processLatestCloud(tf_, robot_pose);
     }
 
-    // 动态改写节点实时可视化 (前端按 intensity 着色: 封锁=红, 软代价=橙; 空帧即清除)
+    // 动态改写节点实时可视化 (前端按 zone 三档配色: FORBIDDEN 禁行=红,
+    // BODY_HARD 机体硬环=橙, SOFT 软代价=紫渐变; 空帧即清除)
     // z 必须发布真实节点高程: 桥接端以 (x,y,z) 精确匹配建立 dynamic_trav 覆盖层,
     // 任何可视化偏移都会导致查询端键失配、动态封锁静默失效 (渲染抬升由前端 +0.02 自理)
     {
-      pcl::PointCloud<pcl::PointXYZI> dyn_cloud;
+      pcl::PointCloud<elevation_planner::ElevationZonePoint> dyn_cloud;
       for (const auto & n : fusion_engine_.getDynamicNodes()) {
-        pcl::PointXYZI pt;
+        elevation_planner::ElevationZonePoint pt;
         pt.x = n[0];
         pt.y = n[1];
         pt.z = n[2];
         pt.intensity = n[3];
+        pt.zone = static_cast<uint8_t>(n[4]);
         dyn_cloud.push_back(pt);
       }
       sensor_msgs::PointCloud2 msg;

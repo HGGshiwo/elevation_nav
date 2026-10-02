@@ -2,6 +2,8 @@
 
 本项目面向四足机器人等具有离散立体跨越能力的移动底盘，提供一套从**三维点云处理、多层流形拓扑建图、全局跨层 A\* 规划**到**局部控制与 Web 3D 交互**的完整导航方案。
 
+可视化代码位置：elevation_nav/elevation_sim/web
+
 ---
 
 ## 一、三维建图完整流程 (Point Cloud to Topology Graph)
@@ -155,7 +157,7 @@ A\* 算法的本质是寻找全图**总代价最小（Cost 最低）**的路径�
 
 | 模块 | 功能描述 |
 | :--- | :--- |
-| **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`，含柱表生成/逐柱融合/建边压平两段式管线)、进程级共享存储 (`GraphStore`)、跨层门户 (`LayerPortal`)、代价评估器 (`CostEvaluator`)、统一的 A\* 搜索实现 (`ManifoldSearch`)、路径直线连通性检查与航点合并工具 (`PathSimplifier`) |
+| **`elevation_planner_core`** | 核心拓扑图定义 (`ManifoldGraph`)、点云拓扑建图器 (`CloudGraphBuilder`，含柱表生成/逐柱融合/建边压平两段式管线)、进程级共享存储 (`GraphStore`)、跨层门户 (`LayerPortal`)、统一的 A\* 搜索实现 (`ManifoldSearch`)、路径直线连通性检查与航点合并工具 (`PathSimplifier`) |
 | **`elevation_sim`** | 仿真与可视化套件：FastAPI/Web 3D 前端、伪 TF 广播、PCD 先验地图提供节点 (`pcd_to_grid_map_node`)、障碍物注入器 (`obstacle_injector`)、bag 回放模式 |
 | **`elevation_global_planner`** | move_base 全局规划器插件 (`ElevationGlobalPlanner`)：离线 PCD 先验建图、跨层 A* (`ManifoldAStar`)、防割角平滑 (`PathSmoother`)、在线 C++ 拓扑诊断服务 |
 | **`elevation_local_planner`** | move_base 局部规划器插件 (`AStarLocalPlanner`)：基于 3D 流形拓扑图的局部 A* 动态避障寻优与前瞻平滑跟踪控制，速度指令生成 (`/cmd_vel`) |
@@ -560,3 +562,322 @@ roslaunch elevation_sim navigation.launch freeze:=true
 
 - `dynamic_nodes_visualizer` 方块放平修复 (Y-up 项目的 `rotateX(-π/2)` 写法残留, Z-up 场景下方块立起)
 - 新增 `rebound_visualizer` (排斥向量红/绿) 与"添加障碍物"工具；删除重复订阅
+
+---
+
+## ⚠️ 十二、2026-09-29 更新：走廊生成重构为迭代半平面交（未经验证，待实测确认）
+
+> **状态声明**：本章全部改动已通过单元测试（6/6）与编译，但**尚未经过实机/仿真闭环验证**。
+> 涉及核心规划链路，请先在 freeze 模式下完整验证（摆障碍→自动重规划→绕障）后再投入使用。
+> 若行为异常，可回退至提交 a6d2b91 的走廊实现。
+
+### 1. 走廊生成范式切换：BFS 凸包 + 覆盖性检验 → 迭代半平面交（Decomp 式）
+
+替换 `sfc_corridor.hpp` 中的走廊生成核心（新增 `DecompCorridorGenerator`）：
+
+- **正空间**：`performTopologicalBFS`（保留）扩散出的 `visited` 连通安全格集——单步连通的可站立踏面，权威禁行定义；
+- **负空间障碍点集**：visited 包围盒内 ⊤ visited 的所有格中心——**墙/悬崖/空洞/未建图/异层踏面/扫掠剪枝格统一成一个判据**（不在单步连通安全集 = 障碍）；
+- **迭代切割**：靶心 = 段折线（W_{i-1}→W_i），每轮找距折线最近的障碍点，沿"投影点指向障碍"方向生成切割半平面，偏置 `b = n·P_proj + max(min_clearance, d − margin)`，SH 裁剪可视化多边形、剔除被切障碍点，循环至 O 清空；
+- **两层保护**（数学保证，每刀保持）：
+  - `min_clearance` (0.01m) 动态截断 → 投影点恒不被切；
+  - 最近点性质 `(P_proj−O)·(p−P_proj) ≥ 0` → **整条折线**恒在切割面安全侧（折线为直线段时严格成立）；
+- **终止即正确**：凸（半平面交）+ 无障碍（O 清空才终止）+ 含种子线（clamp）三条不变量每刀保持。
+
+**删除的旧机制**（其修复的 bug 类别在新范式下结构性不存在）：
+`checkHullCoverage`（覆盖性检验）、`collectSegmentPiecesRecursive`（递归孔洞切分）、`mergeAdjacentPieces`（贪心合并）、`expandCorridorConstrained`（逐面受限膨胀）、顶点求交护栏。退役原因：BFS 节点团是非凸的，"取凸包再验证/切分/合并"是先造形再验形的路线，凸包吞障碍、薄片顶点爆炸、弦盖薄墙、航点出走廊等问题均出在此层。
+
+### 2. 起步动力学处理重构：状态点注入 → 软硬分离
+
+- **旧机制**：机器人位姿 + dt·v 锚点作为状态点插入段 1/2 折线头部，使走廊罩住 q₁/q₂ 初值。问题：弯折折线非凸，覆盖性保证失效（实测 corridor 2 init_viol=0.85 拒绝）；
+- **新机制（软硬分离）**：
+  - **硬约束**：q₁, q₂ ∈ C₁（走廊纯由 A\* 段生成，折线为两点直线段；q₁=机器人真实位姿距 W₀ ≤ 半格恒在内，q₂=W₁ 为段末端节点恒在内）；
+  - **软约束**：`J_dyn = λ_dyn·|q₂ − 锚点|²`（锚点 = 位姿 + knot_dt·当前速度），起步运动连续性作为代价而非约束——锚点出走廊时硬约束赢、软项妥协，无拒绝路径；
+  - 参数：`setDynamicsAnchor(锚点, λ_dyn=10.0)`。
+- **附带收益**：折线恒为两点直线段（凸集），"最近点性质保整条折线"严格成立，弯折折线被切远端的问题结构性消失。
+
+### 3. 语义保留说明（为什么丢掉 BFS 连通性语义是安全的）
+
+走廊正确性分解为两个更弱的条件，各自有保证：
+- **骨干连通**：SC-LOS 支撑链保证相邻航点间存在单步连通真实踏面链（与走廊算法无关，原样保留）；
+- **偏离落点可站立**：切割法不变量保证走廊内只有 visited 可站立格——偏离口袋必被"某种不可行走边界"包围，而墙/空洞/出带三种形态在 visited 补集判据下统一为切割障碍。
+
+残余风险（有界）：扫掠剪枝边不感知（轨迹最多贴近、由 rebound 弹簧兜底）；多层 xy 重叠的 drape 取 z 歧义（只影响显示初值，骨干 z 由 SC-LOS 链钉住）。
+
+### 4. 附带修复与清理
+
+- 顶点重建退化护栏（薄薄片顶点 + 不对称外推 → 近平行面求交飞出数千米）随旧膨胀机制一并退役（SH 裁剪无此问题）；
+- 侧向软膨胀带加宽（`inflation_radius=0.5m`）保留——A\* 阶段的障碍距离感知仍由它承担。
+
+### 5. 验证清单（待执行）
+
+- [ ] freeze 模式：设终点 → 黄线出现，走廊为任意凸形状（贴障碍切割，非矩形）
+- [ ] 摆障碍在黄线上 → 自动重规划 → 黄线绕开，无 `ALM optimize rejected`
+- [ ] 起步段：机器人沿当前运动方向平滑汇入路径（锚点软项生效）
+- [ ] 狭窄通道通过性回归（走廊变窄场景不被误拒）
+- [ ] 多层/楼梯场景回归（drape 正确贴本层）
+
+---
+
+## ⚠️ 十三、2026-10-01 更新：分层代价架构 + 全局-局部失败闭环（全部待测试）
+
+> **状态声明**：本章全部改动已编译通过，但**尚未经过完整闭环验证**（用户实测中发现过
+> 走廊退化与进程崩溃，修复后待复测）。涉及融合引擎、全局规划器、局部规划器三层的
+> 核心链路，请先在 freeze 模式 + 常用场景下完整回归后再投入使用。
+> 若行为异常，可回退：`git checkout -- <对应文件>`（本章改动均未提交）。
+
+### 1. 分层代价架构（类 costmap 两层叠加）— 融合引擎重构
+
+GraphNode 由单值 traversability 拆为**两层 + 合成值**：
+
+| 字段 | 层 | 写入者 |
+|---|---|---|
+| `static_trav` / `static_headroom` | 静态层 | 建图一次（墙体/楼梯/静态软带 0.9 封顶衰减），融合永不修改 |
+| `dynamic_trav` / `dynamic_headroom` | 动态层 | 融合每帧**全量重算重写**（0=无叠加；≤0.9 膨胀；1.0 禁行） |
+| `traversability` / `headroom` | 合成 | `min(1.0, 静态+动态)` / `min(两层净空)`，所有现有消费者照读不变 |
+
+- 融合帧流程**无状态化**：清理区（上帧 ∪ 本帧 ROI，外扩膨胀半径）动态层清零 →
+  本帧 ROI 逐节点全量重算动态层 → 加法叠加静态层（封顶 1.0）。
+  删除了 `touched_nodes_` 快照/变化检测/恢复状态机——其"写回条件不满足即走恢复分支"
+  的判据错误正是**代价层方波振荡（时有时无）**的根因。
+- `changed` 只计**净变化**（清理前后逐节点对比），稳态归零——点云逐帧微抖不再
+  改写图、不再触发上层反复重规划（代价层闪烁修复）。
+- 障碍移除由"上一帧窗口并入清理区"天然覆盖，无需任何判断。
+- 三条静默 restore 路径（空云/裁剪后空/柱表失败）补齐节流 WARN 日志（此前整层
+  清空完全无日志，"代价层消失"不可诊断）。
+
+### 2. 单一膨胀语义（三区）
+
+- **禁行区**：障碍本体格（z=0 流形上无节点，踏面即柱顶在高层）+ 顶头净空不足
+  （trav=1.0）——A\* 与走廊硬排除；
+- **膨胀区**：障碍周围 0.5m 软带，**可走、代价递增、不禁行**（ring 不再硬封锁，
+  删除 `d≤body_hard_radius→1.0` 分支）；软代价封顶 0.7→**0.9** 且 d 钳到
+  body_hard_radius（推 A\* 链离墙居中）；
+- **机体间距的职责上移**：由走廊 margin 改为 **A\* 代价层**（膨胀软带推力）；
+  切割层 margin 参数**删除**（贴障碍格中心切割）；
+- 静态边代价烘焙权重 0.5→**1.5**（= weight_traversability 3.0 × 0.5 均值），
+  与内核实时重算公式完全同口径——节点被融合触摸前后代价连续无跳变。
+
+### 3. 全局规划器接入活图 + 零拷贝（"全局对动态障碍失明"总根源修复）
+
+- **事实**：全局规划器搜索用的是启动时的静态图副本（插件/planner/GraphStore 三份
+  互不相通），融合刷新对它完全不可见——这是此前所有"局部失败→全局重规划→原样
+  路线→死循环"卡死的总根源；
+- 修复：`makePlan()` 开头绑定 `GraphStore::getGlobalGraph()` 活图引用，全局 A\* 在
+  活图上搜索，动态禁行/膨胀实时生效；
+- **零拷贝**：`ManifoldAStarPlanner` 由持有图的值拷贝改为持 `const ManifoldGraph*`
+  （原每次 makePlan 两次深拷贝 19 万节点图 → astar 13~30ms；改后 ~2ms）；
+  smoother/拓扑走廊生成同步用活图引用；
+- 内核代价混合式（增量）：端点均无动态叠加的边用建图期烘焙边代价（零重算），
+  任一端点有动态叠加的边实时重算（公式与静态烘焙统一）。
+
+### 4. 局部链可通行不变式 + 失败冻结链路（AStarLocalPlanner）
+
+- **链可通行不变式**：扫描锚定链，第一个硬封锁节点（trav≥0.95）之后的节点不进链；
+  **绕障目标修正**：取"封锁点之后索引最大的可通行节点"（旧逻辑无条件取链尾，
+  链尾恰好被封锁时绕障必然失败，是绕障 ok/failed 随融合抖动翻转的来源之一）；
+- **绕障失败 → 零速 + return false**：冻结，交 move_base 全局重规划（替代旧
+  "保留含封锁节点的原链继续走廊/ALM"——那会把控制点钉在障碍上，audit d=0.000）；
+- **机体间隙闸（验证器）**：`cor.body_clearance` = 沿段折线采样点到走廊边界的最小
+  距离；`min(body_clearance) < body_hard_radius(0.17)` → 零速 + return false。
+  机体与障碍的间距由 A\* 代价层负责，本闸只验证其结果；
+- 原 `isPathBlocked`（1.5m 检查窗）从调用点退役（整链扫描覆盖，无窗外盲区），
+  函数保留供 legacy 代码引用。
+
+### 5. 绕障 A\* 失败可诊断化 + 预算放宽
+
+- 内核 `manifoldAstarSearch` 增加可选 `fail_reason` 出参，区分：`invalid node id` /
+  `expansion budget exhausted` / `open set exhausted`（前两个曾静默失败无法诊断）；
+- `max_expansions` 默认 5000 → **30000**，开放参数 `detour_max_expansions`
+  （astar_local_planner_params.yaml）——预算耗尽曾让绕障误判无路；
+- 新增诊断日志：链内封锁节点普查（`chain census`）、post-opt 控制点占据审计
+  （与 rebound 同占据语义复查最终控制点）、绕障成败与原因、走廊宽度与
+  DEGENERATE 告警。
+
+### 6. SFC 走廊诊断
+
+- JSON `obstacles` 字段：负空间逐格诊断对象 `{p, z, dz, trav, why}`，
+  why ∈ no_node（空洞立面）/ z_above / z_below（其他层结构）/ blocked（硬禁行）/
+  unvisited（层带内可走但 BFS 未访问=BFS 伪影）；
+- JSON `width` 字段（段折线最大内切宽度）+ `DEGENERATE`（<0.34m=机体直径）告警。
+
+### 7. 崩溃诊断：CrashHandler + 静默路径日志
+
+- `crash_handler.hpp`（planner_core）：捕获 SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL
+  与未捕获异常，**按模块分组 addr2line 符号化调用栈**（覆盖 .so 帧）写入
+  `/tmp/elevation_nav_crash.log` 并输出 stderr；接入点
+  `ManifoldCostmapLayer::initialize`；
+- 背景：放置障碍曾触发 move_base SIGSEGV（dmesg: fault 地址 9，
+  `buildColumnTable` 内，栈帧破坏特征，两次同址确定性复现）——根因未定罪，
+  下次复现直接查崩溃日志；
+- 融合三条静默 restore 路径补齐节流 WARN（ROI 裁剪后空/柱表失败/合并空）。
+
+### 8. 前端（elevation_sim/web）
+
+- 全局走廊边界线：青色 → **深橙 0xff6d00**（与青蓝色全局路径区分）；
+- 动态节点三区配色：禁行 ≥0.95 红 / **机体半径圈 0.8~0.95 橙黄**（不可入）/
+  **代价衰减带 <0.8 紫色渐变**（深紫→淡紫，亮度编码代价）；
+- 动态节点网格：数量不变时原位更新（消除逐帧 remove/add 重建造成的视觉闪烁）；
+- 走廊航点蓝球 z 贴地修复：段式走廊 `z_ref` 漏赋值（恒 0），JSON `z` 字段
+  曾导致蓝球悬空/穿地。
+
+### 9. 新增/变更参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `detour_max_expansions` | 30000 | 局部绕障 A\* 弹出预算（原 5000，宽障碍阵下预算耗尽误判无路） |
+| `body_hard_radius` | 0.17 | 全局参数，宽度/间隙闸阈值 = 2×该值 / 该值 |
+
+### 10. 已知边界与待测试清单
+
+已知边界（非 bug，记录在案）：
+- 楼梯多层 XY 重叠段的负空间未按层过滤，走廊可能仍偏窄（配合 `obstacles.why`
+  诊断字段实测后再定方案）；
+- ASan 诊断轮次曾引入 pcd_to_grid_map 启动 bad-free（半插桩 + Eigen 对齐分配器
+  跨 TU 配对错位的假阳性），已回退——**ASan 不再使用**，崩溃诊断走 CrashHandler。
+
+---
+
+## ⚠️ 十四、2026-10-01 更新：三档代价区划（CostZone）与机体硬禁行环恢复
+
+### 1. 语义背景：为什么恢复"机体半径硬禁行"
+
+第十三章"单一膨胀"重构删除了 ring 硬圈（`d≤body_hard_radius→1.0` 分支），机体与
+障碍的间距完全交给 A* 软代价引导。实测确认该约束过弱：静态图上贴墙 0.1m 的节点
+trav=0.9 可通行，SC-LOS 剪枝的支撑匹配又不感知软代价数值，剪枝弦线可以贴着障碍
+边缘、甚至进入 body_hard_radius 以内通过，最终只能靠局部走廊 `body_clearance` 闸
+拦停执行，形成"全局照穿 → 局部失败 → 重规划 → 同一弦线"循环。
+
+本次恢复硬环并把它做成**显式的三档区划**，全局与局部 A* 通过统一内核同一处检查
+共同生效：
+
+| CostZone | 含义 | 合成 traversability | A* 行为 |
+|---|---|---|---|
+| `FREE`(0) | 自由区 | 0 | 可通行 |
+| `SOFT`(1) | 软代价带（body_hard_radius < d ≤ inflation_radius） | 0~0.9 距离衰减 | 可通行，代价递增 |
+| `BODY_HARD`(2) | 机体硬禁行环（d < body_hard_radius） | **1.0** | 硬排除 |
+| `FORBIDDEN`(3) | 绝对禁行（障碍本体/顶头/动态封锁） | 1.0 | 硬排除 |
+
+环半径 = `body_hard_radius` = `robot_width/2 + obstacle_safety_margin`（机器人几何
+单点推导），**不是独立魔法数**。
+
+### 2. 结构改动
+
+- `GraphNode` 新增对称三层区划字段 `static_zone / dynamic_zone / cost_zone`
+  （`manifold_graph.hpp` 的 `CostZone` 枚举），与既有 static/dynamic/合成
+  traversability 分层完全对称；
+- **唯一合成点** `GraphNode::synthesize()`：zone 取严（max，动态只许变差）、
+  trav = 环/禁行 ? 1.0 : min(1.0, 静态+动态)、headroom = min。不变量
+  **zone ≥ BODY_HARD ⇔ trav = 1.0** 使全仓二十余处 `trav>=0.95` 历史消费者
+  （SC-LOS 支撑匹配、局部链封锁扫描、走廊 BFS、碰撞检查、rebound、平滑器）
+  无需改造即自动尊重硬环；
+- 建图与融合此前各持一份逐行重复的膨胀计算（`computeNodeTraversability` +
+  `inflatedTraversability` lambda），合并为唯一的 `CloudGraphBuilder::computeNodeZone()`，
+  两侧行为天然同口径，攀爬包络判据（楼梯不误判）原样保留；
+- A* 内核禁行检查改为显式语义 `nv.hardBlocked()`（zone 优先 + trav 兜底），
+  全局规划与局部绕障一处生效；
+- **Web 调试方块接入活图**：`onDebugQuery` 此前诊断的是插件静态先验副本 `graph_`，
+  对融合动态封锁/动态机体环失明（第十三章只修了 makePlan，调试查询被遗漏）——
+  现与 makePlan 同源绑定 GraphStore 活图；`diagnoseNode` 区分动态层原因
+  （新增 `dynamic_blocked` / `dynamic_inflation` 两种 reason_code，JSON 透出
+  static_trav/dynamic_trav/static_zone/dynamic_zone 分层字段）；前端调试面板
+  移除"本地静态值可通行即短路"逻辑，状态行/原因行一律以后端权威诊断为准，
+  动态禁行显示品红。
+- 新增 `ElevationZonePoint` 点类型（x/y/z/intensity/zone），`/elevation_graph_nodes`
+  与 `/elevation_dynamic_nodes` 均携带 zone 字段；ros_bridge 容错解析（旧格式 4 元
+  照常），Web 前端静态图/动态节点按 zone 三档配色（红=禁行 / 橙=机体环 /
+  紫渐变=软代价 / 绿=自由），图层栏新增图例。
+
+### 3. 行为变化与已知边界
+
+- **窄缝语义改变**：两障碍间距 < 约 `2×body_hard_radius`（当前 0.34m，含栅格量化
+  边界效应）的缝隙全局直接无解 → move_base 明式 abort——这是"物理无通道"的预期
+  失败，替代此前"规划穿过→局部闸拦停→反复重规划"。需要放宽通道时调
+  `obstacle_safety_margin`；
+- 动态注入障碍同样获得动态机体环（融合层 zone 语义一致），绕障路径更远离障碍，
+  走廊 `body_clearance` 闸触发应显著减少；
+- 楼梯不受影响：环判据沿用攀爬包络侧向墙判据，台阶本体不产生环；
+- 残留（未在本次处理）：SC-LOS 剪枝弦线在凸角处仍可能几何上切入软带（支撑链已被
+  环排除，风险较此前收窄），如需彻底封口可在 matchSupport 增加逐采样格检查；
+- **一键回退**：`body_hard_ring_enabled: false` 完整恢复第十三章纯软代价行为。
+
+
+
+### 4. 待测试清单
+
+- [ ] freeze 摆柱：全局 2Hz 重规划路线绕柱且居中，走廊 width ≥0.34，宽度/间隙闸不触发
+- [ ] 移除柱：`dynamic_trav` 随清理区清零，全局路线复原
+- [ ] 稳态 `[Fusion][DBG] refresh: 0 changed, N dynamic`（振荡修复验证）
+- [ ] `[Perf][global]` 稳定 ~2ms（零拷贝验证）
+- [ ] 坡道窄带：链居中通过；物理无通道 → 宽度/间隙闸失败 → 全局无解 → 明式 abort
+- [ ] 放障碍复现 SIGSEGV：`/tmp/elevation_nav_crash.log` 出现符号化调用栈
+- [ ] 楼梯/多层场景回归：走廊宽度、绕障、爬层
+- [ ] 前端：走廊边界深橙、动态节点三色圈稳定不闪、航点蓝球贴地
+
+---
+
+## ⚠️ 十五、2026-10-01 续更：SC-LOS 拓扑流形化简、动态层原子覆写与调试服务化
+
+### 1. SC-LOS 拓扑流形连通性化简重构 (`path_simplifier.hpp`)
+
+- **历史问题**：旧版 `match_support` 先将三维连通路径转为 $(x,y)$ 二维栅格，再根据欧氏半径搜索周围图节点。在多层复杂地貌（如坡道、跃层、楼梯）及障碍物边缘处，空间近似搜索无法感知真实的拓扑连通性，容易将跨层节点或障碍物内部节点误配，且无法准确判断射线前进方向，导致剪枝直线在障碍物边缘发生退化与穿透。
+- **重构方案**：
+  - 彻底移除 $(x,y)$ 空间桶半盲搜索；
+  - 改造为**基于流形图邻接边（`graph_->getEdges(curr, cnt)`）的纯拓扑流形射线投影追踪**：
+    - 沿着起点到终点的方向向量，逐跳在邻接边中寻找射线前进方向上的最佳流形邻居；
+    - 严格校验拓扑连通性、步高差（`max_step_height`）、跨步距离；
+    - 严格遵循区划准则：**仅允许经过 `FREE` 和 `SOFT` 代价带**，一旦遇到 `BODY_HARD` 或 `FORBIDDEN` 节点立即判定视线阻断。
+
+### 2. 融合引擎动态层就地原子覆写（In-place Atomic Overwrite）(`manifold_fusion_engine.cpp`)
+
+- **历史问题**：此前融合线程在 10Hz 循环中采用“先全量清理清零 $\rightarrow$ 再全量拓扑膨胀计算写入”的两阶段原地操作。清零后存在短暂的中间态（`dynamic_zone=FREE, dynamic_trav=0`），当上层 A* 规划或 Web 调试接口在清零与写入之间并发读取时，会产生瞬态误判，导致调试面板在“软代价”和“可通行”之间随机跳变。
+- **重构方案**：
+  - 在局部容器 `new_dyn` 中先完成本帧所有踏面节点的拓扑膨胀与代价计算，期间不触碰全局图；
+  - 计算完成后，直接遍历 `new_dyn` 对图节点进行就地原子覆写：
+    - 状态未改变的节点（如持续处于软代价带）跳过写操作，消除 cache 颠簸；
+    - 状态变化的节点直接一步到位赋为最终值并调用 `synthesize()`，**图上任何节点不再存在人工制造的裸 FREE 中间态**；
+  - 仅对上一帧存在动态值但本帧移出视野或障碍消失的节点做精准置零。
+
+### 3. Web 调试方块接口升级为标准 ROS Service (`elevation_global_planner_plugin.cpp`, `ros_bridge.py`, `DiagnoseQuery.srv`)
+
+- **历史问题**：Web 前端调试方块通过一对单向 Topic（`/elevation_debug_query` 与 `/elevation_debug_result`）配合 `threading.Event` 模拟伪 RPC。当用户点击方块 B 时，前端在同一毫秒内并发发起“单点通行诊断”与“两点拓扑邻边诊断”两个 HTTP 请求。由于 ROS Bridge 内部只有一个全局结果变量和单个事件，两路回包在同一个回调中相互竞争覆盖（“串包”），导致单点诊断常抢到邻边诊断的回包（无 reason_code 与 trav 字段），进而误将方块 B 判定为“可通行”。
+- **重构方案**：
+  - 新增专用服务协议 [`elevation_planner_core/DiagnoseQuery.srv`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_planner_core/srv/DiagnoseQuery.srv)（`string query` $\rightarrow$ `string result`）；
+  - 全局规划器插件端注册 ROS Service `/elevation_debug_diagnose`，在回调中同步处理单点/两点诊断并直接回包；
+  - Python ROS Bridge 端改为使用 `rospy.ServiceProxy("/elevation_debug_diagnose", DiagnoseQuery)` 执行同步请求；
+  - **彻底实现线程隔离与独立会话上下文**，无论多方块以何种频率并发点击，均 100% 准确返回各自的物理诊断结果。
+
+---
+
+## ⚠️ 十六、2026-10-02 更新：移动障碍物路径防震荡（同伦同侧判别与滞后切换过滤）、A* 反向搜索与独立物理仿真引擎
+
+### 1. 移动障碍物路径防震荡机制（Homotopy Hysteresis Filter）(`elevation_global_planner_plugin.cpp`)
+
+- **问题背景**：当动态障碍物位于起点与终点连线中轴线附近时，左绕与右绕两条拓扑分支代价极度接近（例如 10.01 vs 10.00）。当障碍物微小位移或观测存在点云噪声时，左右两分支代价每帧颠倒，导致全局路径与局部控制器在障碍物两侧剧烈横跳振荡。
+- **同伦同侧几何判别（向量叉积符号法）**：
+  - 以 Start $\to$ Goal 连线为主基准向量 $\vec{v} = (G_x - S_x, G_y - S_y)$；
+  - 遍历路径上各点，计算相对基准向量的有符号二维垂直距离：
+    $$h_i = \frac{v_x (P_{y,i} - S_y) - v_y (P_{x,i} - S_x)}{\|\vec{v}\|}$$
+  - 提取路径的最大偏离峰值 $h_{\text{peak}}$ 作为路径的绕行侧向（$>0$ 判定为左侧绕行分支，$<0$ 判定为右侧绕行分支）；
+  - 当新旧路径偏离符号相反（$h_{\text{old}} \cdot h_{\text{new}} < 0$）且偏离幅度均超过有效门限（$\ge \text{min\_side\_offset} = 0.20\text{m}$）时，判定为尝试跨障碍物侧向翻转。
+- **阻断即切与滞后切换过滤（Hysteresis Switch Filter）**：
+  - **阻断即切**：通过 `evaluateOldPath` 检测上一帧同侧路径在当前活图上是否依然无碰撞且未硬阻断。若旧路径被动态障碍物直接阻断（`hardBlocked` / `dynamic_zone` / `dynamic_trav > 0.8`），**立即无条件切换至新路径**；
+  - **微小波动抑制**：若上一帧同侧路径依然畅通可行，只有当新路径代价明显优于旧路径（$C_{\text{new}} < (1 - \text{hysteresis\_ratio}) \times C_{\text{old}}$，默认需优 $20\%$ 以上）时才允许侧向翻转；否则平滑复用上一帧同侧分支，**彻底杜绝移动障碍物引起的全局路径左右横跳**。
+
+### 2. A* 反向搜索与上一帧路径节点复用 (`manifold_search.hpp`, `manifold_astar.cpp`)
+
+- **固定 Goal 反向搜索至动态 Start**：静态目标 Goal 不变时，反向搜索能最大化保持搜索树在终点附近的几何一致性；
+- **历史路径节点惯性折让**：引入上一帧路径节点 $15\%$ 惯性折让（$0.85 \times \text{step\_cost}$），在底层 A* 阶段即赋予历史路径连续性吸引力，与上层同伦滞后过滤器形成双重防抖防护。
+
+### 3. 独立点云物理仿真引擎 (`simulator.py`)
+
+- **仿真器物理引擎独立化**：将运动学、点云越障挤压与防跌落逻辑从 `ros_bridge.py` 完全剥离为独立的 `simulator.py` 节点；
+- **连续楼梯爬升与顶盖净空修复**：消除将连续上升台阶地表误判为天花板顶头的误报截断；
+- **立面高墙硬截断与动静隔离**：严格区分静态地形踏面与动态障碍物，禁止将圆柱体等动态障碍物侧壁作为踏面攀爬踩踏；
+- **设起点（`/initialpose`）直通**：接收起点指令时 1:1 直通三维空间坐标 $(x, y, z)$，即时刷新 TF 并清除历史碰撞锁止。
+
+### 4. 日志规范化与清理
+
+- 清理 `SC-LOS Pruned`、`AStar PathNode` 等高频日志，统一规范 `scan_bspline_optimizer.hpp` 中的调试信息为 `ROS_DEBUG`。
+
+---
+

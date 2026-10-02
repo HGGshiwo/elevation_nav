@@ -44,6 +44,7 @@ struct PerfTrace
 #include <angles/angles.h>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 
 PLUGINLIB_EXPORT_CLASS(elevation_local_planner::AStarLocalPlanner, nav_core::BaseLocalPlanner)
@@ -101,6 +102,8 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
   private_nh.param<bool>  ("align_final_yaw",         align_final_yaw_, true);
   private_nh.param<double>("rebound_weight",          rebound_weight_, 100.0);
   private_nh.param<double>("rebound_clearance",       rebound_clearance_, 0.17);
+  // 机体硬半径: 与 planner_common.yaml/伪 TF 桥接同源 (全局参数), 走廊宽度闸阈值 = 2×该值
+  nh.param<double>("body_hard_radius", body_hard_radius_, 0.17);
   private_nh.param<bool>  ("planning_freeze",         planning_freeze_, false);
   if (planning_freeze_)
     ROS_WARN("[AStarLocalPlanner] FREEZE mode: robot will not move; planning on goal/obstacle-change (goal republish)");
@@ -112,6 +115,10 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
   k_cfg.weight_traversability = 3.0;
   k_cfg.max_step_height = max_step_height_;
   k_cfg.max_stride_length = max_stride_length_;
+  // [DBG] 绕障预算可调: 预算耗尽会让绕障误判无路, 原封锁链直接进走廊生成
+  int detour_max_expansions = 30000;
+  private_nh.param<int>("detour_max_expansions", detour_max_expansions, 30000);
+  k_cfg.max_expansions = detour_max_expansions;
   kinematic_astar_.setConfig(k_cfg);
 
   // 速度平滑器配置
@@ -354,22 +361,85 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
     }
   }
 
-  // 4.1 避障检测：若前方局部路径受阻，调用 Kinematic A* 局部绕障重搜
-  if (graph && graph->numNodes() > 0)
+  // 4.1 链可通行不变式 + 绕障: 扫描锚定链的第一个硬封锁节点 (trav>=0.95;
+  //     顶头禁行与侧向硬阻挡在图口径下同为 1.0)。
+  //     不变量: 进入走廊/ALM 的链全程可通行 —— 封锁节点绝不作航点/走廊种子,
+  //     否则 ALM 会把控制点钉在障碍坐标上 (chain census / audit d=0.000 的根源)。
+  if (graph && graph->numNodes() > 0 && !path_node_ids.empty())
   {
-    size_t blocked_idx = 0;
-    if (isPathBlocked(local_band, *graph, obstacle_check_distance_, blocked_idx))
+    size_t k = path_node_ids.size();
+    for (size_t i = 0; i < path_node_ids.size(); ++i)
     {
-      ROS_WARN_THROTTLE(1.0, "[AStarLocalPlanner] Path blocked ahead. Triggering Kinematic A* detour on graph...");
-      uint32_t start_nid = path_node_ids.empty() ? 0 : path_node_ids.front();
-      uint32_t goal_nid = path_node_ids.empty() ? 0 : path_node_ids.back();
-      std::vector<uint32_t> detour_nids;
-      std::vector<Eigen::Vector3d> detour_pts;
-      if (kinematic_astar_.search(*graph, start_nid, goal_nid, detour_nids, detour_pts) && !detour_nids.empty())
+      if (graph->getNode(path_node_ids[i]).traversability >= 0.95f)
       {
-        path_node_ids = detour_nids;
+        k = i;
+        break;
       }
     }
+
+    if (k < path_node_ids.size())
+    {
+      const auto & blk = graph->getNode(path_node_ids[k]);
+
+      // 绕障目标: 封锁位置之后索引最大的可通行节点 (链尾可走即取链尾;
+      // 链尾自身被封锁时退而取封锁点之后最远的可通行节点 —— 旧逻辑无条件取链尾,
+      // 链尾恰好被封锁时绕障必然无解, 是 ok/failed 随融合抖动翻转的来源之一)
+      int goal_j = -1;
+      for (int j = static_cast<int>(path_node_ids.size()) - 1; j > static_cast<int>(k); --j)
+      {
+        if (graph->getNode(path_node_ids[j]).traversability < 0.95f)
+        {
+          goal_j = j;
+          break;
+        }
+      }
+
+      const uint32_t start_nid = path_node_ids.front();
+      uint32_t goal_nid = (goal_j >= 0) ? path_node_ids[goal_j] : 0;
+      std::vector<uint32_t> detour_nids;
+      std::vector<Eigen::Vector3d> detour_pts;
+      if (goal_nid != 0 &&
+          kinematic_astar_.search(*graph, start_nid, goal_nid, detour_nids, detour_pts) &&
+          !detour_nids.empty())
+      {
+        ROS_INFO_THROTTLE(2.0, "[AStarLocalPlanner] Detour A* ok: start=%u goal=%u -> %zu nodes (chain replaced, blockage at idx %zu)",
+                          start_nid, goal_nid, detour_nids.size(), k);
+        path_node_ids = detour_nids;
+      }
+      else
+      {
+        // 绕障无路 (或封锁点之后整段无可通行节点): 只保留可通行前缀 (idx [0,k))
+        // 并返回 false, 强制 move_base 在融合图上重新全局规划; 全局也无解则明式
+        // abort —— 绝不让封锁节点进链继续走廊/ALM (那会规划出穿障轨迹)
+        ROS_WARN_THROTTLE(2.0, "[AStarLocalPlanner] blockage at chain idx %zu/%zu (node %u at %.2f,%.2f), detour %s; "
+                               "traversable prefix = %zu nodes -> return false, hand over to global planner",
+                          k, path_node_ids.size(), path_node_ids[k], blk.x, blk.y,
+                          goal_nid != 0 ? "failed (see KinematicAStar)" : "target invalid (no free node beyond blockage)",
+                          k);
+        cmd_vel = geometry_msgs::Twist();
+        return false;
+      }
+    }
+  }
+
+  // [DBG] 链内封锁节点普查: 无论绕障成败, 最终链上残留的封锁节点 (trav>=0.95)
+  //       就是"航点在障碍里"的直接来源 —— 0 才是健康状态
+  if (graph && graph->numNodes() > 0 && !path_node_ids.empty())
+  {
+    size_t blocked_in_chain = 0;
+    uint32_t first_blocked = 0;
+    for (uint32_t nid : path_node_ids)
+    {
+      if (nid < graph->numNodes() && graph->getNode(nid).traversability >= 0.95f)
+      {
+        ++blocked_in_chain;
+        if (first_blocked == 0) first_blocked = nid;
+      }
+    }
+    if (blocked_in_chain > 0)
+      ROS_WARN_THROTTLE(1.0, "[AStarLocalPlanner] chain census: %zu/%zu path nodes HARD-BLOCKED (first nid=%u at %.2f,%.2f), waypoints sit on obstacles",
+                        blocked_in_chain, path_node_ids.size(), first_blocked,
+                        graph->getNode(first_blocked).x, graph->getNode(first_blocked).y);
   }
 
   // 保证至少有 4 个节点满足三次 B 样条阶数
@@ -401,7 +471,7 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
     std::vector<uint32_t> pruned_ids = band_simplifier_.simplifyPath(path_node_ids, los_max_segment_);
     if (pruned_ids.size() >= 4 && pruned_ids.size() < path_node_ids.size())
     {
-      ROS_INFO_THROTTLE(5.0, "[AStarLocalPlanner] SC-LOS band pruned: %zu -> %zu waypoints",
+      ROS_DEBUG_THROTTLE(5.0, "[AStarLocalPlanner] SC-LOS band pruned: %zu -> %zu waypoints",
                         path_node_ids.size(), pruned_ids.size());
       path_node_ids = std::move(pruned_ids);
     }
@@ -467,18 +537,12 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
         band_simplifier_.build(*graph);
         simplifier_graph_ = graph.get();
       }
-      std::vector<Eigen::Vector2d> state_points;
-      if (sfc_seed_robot_state_)
-      {
-        state_points = {robot_start_2d, anchor_2d};
-      }
-      // 凸性保证走廊: 非凸节点团拆分为凸子片, waypoints 按航线穿入点重采样 ——
-      // waypoints_2d 必须同步替换为重采样序列, 保持 corridors==waypoints 1:1 硬约束
+      // 凸走廊: 走廊纯由 A* 段生成 (状态点不进折线 —— 机器人位姿/锚点由优化器软约束处理)
       std::vector<Eigen::Vector2d> resampled_waypoints;
       corridors_2d = SFCGenerator::generateSegmentCorridors(path_node_ids, *graph, band_simplifier_,
                                                             0.50, max_step_height_, max_stride_length_,
-                                                            state_points, robot_pose.z, &resampled_waypoints);
-      // 对齐校验: 数量不匹配 (拆分后数量变动但采样失败等异常) 时退回原航点序列
+                                                            {}, robot_pose.z, &resampled_waypoints);
+      // 对齐校验: 数量不匹配 (异常) 时退回原航点序列
       if (resampled_waypoints.size() == corridors_2d.size() && !resampled_waypoints.empty())
       {
         waypoints_2d = resampled_waypoints;
@@ -491,6 +555,7 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
     {
       corridors_2d = SFCGenerator::generateCorridors(path_node_ids, *graph, 0.50, max_step_height_, max_stride_length_);
     }
+
 
     // 发布 3D 贴地凸走廊可视化 MarkerArray 供 RViz / Web 前端渲染 (直接使用走廊节点高程，零二次查图)
     if (local_corridor_pub_.getNumSubscribers() > 0)
@@ -510,6 +575,8 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
     // 6.3 1:1 物理点 ALM 内外循环优化求解 (Jerk 极小化 + 线性凸约束穿墙三次重罚 + 外循环拉格朗日乘子更新)
     scan_optimizer_.setParams(1.0, 1000.0, 2.0, 1.0, cruise_speed, 1.5);
     scan_optimizer_.setReboundParams(rebound_weight_, rebound_clearance_);
+    // 起步动力学锚点软约束: 拉 q2 靠近 机器人位姿 + knot_dt·当前速度 (硬约束是走廊 C1∩C2)
+    scan_optimizer_.setDynamicsAnchor(robot_start_2d + knot_dt * v_start_2d, 10.0);
 
     // rebound 占据查询回调: 与伪 TF 落脚点预检同语义 —— 控制点 body_hard_radius 内
     // 存在本层 (|dz| <= max_step_height) 禁行节点即碰撞, 输出最近禁行节点作排斥参考点;
@@ -519,16 +586,19 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
     auto* graph_ptr = graph.get();
     const double occ_band = max_step_height_;
     const double occ_radius2 = rebound_clearance_ * rebound_clearance_;
-    scan_optimizer_.setOccupancyCallback(
-        [graph_ptr, occ_band, occ_radius2](double x, double y, double z,
-                                           Eigen::Vector2d* obstacle_pt) -> bool {
+    // 查找范围必须覆盖 clearance: 半径 = ceil(clearance/res)+1 格, 否则弹簧对
+    // 恰好落在范围外 (0.3~0.35m) 的禁行格失明, 0.35 的间距要求形同虚设
+    const int occ_scan = static_cast<int>(std::ceil(rebound_clearance_ / graph_ptr->getResolution())) + 1;
+    std::function<bool(double, double, double, Eigen::Vector2d*)> occupancy_check =
+        [graph_ptr, occ_band, occ_radius2, occ_scan](double x, double y, double z,
+                                                     Eigen::Vector2d* obstacle_pt) -> bool {
           int r = 0, c = 0;
           if (!graph_ptr->toGridIndex(x, y, r, c)) return false;  // 图外: 不装弹簧
           double best_d2 = occ_radius2;
           bool hit = false;
-          for (int dr = -3; dr <= 3; ++dr)
+          for (int dr = -occ_scan; dr <= occ_scan; ++dr)
           {
-            for (int dc = -3; dc <= 3; ++dc)
+            for (int dc = -occ_scan; dc <= occ_scan; ++dc)
             {
               for (uint32_t nid : graph_ptr->getSpatialCellNodes(r + dr, c + dc))
               {
@@ -547,10 +617,48 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
             }
           }
           return hit;
-        });
+        };
+    scan_optimizer_.setOccupancyCallback(occupancy_check);
 
     if (scan_optimizer_.optimize(waypoints_2d, corridors_2d, robot_start_2d, v_start_2d, knot_dt, opt_control_points_2d))
     {
+      // [DBG] 优化后控制点占据审计: 用与 rebound 完全相同的占据语义复查最终控制点。
+      //       命中 = 优化轨迹本体贴/入禁行区, 但走廊约束 (viol≈0) 仍判成功 —— 当前
+      //       管线不会据此触发重规划, 此日志是"控制点在障碍物内"的权威判据
+      {
+        int hit = 0;
+        double worst_d = 1e9;
+        size_t worst_i = 0;
+        Eigen::Vector2d worst_ob(0.0, 0.0);
+        for (size_t k = 0; k < opt_control_points_2d.size(); ++k)
+        {
+          // 控制点 q_k 的贴地高程取走廊序号 k-1 (与优化器 checkCollisionAndRebound 同口径)
+          const size_t ci = (k >= 1) ? k - 1 : 0;
+          const double zq = corridors_2d[std::min(ci, corridors_2d.size() - 1)].queryZFromNodes(
+              opt_control_points_2d[k].x(), opt_control_points_2d[k].y());
+          Eigen::Vector2d ob;
+          if (occupancy_check(opt_control_points_2d[k].x(), opt_control_points_2d[k].y(), zq, &ob))
+          {
+            ++hit;
+            const double d = (opt_control_points_2d[k] - ob).norm();
+            if (d < worst_d)
+            {
+              worst_d = d;
+              worst_i = k;
+              worst_ob = ob;
+            }
+          }
+        }
+        if (hit > 0)
+          ROS_WARN_THROTTLE(1.0, "[AStarLocalPlanner] post-opt audit: %d/%zu control points within %.2fm of blocked node "
+                   "(worst q%zu d=%.3fm, obstacle at %.2f,%.2f) - trajectory on obstacle but corridor constraints satisfied",
+                   hit, opt_control_points_2d.size(), rebound_clearance_, worst_i, worst_d,
+                   worst_ob.x(), worst_ob.y());
+        else
+          ROS_INFO_THROTTLE(5.0, "[AStarLocalPlanner] post-opt audit: all %zu control points clear of blocked nodes",
+                            opt_control_points_2d.size());
+      }
+
       if (bspline_traj_.initialize2D(opt_control_points_2d, knot_dt))
       {
         opt_success = true;
@@ -842,29 +950,45 @@ bool AStarLocalPlanner::isPathBlocked(
 {
   if (path.size() < 2) return false;
 
-    double accum = 0.0;
-    for (size_t i = 1; i < path.size(); ++i)
-    {
-      const auto & prev = path[i - 1].pose.position;
-      const auto & curr = path[i].pose.position;
-      accum += std::hypot(curr.x - prev.x, curr.y - prev.y);
+  size_t checked = 0, unanchored = 0;
+  double accum = 0.0;
+  for (size_t i = 1; i < path.size(); ++i)
+  {
+    const auto & prev = path[i - 1].pose.position;
+    const auto & curr = path[i].pose.position;
+    accum += std::hypot(curr.x - prev.x, curr.y - prev.y);
 
-      uint32_t nid = 0;
-      // include_blocked=true: 动态障碍封锁的节点也要找得到, 否则阻挡检测失明
-      if (graph.findClosestNode(curr.x, curr.y, curr.z, nid, 0.4, 0.6, true))
+    uint32_t nid = 0;
+    // include_blocked=true: 动态障碍封锁的节点也要找得到, 否则阻挡检测失明
+    if (graph.findClosestNode(curr.x, curr.y, curr.z, nid, 0.4, 0.6, true))
     {
+      ++checked;
       const auto & node = graph.getNode(nid);
       // 节点不可通行: 障碍物阻挡或顶头净空不足
       if (node.traversability >= 0.8f || node.headroom < 0.45f)
       {
         blocked_idx = i;
+        ROS_WARN_THROTTLE(1.0, "[AStarLocalPlanner] Path blocked: band pose %zu (arc %.2fm / window %.2fm) -> "
+                 "node %u (%.2f,%.2f,%.2f) trav=%.2f headroom=%.2f -> Kinematic A* detour",
+                 i, accum, check_dist, nid, node.x, node.y, node.z,
+                 node.traversability, node.headroom);
         return true;
       }
+    }
+    else
+    {
+      // [DBG] 锚定失败 = 该 pose 完全没被检查 (其周边 0.4m 内无任何图节点)
+      ++unanchored;
     }
 
     if (accum >= check_dist) break;
   }
 
+  // [DBG] 未触发也要留痕: checked < 总数说明检查窗口截断 (obstacle_check_distance
+  //       之后的路径是盲区, freeze 模式机器人不前进则永远盲); unanchored 说明
+  //       有 pose 周边无图节点, 同样是探测盲区
+  ROS_INFO_THROTTLE(2.0, "[AStarLocalPlanner] isPathBlocked: no block (%zu/%zu poses checked within %.2fm, %zu unanchored)",
+                    checked, path.size() - 1, check_dist, unanchored);
   return false;
 }
 

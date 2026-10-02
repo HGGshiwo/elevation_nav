@@ -62,9 +62,12 @@ function getActiveRequestedLayers() {
 }
 
 // ---- 3. 核心功能模块组装 ----
-// 3.1 机器狗追踪与路径模块 (跟随视角驱动挂入渲染循环)
+// 3.1 机器狗追踪与路径模块 (跟随视角驱动与碰撞脉冲挂入渲染循环)
 const robotTracker = initRobotTracker(scene, controls);
-if (setFrameCallback) setFrameCallback(() => robotTracker.updateFollow());
+if (setFrameCallback) setFrameCallback(() => {
+    robotTracker.updateFollow();
+    if (robotTracker.updateCollisionAnimation) robotTracker.updateCollisionAnimation();
+});
 
 // 3.2 地图持久化存储与 ROS 同步模块
 const mapStorage = initMapStorage(layers, () => {
@@ -216,6 +219,63 @@ function updateSfcDetailBox(idx, c) {
 
 sfcDebugVisualizer.setOnSelectCallback((idx, c) => {
     updateSfcDetailBox(idx, c);
+});
+
+// 走廊点快速查找定位
+function performSfcSearch() {
+    const inputEl = document.getElementById('sfc-search-input');
+    if (!inputEl || currentSfcCorridors.length === 0) return;
+    const q = inputEl.value.trim();
+    if (!q) return;
+
+    let targetIdx = -1;
+
+    // 1. 尝试作为纯数字匹配 (先当索引，再当 root_id)
+    if (/^\d+$/.test(q)) {
+        const num = parseInt(q, 10);
+        if (num >= 0 && num < currentSfcCorridors.length) {
+            targetIdx = num;
+        } else {
+            targetIdx = currentSfcCorridors.findIndex(c => c.root_id === num);
+        }
+    }
+
+    // 2. 尝试解析坐标 (x,y 或 x,y,z)
+    if (targetIdx < 0) {
+        const matches = q.match(/[-+]?[0-9]*\.?[0-9]+/g);
+        if (matches && matches.length >= 2) {
+            const qx = parseFloat(matches[0]);
+            const qy = parseFloat(matches[1]);
+            const qz = matches.length >= 3 ? parseFloat(matches[2]) : null;
+
+            let bestDist = Infinity;
+            currentSfcCorridors.forEach((c, i) => {
+                let d = (c.x - qx) ** 2 + (c.y - qy) ** 2;
+                if (qz !== null) d += ((c.z - qz) * 2) ** 2;
+                if (d < bestDist) {
+                    bestDist = d;
+                    targetIdx = i;
+                }
+            });
+        }
+    }
+
+    if (targetIdx >= 0 && targetIdx < currentSfcCorridors.length) {
+        sfcDebugVisualizer.selectCorridor(targetIdx);
+        sfcDebugVisualizer.focusOnSelected();
+        const card = document.getElementById(`sfc-card-${targetIdx}`);
+        if (card) card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } else {
+        alert(`未找到匹配的局部规划走廊点: "${q}"`);
+    }
+}
+
+document.getElementById('btn-sfc-search')?.addEventListener('click', performSfcSearch);
+document.getElementById('sfc-search-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        performSfcSearch();
+    }
 });
 
 // 聚焦视角

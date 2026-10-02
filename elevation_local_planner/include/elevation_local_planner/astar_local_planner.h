@@ -98,6 +98,7 @@ private:
   bool sfc_seed_robot_state_{true};           ///< 起始两条段走廊并入机器人位姿/锚点种子 (转角交集覆盖动力学锚点)
   double rebound_weight_{100.0};              ///< 样条优化 rebound 定向排斥权重 (0 = 关闭)
   double rebound_clearance_{0.17};            ///< rebound 安全间距 (= body_hard_radius, 与代价地图同口径)
+  double body_hard_radius_{0.17};             ///< 机体硬半径 (planner_common 同源): 走廊宽度闸 = 2×该值
 
   // ---- 冻结调试模式 (freeze:=true): 狗不动、不自动重规划, 摆障碍/设终点时按需规划一轮 ----
   bool planning_freeze_{false};               ///< 冻结总开关

@@ -50,22 +50,37 @@
         <arg name="planning_freeze" value="$(arg freeze)"/>
     </include>
 
-    <!-- 3. Web 服务端与三维可视化 (FastAPI + Three.js); sim 时广播伪 TF, bag 模式强制关闭 -->
+    <!-- 3. 独立点云物理仿真器 (仅仿真且非 bag 模式启动): 输入点云 + cmd_vel, 广播 TF 并发布 /loc_base & /odom -->
+    <group if="$(eval arg('sim') and not arg('bag'))">
+        <node pkg="elevation_sim" type="simulator.py" name="quadruped_simulator" output="screen">
+            <param name="pcd_file" value="$(arg pcd_file)"/>
+            <param name="cmd_vel_freeze" value="$(arg freeze)"/>
+            <param name="base_frame" value="base_link"/>
+            <param name="map_frame" value="map"/>
+            <param name="odom_frame" value="odom"/>
+            <param name="publish_tf" value="true"/>
+            <param name="init_x" value="$(arg sim_init_x)"/>
+            <param name="init_y" value="$(arg sim_init_y)"/>
+            <param name="init_z" value="$(arg sim_init_z)"/>
+            <param name="init_yaw" value="$(arg sim_init_yaw)"/>
+            <param name="linear_noise_std" value="$(arg sim_noise_linear)"/>
+            <param name="lateral_noise_std" value="$(arg sim_noise_lateral)"/>
+            <param name="angular_noise_std" value="$(arg sim_noise_angular)"/>
+            <param name="footprint_radius" value="0.22"/>
+            <param name="max_step_height" value="0.25"/>
+            <param name="dog_height" value="0.45"/>
+        </node>
+    </group>
+
+    <!-- 4. Web 服务端与三维可视化 (FastAPI + Three.js): 纯粹作为 Web 诊断与交互桥接 -->
     <node pkg="elevation_sim" type="elevation_server.py" name="elevation_web_server" output="screen">
         <param name="web_port" value="$(arg web_port)"/>
-        <param name="publish_fake_tf" value="$(eval False if arg('bag') else arg('sim'))"/>
+        <param name="publish_fake_tf" value="false"/>
         <param name="cmd_vel_freeze" value="$(arg freeze)"/>
         <param name="tf_child_frame" value="base_link"/>
-        <param name="init_x" value="$(arg sim_init_x)"/>
-        <param name="init_y" value="$(arg sim_init_y)"/>
-        <param name="init_z" value="$(arg sim_init_z)"/>
-        <param name="init_yaw" value="$(arg sim_init_yaw)"/>
-        <param name="linear_noise_std" value="$(arg sim_noise_linear)"/>
-        <param name="lateral_noise_std" value="$(arg sim_noise_lateral)"/>
-        <param name="angular_noise_std" value="$(arg sim_noise_angular)"/>
     </node>
 
-    <!-- 4. 障碍物注入器 (仅仿真且非 bag 模式): 按规则在全局路径上生成障碍物表面点云, 驱动融合避障测试;
+    <!-- 5. 障碍物注入器 (仅仿真且非 bag 模式): 按规则在全局路径上生成障碍物表面点云, 驱动融合避障测试;
             实机 (sim=false) 不启动, 避免伪造障碍进入真实感知; bag 模式不启动 (bag 里有录制的障碍数据) -->
     <!-- freeze 模式: 障碍全部由 Web 手动摆放, 禁用脚本化自动注入 -->
     <group if="$(eval arg('obstacle_injector') and arg('sim') and not arg('bag') and not arg('freeze'))">

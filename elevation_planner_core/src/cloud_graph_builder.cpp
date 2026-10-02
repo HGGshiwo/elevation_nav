@@ -288,19 +288,17 @@ std::vector<ColumnSurface> CloudGraphBuilder::mergeColumnSurfaces(
   return merged;
 }
 
-float CloudGraphBuilder::computeNodeTraversability(
+CostZone CloudGraphBuilder::computeNodeZone(
     float tread_z,
     const std::vector<ColumnSurface> & self_surfaces,
     const std::function<const std::vector<ColumnSurface> * (int dr, int dc)> & fetch_surfaces,
     const GraphBuildConfig & config,
-    float & out_headroom,
-    bool & lateral_hard)
+    float & out_soft_cost,
+    float & out_headroom)
 {
-  lateral_hard = false;
+  out_soft_cost = 0.0f;
 
-  // ---- 净空: 本踏面上方第一个有效面层的底板 (与 buildGraphFromColumnTable 同口径) ----
-  // 自身面以 z_top <= tread_z + tol/2 排除; 单柱内相邻面层间距 > cluster_height_diff,
-  // 因此合并后仍严格高于该阈值的面层必在本踏面之上
+  // 1. 净空: 本踏面上方第一个有效面层的底板 (与 buildGraphFromColumnTable 同口径)
   out_headroom = 3.0f; // 默认室外无上顶
   for (const auto & S : self_surfaces) {
     if (S.count < config.min_cluster_points) continue;
@@ -309,35 +307,156 @@ float CloudGraphBuilder::computeNodeTraversability(
     break;
   }
   if (out_headroom < config.dog_height) {
-    return 1.0f; // 顶头禁行: 与建图一致, 不再叠加侧向膨胀
+    return CostZone::FORBIDDEN; // 顶头禁行: 不再叠加侧向膨胀
   }
 
-  // ---- 侧向膨胀: inflation_radius 内垂直范围跨越攀爬包络的结构 (公式与建图逐行一致) ----
+  // 2. 局部单步拓扑传染搜索 (在局部窗口内进行单步连通边 Dijkstra 扩散)
   const int rad = std::max(1, static_cast<int>(std::ceil(config.inflation_radius / config.resolution)));
   const float soft_band = std::max(1e-3f, static_cast<float>(config.inflation_radius - config.body_hard_radius));
-  float worst = 0.0f;
+  const int span = 2 * rad + 1;
+
+  struct LocalNode {
+    int dr{0};
+    int dc{0};
+    float z{0.0f};
+    float min_obs_d{std::numeric_limits<float>::max()};
+    bool valid{false};
+  };
+
+  std::vector<LocalNode> local_nodes(static_cast<size_t>(span * span));
+  auto get_node = [&](int dr, int dc) -> LocalNode & {
+    return local_nodes[static_cast<size_t>((dr + rad) * span + (dc + rad))];
+  };
+
+  // 1) 提取局部每个格子的踏面层 (取与行走平面处于同一高度连续范围的面)
   for (int dr = -rad; dr <= rad; ++dr) {
     for (int dc = -rad; dc <= rad; ++dc) {
-      // double 计算: 与建图同理由, 硬半径边界格不因 float 舍入漏成软代价
-      const double d = std::hypot(dr, dc) * config.resolution;
-      if (d > config.inflation_radius) continue;
-      const auto * surfaces = fetch_surfaces(dr, dc);
+      const auto * surfaces = (dr == 0 && dc == 0) ? &self_surfaces : fetch_surfaces(dr, dc);
       if (!surfaces) continue;
+      float best_dz = 1e9f;
+      float best_z = 0.0f;
+      bool found = false;
       for (const auto & S : *surfaces) {
         if (S.count < config.min_cluster_points) continue;
-        // 攀爬包络判据: 结构底面贴近本层踏面、顶面超过 tread_z + k*max_step_height
-        // (k 为格距) 才判墙, 楼梯本体可逐级攀爬不误判 —— 与建图口径一致
-        const int k = std::max(std::abs(dr), std::abs(dc));
-        const float top_limit = tread_z + static_cast<float>(k * config.max_step_height);
-        if (!(S.z_bottom < tread_z + config.max_step_height &&
-              S.z_top > top_limit)) continue;
-        if (d <= config.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
-        float soft = 0.7f * (config.inflation_radius - d) / soft_band;          // 距离衰减软代价
-        worst = std::max(worst, soft);
+        float dz = std::abs(S.z_top - tread_z);
+        if (dz < best_dz) {
+          best_dz = dz;
+          best_z = S.z_top;
+          found = true;
+        }
+      }
+      if (found) {
+        auto & ln = get_node(dr, dc);
+        ln.dr = dr;
+        ln.dc = dc;
+        ln.z = best_z;
+        ln.valid = true;
       }
     }
   }
-  return worst;
+
+  // 2) 识别障碍接触种子
+  struct QueueEntry {
+    float d;
+    int dr;
+    int dc;
+    bool operator>(const QueueEntry & o) const { return d > o.d; }
+  };
+  std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> pq;
+
+  for (int dr = -rad; dr <= rad; ++dr) {
+    for (int dc = -rad; dc <= rad; ++dc) {
+      const auto * cell_surfaces = (dr == 0 && dc == 0) ? &self_surfaces : fetch_surfaces(dr, dc);
+      if (cell_surfaces) {
+        for (const auto & S : *cell_surfaces) {
+          if (S.count < config.min_cluster_points) continue;
+          // 踏面高度层的本体障碍判定: 落在 [tread_z + max_step_height, tread_z + dog_height]
+          if (S.z_bottom < tread_z + config.dog_height &&
+              S.z_top > tread_z + config.max_step_height) {
+            auto & ln = get_node(dr, dc);
+            if (ln.min_obs_d > 0.0f) {
+              ln.min_obs_d = 0.0f;
+              pq.push({0.0f, dr, dc});
+            }
+          }
+        }
+      }
+
+      auto & ln = get_node(dr, dc);
+      if (!ln.valid) continue;
+
+      for (int step_r = -1; step_r <= 1; ++step_r) {
+        for (int step_c = -1; step_c <= 1; ++step_c) {
+          if (step_r == 0 && step_c == 0) continue;
+          int nr = dr + step_r;
+          int nc = dc + step_c;
+          if (nr < -rad || nr > rad || nc < -rad || nc > rad) continue;
+
+          const auto * nbr_surfaces = (nr == 0 && nc == 0) ? &self_surfaces : fetch_surfaces(nr, nc);
+          if (!nbr_surfaces) continue;
+
+          for (const auto & S : *nbr_surfaces) {
+            if (S.count < config.min_cluster_points) continue;
+            // 阻挡判定: 结构拦截 [ln.z + max_step, ln.z + dog_height]
+            if (S.z_bottom < ln.z + config.max_step_height &&
+                S.z_top > ln.z + config.max_step_height) {
+              float d_wall = static_cast<float>(std::hypot(step_r, step_c) * config.resolution);
+              if (d_wall < ln.min_obs_d) {
+                ln.min_obs_d = d_wall;
+                pq.push({d_wall, dr, dc});
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 3) 沿单步连通边进行 Dijkstra 拓扑扩散
+  while (!pq.empty()) {
+    auto top = pq.top();
+    pq.pop();
+    if (top.d > get_node(top.dr, top.dc).min_obs_d) continue;
+    if (top.d >= config.inflation_radius) continue;
+
+    const auto & curr = get_node(top.dr, top.dc);
+    for (int step_r = -1; step_r <= 1; ++step_r) {
+      for (int step_c = -1; step_c <= 1; ++step_c) {
+        if (step_r == 0 && step_c == 0) continue;
+        int nr = top.dr + step_r;
+        int nc = top.dc + step_c;
+        if (nr < -rad || nr > rad || nc < -rad || nc > rad) continue;
+
+        auto & nbr = get_node(nr, nc);
+        if (!nbr.valid) continue;
+
+        // 单步物理连通条件: |Δz| <= max_step_height
+        float dx = static_cast<float>(step_r * config.resolution);
+        float dy = static_cast<float>(step_c * config.resolution);
+        float dz = nbr.z - curr.z;
+        float step_d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        float next_d = top.d + step_d;
+        if (next_d < nbr.min_obs_d && next_d <= config.inflation_radius) {
+          nbr.min_obs_d = next_d;
+          pq.push({next_d, nr, nc});
+        }
+      }
+    }
+  }
+
+  // 4) 评估中心点 (0, 0)
+  float center_dist = get_node(0, 0).min_obs_d;
+  if (config.body_hard_ring_enabled && center_dist < config.body_hard_radius) {
+    out_soft_cost = 0.9f;
+    return CostZone::BODY_HARD;
+  }
+  if (center_dist <= config.inflation_radius) {
+    float d_eff = std::max(center_dist, static_cast<float>(config.body_hard_radius));
+    out_soft_cost = 0.9f * (static_cast<float>(config.inflation_radius) - d_eff) / soft_band;
+    return CostZone::SOFT;
+  }
+
+  return CostZone::FREE;
 }
 
 bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, ManifoldGraph & out_graph)
@@ -354,68 +473,14 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
   out_graph.initSpatialGrid(res, min_x, min_y, rows, cols); // 内部 clear, 支持重复建图
   const auto & cell_surfaces = table.cells;
 
-  // 机体侧向碰撞膨胀: 扫描 inflation_radius 内 "垂直范围跨越踏步极限" 的结构 (墙体/台沿,
-  // 即从本层踏面高度附近向上生长、高到迈不上去的竖直结构), 硬半径内硬阻挡, 外围软代价
-  auto inflatedTraversability = [&](int r, int c, float tread_z, bool & lateral_hard) -> float {
-    const int rad = std::max(1, static_cast<int>(std::ceil(config_.inflation_radius / res)));
-    float worst = 0.0f;
-    lateral_hard = false;
-    const float soft_band = std::max(1e-3f, static_cast<float>(config_.inflation_radius - config_.body_hard_radius));
-    for (int dr = -rad; dr <= rad; ++dr) {
-      int nr = r + dr;
-      if (nr < 0 || nr >= rows) continue;
-      for (int dc = -rad; dc <= rad; ++dc) {
-        int nc = c + dc;
-        if (nc < 0 || nc >= cols) continue;
-        // double 计算: float 乘法会让 "整 2 格 = 0.2m" 恰好落在硬半径边界时因舍入差 3e-9 漏成软代价
-        const double d = std::hypot(dr, dc) * res;
-        if (d > config_.inflation_radius) continue;
-
-        for (const auto & S : cell_surfaces[static_cast<size_t>(nr * cols + nc)]) {
-          if (S.count < config_.min_cluster_points) continue;
-          // 侧向障碍判据: 结构底面贴近本层踏面 (根长在行走平面附近, 排除悬空板),
-          // 顶面超过 "攀爬包络" 才判墙。攀爬包络: 从本踏面出发每前进一格 (resolution)
-          // 最多再爬一级 max_step_height —— 与 8 邻域建边 `|dz| <= max_step_height` 的
-          // 运动学口径保持一致, 因此格距 k = max(|dr|,|dc|) 的结构顶面在
-          // tread_z + k * max_step_height 以内, 视为可逐级攀爬的楼梯本体, 不判墙。
-          // 注意阈值必须随格距缩放: max_step_height 的物理含义是 "相邻两个落足点之间"
-          // 的单步抬腿极限, 仅在 k=1 (贴身) 时等于踏步极限线 tread_z + 0.25;
-          // 若对远处格子沿用固定 +0.25, 坡度 > atan(max_step_height / body_hard_radius)
-          // (约 51°) 的楼梯段会因累计高差越线被误判成墙, 建边扫掠随之剪光周边全部边,
-          // 整段楼梯断连 (实测 map-segment 二楼楼梯 A-B 两点度数归零)。k=1 时本判据
-          // 与原单级踢面判据完全一致, 贴身墙/转角内切防护不受影响。
-          const int k = std::max(std::abs(dr), std::abs(dc));
-          const float top_limit = tread_z + static_cast<float>(k * config_.max_step_height);
-          if (!(S.z_bottom < tread_z + config_.max_step_height &&
-                S.z_top > top_limit)) continue;
-
-          if (d <= config_.body_hard_radius) { lateral_hard = true; return 1.0f; } // 硬阻挡
-          float soft = 0.7f * (config_.inflation_radius - d) / soft_band; // 距离衰减软代价 (上限0.7, 低于前端0.8禁行显示阈值)
-          worst = std::max(worst, soft);
-        }
-      }
-    }
-    return worst;
-  };
-
+  // 1. 提取踏面节点并初筛上方净空
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < cols; ++c) {
       const auto & surfaces = cell_surfaces[static_cast<size_t>(r * cols + c)];
       if (surfaces.empty()) continue;
 
-      // 提取踏面节点并评估净空 (假设均可通行，不设踏面坡度截断)
       for (size_t s = 0; s < surfaces.size(); ++s) {
         if (surfaces[s].count < config_.min_cluster_points) continue;
-
-        // 净空只对 "达到最小点数门槛" 的面层计算: 相邻踏面边缘溢入的杂散点
-        // 会形成 n=1 的假面层, 若不过滤, 单个噪声点即可在本踏面上方 0.1~0.2m 处
-        // 伪装出 "天花板", 把节点误判为顶头禁行, 并经建边胶囊扫掠剪光周边全部边
-        float headroom = 3.0f; // 默认室外无上顶
-        for (size_t up = s + 1; up < surfaces.size(); ++up) {
-          if (surfaces[up].count < config_.min_cluster_points) continue;
-          headroom = surfaces[up].z_bottom - surfaces[s].z_top;
-          break;
-        }
 
         GraphNode node;
         node.x = static_cast<float>(min_x + (r + 0.5) * res);
@@ -424,33 +489,157 @@ bool CloudGraphBuilder::buildGraphFromColumnTable(const ColumnTable & table, Man
         node.row = r;
         node.col = c;
         node.layer_id = static_cast<int>(s);
+
+        // 净空检查: 本踏面上方第一个有效面层的底板
+        float headroom = 3.0f;
+        for (size_t s_other = 0; s_other < surfaces.size(); ++s_other) {
+          if (surfaces[s_other].count < config_.min_cluster_points) continue;
+          if (static_cast<double>(surfaces[s_other].z_top) <= static_cast<double>(node.z) + 0.5 * config_.cluster_height_diff) continue;
+          headroom = surfaces[s_other].z_bottom - node.z;
+          break;
+        }
         node.headroom = headroom;
 
-        // 顶棚净空不足判定 (满足身高净空即均可通行)
         if (headroom < config_.dog_height) {
-          node.traversability = 1.0f; // 标记顶头不可通过
           node.flags |= node_flags::BLOCK_HEADROOM;
+          node.static_zone = static_cast<uint8_t>(CostZone::FORBIDDEN);
+          node.static_trav = 1.0f;
         } else {
-          node.traversability = 0.0f;
+          node.static_zone = static_cast<uint8_t>(CostZone::FREE);
+          node.static_trav = 0.0f;
         }
-
-        // 机体足印膨胀: 贴墙节点标记阻挡/软代价, 使 A* 走走廊中线、转角外侧绕行
-        if (node.traversability < 0.95f) {
-          bool lateral_hard = false;
-          float inf = inflatedTraversability(r, c, node.z, lateral_hard);
-          node.traversability = std::max(node.traversability, inf);
-          if (lateral_hard) node.flags |= node_flags::BLOCK_LATERAL;
-        }
+        node.dynamic_zone = static_cast<uint8_t>(CostZone::FREE);
+        node.dynamic_trav = 0.0f;
+        node.dynamic_headroom = 3.0f;
+        node.static_headroom = headroom;
 
         out_graph.addNode(node);
       }
     }
   }
 
-  // 5. 拓扑邻居建边: 两遍式 "短边主干 + 长边按需架桥"
+  const size_t total_nodes = out_graph.numNodes();
+
+  // 2. 建立 8 邻域单步物理连通邻接表 (用于拓扑传染扩散)
+  std::vector<std::vector<uint32_t>> single_step_nbrs(total_nodes);
+  for (uint32_t u_id = 0; u_id < total_nodes; ++u_id) {
+    const auto & u = out_graph.getNode(u_id);
+    if (u.flags & node_flags::BLOCK_HEADROOM) continue;
+
+    for (int dr = -1; dr <= 1; ++dr) {
+      for (int dc = -1; dc <= 1; ++dc) {
+        if (dr == 0 && dc == 0) continue;
+        int nr = u.row + dr;
+        int nc = u.col + dc;
+        if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+
+        for (uint32_t v_id : out_graph.getSpatialCellNodes(nr, nc)) {
+          if (v_id == u_id) continue;
+          const auto & v = out_graph.getNode(v_id);
+          if (v.flags & node_flags::BLOCK_HEADROOM) continue;
+
+          // 单步物理连通条件: |Δz| <= max_step_height
+          if (std::abs(u.z - v.z) <= config_.max_step_height) {
+            single_step_nbrs[u_id].push_back(v_id);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. 识别初始障碍接触种子 (低顶禁行 + 8 邻域阻挡立面)
+  struct SeedEntry {
+    float dist;
+    uint32_t nid;
+    bool operator>(const SeedEntry & o) const { return dist > o.dist; }
+  };
+  std::priority_queue<SeedEntry, std::vector<SeedEntry>, std::greater<SeedEntry>> pq;
+  std::vector<float> min_obs_dist(total_nodes, std::numeric_limits<float>::max());
+
+  for (uint32_t u_id = 0; u_id < total_nodes; ++u_id) {
+    const auto & u = out_graph.getNode(u_id);
+    if (u.flags & node_flags::BLOCK_HEADROOM) {
+      min_obs_dist[u_id] = 0.0f;
+      pq.push({0.0f, u_id});
+      continue;
+    }
+
+    // 检查 8 邻域是否有阻挡当前踏面的立面结构
+    for (int dr = -1; dr <= 1; ++dr) {
+      for (int dc = -1; dc <= 1; ++dc) {
+        if (dr == 0 && dc == 0) continue;
+        int nr = u.row + dr;
+        int nc = u.col + dc;
+        if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+
+        const auto & nbr_surfaces = cell_surfaces[static_cast<size_t>(nr * cols + nc)];
+        for (const auto & S : nbr_surfaces) {
+          if (S.count < config_.min_cluster_points) continue;
+          // 阻挡判定: 结构拦截 [u.z + max_step, u.z + dog_height]
+          if (S.z_bottom < u.z + config_.max_step_height &&
+              S.z_top > u.z + config_.max_step_height) {
+            float d_wall = static_cast<float>(std::hypot(dr, dc) * res);
+            if (d_wall < min_obs_dist[u_id]) {
+              min_obs_dist[u_id] = d_wall;
+              pq.push({d_wall, u_id});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 4. 沿单步连通边进行 Dijkstra 拓扑波前扩散 (传染软代价与硬碰撞环)
+  const float infl_rad = static_cast<float>(config_.inflation_radius);
+  const float soft_band = std::max(1e-3f, static_cast<float>(config_.inflation_radius - config_.body_hard_radius));
+
+  while (!pq.empty()) {
+    auto top = pq.top();
+    pq.pop();
+    uint32_t u_id = top.nid;
+    float d_u = top.dist;
+    if (d_u > min_obs_dist[u_id]) continue;
+    if (d_u >= infl_rad) continue;
+
+    const auto & u = out_graph.getNode(u_id);
+    for (uint32_t v_id : single_step_nbrs[u_id]) {
+      const auto & v = out_graph.getNode(v_id);
+      float dx = v.x - u.x;
+      float dy = v.y - u.y;
+      float dz = v.z - u.z;
+      float step_d = std::sqrt(dx * dx + dy * dy + dz * dz);
+      float next_d = d_u + step_d;
+      if (next_d < min_obs_dist[v_id] && next_d <= infl_rad) {
+        min_obs_dist[v_id] = next_d;
+        pq.push({next_d, v_id});
+      }
+    }
+  }
+
+  // 5. 赋区划与合成代价
+  for (uint32_t u_id = 0; u_id < total_nodes; ++u_id) {
+    auto & node = out_graph.nodeMutable(u_id);
+    if (node.flags & node_flags::BLOCK_HEADROOM) {
+      node.static_zone = static_cast<uint8_t>(CostZone::FORBIDDEN);
+      node.static_trav = 1.0f;
+    } else if (config_.body_hard_ring_enabled && min_obs_dist[u_id] < config_.body_hard_radius) {
+      node.static_zone = static_cast<uint8_t>(CostZone::BODY_HARD);
+      node.flags |= node_flags::BLOCK_LATERAL;
+      node.static_trav = 1.0f;
+    } else if (min_obs_dist[u_id] <= config_.inflation_radius) {
+      node.static_zone = static_cast<uint8_t>(CostZone::SOFT);
+      float d_eff = std::max(min_obs_dist[u_id], static_cast<float>(config_.body_hard_radius));
+      node.static_trav = 0.9f * (static_cast<float>(config_.inflation_radius) - d_eff) / soft_band;
+    } else {
+      node.static_zone = static_cast<uint8_t>(CostZone::FREE);
+      node.static_trav = 0.0f;
+    }
+    node.synthesize();
+  }
+
+  // 6. 拓扑邻居建边: 两遍式 "短边主干 + 长边按需架桥"
   //    第一遍只建 8 邻域短边 (连通性主干); 第二遍在跨步窗口内为仍不连通的区域架长边桥,
   //    使长边仅出现在短边链无法连通的位置 (锯齿高差/点云缺失/窄缝), 消除平地冗余直连边
-  size_t total_nodes = out_graph.numNodes();
 
   // 跨步搜索窗口: 按机器狗实际跨步极限换算为栅格半径, 让 max_stride_length 真正约束建边
   const int stride_cells = std::max(1, static_cast<int>(std::ceil(config_.max_stride_length / res)));
@@ -621,16 +810,17 @@ void CloudGraphBuilder::toPointCloudMsg(const ManifoldGraph & graph,
                                         const std::string & frame_id,
                                         sensor_msgs::PointCloud2 & out_cloud)
 {
-  pcl::PointCloud<pcl::PointXYZI> pc;
+  pcl::PointCloud<ElevationZonePoint> pc;
   pc.points.reserve(graph.numNodes());
 
   for (size_t i = 0; i < graph.numNodes(); ++i) {
     const auto & nd = graph.getNode(static_cast<uint32_t>(i));
-    pcl::PointXYZI pt;
+    ElevationZonePoint pt;
     pt.x = nd.x;
     pt.y = nd.y;
     pt.z = nd.z;
     pt.intensity = nd.traversability;
+    pt.zone = nd.cost_zone;
     pc.points.push_back(pt);
   }
 
@@ -767,8 +957,8 @@ std::string CloudGraphBuilder::diagnoseEdge(const ManifoldGraph & graph,
      << "\"status\":\"ok\","
      << "\"connected\":" << (connected ? "true" : "false") << ","
      << "\"cost\":" << edge_cost << ","
-     << "\"node_a\":{\"id\":" << u_id << ",\"x\":" << u.x << ",\"y\":" << u.y << ",\"z\":" << u.z << ",\"row\":" << u.row << ",\"col\":" << u.col << ",\"layer\":" << u.layer_id << ",\"headroom\":" << u.headroom << ",\"traversability\":" << u.traversability << "},"
-     << "\"node_b\":{\"id\":" << v_id << ",\"x\":" << v.x << ",\"y\":" << v.y << ",\"z\":" << v.z << ",\"row\":" << v.row << ",\"col\":" << v.col << ",\"layer\":" << v.layer_id << ",\"headroom\":" << v.headroom << ",\"traversability\":" << v.traversability << "},"
+     << "\"node_a\":{\"id\":" << u_id << ",\"x\":" << u.x << ",\"y\":" << u.y << ",\"z\":" << u.z << ",\"row\":" << u.row << ",\"col\":" << u.col << ",\"layer\":" << u.layer_id << ",\"headroom\":" << u.headroom << ",\"traversability\":" << u.traversability << ",\"zone\":" << static_cast<int>(u.cost_zone) << "},"
+     << "\"node_b\":{\"id\":" << v_id << ",\"x\":" << v.x << ",\"y\":" << v.y << ",\"z\":" << v.z << ",\"row\":" << v.row << ",\"col\":" << v.col << ",\"layer\":" << v.layer_id << ",\"headroom\":" << v.headroom << ",\"traversability\":" << v.traversability << ",\"zone\":" << static_cast<int>(v.cost_zone) << "},"
      << "\"metrics\":{\"dxy\":" << dxy << ",\"dz\":" << dz << ",\"slope_deg\":" << slope_deg << ",\"dr\":" << dr << ",\"dc\":" << dc << "},"
      << "\"limits\":{\"max_step_height\":" << config_.max_step_height << ",\"max_stride_length\":" << config_.max_stride_length << ",\"dog_height\":" << config_.dog_height << ",\"body_hard_radius\":" << config_.body_hard_radius << ",\"footprint_radius\":" << config_.footprint_radius << "},"
      << "\"reason\":\"";
@@ -838,6 +1028,17 @@ std::string CloudGraphBuilder::diagnoseNode(const ManifoldGraph & graph,
 
   bool blocked = u.traversability >= 0.95f;
   const bool wall_in_hard = has_wall && wall_d <= config_.body_hard_radius + config_.resolution;
+  // 动态层叠加判定: 融合引擎写入的动态封锁/膨胀 (静态图上不可见, 活图诊断才看得到)
+  const bool dynamic_hard = u.dynamic_zone >= static_cast<uint8_t>(CostZone::BODY_HARD) ||
+                            u.dynamic_trav >= 0.95f;
+  const bool dynamic_overlay = (u.dynamic_zone != static_cast<uint8_t>(CostZone::FREE)) ||
+                               u.dynamic_trav > 0.0f;
+  auto zoneName = [](uint8_t z) -> const char * {
+    switch (z) {
+      case 0: return "FREE"; case 1: return "SOFT";
+      case 2: return "BODY_HARD"; default: return "FORBIDDEN";
+    }
+  };
   std::string code, reason;
   if (blocked) {
     if (u.flags & node_flags::BLOCK_HEADROOM) {
@@ -850,14 +1051,24 @@ std::string CloudGraphBuilder::diagnoseNode(const ManifoldGraph & graph,
       } else {
         reason = "禁行: 建图时栅格级判定足印硬半径 " + fmt2(config_.body_hard_radius) + "m 内存在竖直墙体 (细结构未形成独立图节点, 无法给出精确方位)";
       }
+    } else if (dynamic_hard) {
+      code = "dynamic_blocked";
+      reason = std::string("融合动态禁行: 实时观测障碍 (动态区划 ") +
+               (u.dynamic_zone >= static_cast<uint8_t>(CostZone::FORBIDDEN) ? "FORBIDDEN 障碍本体/顶头" : "BODY_HARD 机体硬环") +
+               ", dyn_trav=" + fmt2(u.dynamic_trav) + "), 静态先验此处可通行";
     } else {
       code = "blocked";
       reason = "禁行节点 (原因未记录)";
     }
+  } else if (dynamic_overlay) {
+    code = "dynamic_inflation";
+    reason = "融合动态叠加: 实时观测障碍软带 (dyn_trav=" + fmt2(u.dynamic_trav) +
+             ", 动态区划 " + zoneName(u.dynamic_zone) + ", 合成 trav=" + fmt2(u.traversability) +
+             "), 可通行但代价升高";
   } else if (u.traversability > 0.05f) {
     code = "soft_inflation";
     if (has_wall && wall_d > config_.body_hard_radius + config_.resolution) {
-      reason = "软膨胀减速区: 距侧向墙体 " + fmt2(wall_d) + "m (" + dirName(wall_dx, wall_dy) + ", 膨胀带 " + fmt2(config_.body_hard_radius) + "~" + fmt2(config_.footprint_radius) + "m), 可通行但代价升高";
+      reason = "软膨胀减速区: 距侧向墙体 " + fmt2(wall_d) + "m (" + dirName(wall_dx, wall_dy) + ", 膨胀带 " + fmt2(config_.body_hard_radius) + "~" + fmt2(config_.inflation_radius) + "m), 可通行但代价升高";
     } else {
       reason = "软代价减速区 (trav=" + fmt2(u.traversability) + "), 位于机体膨胀带内, 可通行但代价升高";
     }
@@ -870,7 +1081,11 @@ std::string CloudGraphBuilder::diagnoseNode(const ManifoldGraph & graph,
      << "\"status\":\"ok\","
      << "\"node\":{\"id\":" << nid << ",\"x\":" << u.x << ",\"y\":" << u.y << ",\"z\":" << u.z
      << ",\"layer\":" << u.layer_id << ",\"headroom\":" << u.headroom
-     << ",\"traversability\":" << u.traversability << ",\"flags\":" << u.flags << "},"
+     << ",\"traversability\":" << u.traversability << ",\"zone\":" << static_cast<int>(u.cost_zone)
+     << ",\"static_trav\":" << u.static_trav << ",\"dynamic_trav\":" << u.dynamic_trav
+     << ",\"static_zone\":" << static_cast<int>(u.static_zone)
+     << ",\"dynamic_zone\":" << static_cast<int>(u.dynamic_zone)
+     << ",\"flags\":" << u.flags << "},"
      << "\"blocked\":" << (blocked ? "true" : "false") << ","
      << "\"reason_code\":\"" << code << "\","
      << "\"reason\":\"" << reason << "\","

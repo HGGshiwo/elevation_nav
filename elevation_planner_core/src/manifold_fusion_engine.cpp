@@ -9,7 +9,9 @@
 #include <elevation_planner_core/graph_store.hpp>
 
 #include <cmath>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace elevation_planner
 {
@@ -36,15 +38,31 @@ void ManifoldFusionEngine::ingestAuxCloud(const sensor_msgs::PointCloud2::ConstP
 
 void ManifoldFusionEngine::restoreMutations()
 {
-  if (!mutated_graph_) return;
-  for (const auto & kv : touched_nodes_)
-  {
-    auto & node = mutated_graph_->nodeMutable(kv.first);
-    node.traversability = kv.second.first;
-    node.headroom = kv.second.second;
-  }
-  touched_nodes_.clear();
+  if (!mutated_graph_ || !prev_valid_) return;
+  const auto & cfg = graph_builder_.getConfig();
+  const int inflate = static_cast<int>(std::ceil(cfg.inflation_radius / cfg.resolution)) + 1;
+  clearDynamicLayer(mutated_graph_,
+                    std::max(0, prev_r0_ - inflate), std::max(0, prev_c0_ - inflate),
+                    std::min(mutated_graph_->getRows() - 1, prev_r1_ + inflate),
+                    std::min(mutated_graph_->getCols() - 1, prev_c1_ + inflate));
+  prev_valid_ = false;
   dynamic_nodes_.clear();
+}
+
+void ManifoldFusionEngine::clearDynamicLayer(const std::shared_ptr<ManifoldGraph> & graph,
+                                             int r0, int c0, int r1, int c1)
+{
+  for (int r = r0; r <= r1; ++r)
+    for (int c = c0; c <= c1; ++c)
+      for (uint32_t nid : graph->getSpatialCellNodes(r, c))
+      {
+        if (nid >= graph->numNodes()) continue;
+        auto & node = graph->nodeMutable(nid);
+        node.dynamic_trav = 0.f;
+        node.dynamic_headroom = 3.0f;
+        node.dynamic_zone = static_cast<uint8_t>(CostZone::FREE);
+        node.synthesize();
+      }
 }
 
 ManifoldFusionEngine::~ManifoldFusionEngine()
@@ -90,12 +108,13 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
       pcl::fromROSMsg(*aux, aux_pts);
       *cloud += aux_pts;
     }
-  } catch (const tf2::TransformException &) {
+  } catch (const tf2::TransformException & ex) {
+    ROS_WARN_THROTTLE(2.0, "[Fusion] TF transform exception: %s", ex.what());
     return false;
   }
 
   if (cloud->empty()) {
-    // 空观测: 无状态语义 = 纯先验, 恢复所有动态改写
+    ROS_WARN_THROTTLE(2.0, "[Fusion] Combined pointcloud (main + aux) is empty -> restoring mutations (dynamic layer cleared)");
     restoreMutations();
     return false;
   }
@@ -119,8 +138,8 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
   }
 
   if (cropped->empty()) {
-    // 空观测: 无状态语义下融合结果 = 纯先验, 恢复所有动态改写
-    // (注入器在无激活障碍时持续发空帧, 障碍消失后封锁随首帧空观测自动清除)
+    ROS_WARN_THROTTLE(2.0, "[Fusion] Cropped ROI cloud is 0 points! Total raw points=%zu. Robot=(%.2f, %.2f, %.2f), crop_radius_xy=%.2fm, z_band=[%.2f, %.2f]. All obstacles outside crop window -> restoring mutations (cleared dynamic obstacles)",
+                      cloud->size(), rx, ry, rz, params_.crop_radius_xy, band_low, band_high);
     restoreMutations();
     return false;
   }
@@ -135,6 +154,7 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
 
   ColumnTable observed;
   if (!graph_builder_.buildColumnTable(cropped, observed, &local_extent) || observed.empty()) {
+    ROS_WARN_THROTTLE(2.0, "[Fusion] Failed to build observed column table -> restoring mutations");
     restoreMutations();
     return false;
   }
@@ -143,11 +163,11 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
   auto prior_table = GraphStore::instance().getGlobalTable();
   if (!graph || graph->numNodes() == 0 || !prior_table) return false;
 
-  // 换图 (全局图重建设) 时, 旧图上的属性快照作废
+  // 换图 (全局图重建设) 时, 上一帧窗口作废 (新图动态层本就为空)
   if (graph != mutated_graph_)
   {
     mutated_graph_ = graph;
-    touched_nodes_.clear();
+    prev_valid_ = false;
   }
 
   const auto & cfg = graph_builder_.getConfig();
@@ -204,10 +224,27 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
   // 跨层重算既无意义又会因柱面差异误改静态通行性)
   const double z_band_low = band_low - 0.3;
   const double z_band_high = band_high + 0.3;
+
+  // ---- 无状态分层刷新 (无变化检测/无快照): ----
+  //   清理区 = 上帧 ∪ 本帧 ROI (外扩膨胀半径): 动态层清零, 覆盖障碍出现/消失/移动
+  //   应用区 = 本帧 ROI: 逐节点全量重算动态层, 加法叠加静态层 (封顶 1.0)
+  //   两条膨胀带重叠的窄缝代数和越过禁行线 → 合成 1.0 = 机体真过不去, 语义自洽
+  const int inflate_cells = static_cast<int>(std::ceil(cfg.inflation_radius / res)) + 1;
+
+  // 1) 局部计算本帧 ROI 窗口内所有节点的最新动态状态 (无中间态, 存于局部 new_dyn)
+  struct DynState {
+    float dyn_trav{0.0f};
+    float dyn_head{3.0f};
+    uint8_t dyn_zone{static_cast<uint8_t>(CostZone::FREE)};
+  };
+  std::unordered_map<uint32_t, DynState> new_dyn;
+  new_dyn.reserve(static_cast<size_t>((r1 - r0 + 1) * (c1 - c0 + 1) * 2));
+
   for (int r = r0; r <= r1; ++r) {
     for (int c = c0; c <= c1; ++c) {
       for (uint32_t nid : graph->getSpatialCellNodes(r, c)) {
-        const GraphNode nd = graph->getNode(nid); // 拷贝读, 避免写者-读者别名
+        if (nid >= graph->numNodes()) continue;
+        const GraphNode & nd = graph->getNode(nid);
         if (nd.z < z_band_low || nd.z > z_band_high) continue;
 
         auto fetch = [&](int dr, int dc) -> const std::vector<ColumnSurface> * {
@@ -216,68 +253,80 @@ bool ManifoldFusionEngine::processLatestCloud(tf2_ros::Buffer * tf, const geomet
         const auto * self = fetch(0, 0);
         if (!self) continue;
 
-        float headroom = 0.0f;
-        bool lateral_hard = false;
-        const float dyn_trav = CloudGraphBuilder::computeNodeTraversability(
-            nd.z, *self, fetch, cfg, headroom, lateral_hard);
+        float dyn_soft = 0.0f;
+        float dyn_head = 0.0f;
+        const CostZone dyn_zone = CloudGraphBuilder::computeNodeZone(
+            nd.z, *self, fetch, cfg, dyn_soft, dyn_head);
 
-        auto it = touched_nodes_.find(nid);
-        const float prior_trav = (it != touched_nodes_.end()) ? it->second.first : nd.traversability;
-        const float prior_head = (it != touched_nodes_.end()) ? it->second.second : nd.headroom;
+        DynState st;
+        st.dyn_zone = static_cast<uint8_t>(dyn_zone);
+        st.dyn_trav = (dyn_zone == CostZone::BODY_HARD || dyn_zone == CostZone::FORBIDDEN)
+                          ? 1.0f : dyn_soft;
+        st.dyn_head = dyn_head;
+        new_dyn.emplace(nid, st);
+      }
+    }
+  }
 
-        // 永不解锁不变量: 注入障碍只会让通行性变差 (封锁/软代价/净空变小),
-        // 不会让不可行走的节点变可走 —— 杜绝"走上天花板"类重算偏差
-        const float eff_trav = std::max(prior_trav, dyn_trav);
-        const float eff_head = std::min(prior_head, headroom);
+  // 2) 原子覆写与清理 (In-place Overwrite: 绝不在原图上先清零再重算产生裸 FREE 中间态)
+  dynamic_nodes_.clear();
+  std::unordered_set<uint32_t> touched_nids;
+  touched_nids.reserve(new_dyn.size());
 
-        if (std::abs(eff_trav - prior_trav) > 1e-6f || std::abs(eff_head - prior_head) > 1e-4f) {
-          // 动态值偏离先验: 原位写回 (首次改写时记录快照)
+  // 2a) 覆写本帧计算出的全部节点状态
+  for (const auto & kv : new_dyn) {
+    uint32_t nid = kv.first;
+    touched_nids.insert(nid);
+    const auto & st = kv.second;
+    auto & node = graph->nodeMutable(nid);
+
+    // 状态实质改变时才写入, 避免频繁脏写与 cache line 颠簸
+    if (std::fabs(node.dynamic_trav - st.dyn_trav) > 1e-6f ||
+        std::fabs(node.dynamic_headroom - st.dyn_head) > 1e-4f ||
+        node.dynamic_zone != st.dyn_zone)
+    {
+      node.dynamic_trav = st.dyn_trav;
+      node.dynamic_headroom = st.dyn_head;
+      node.dynamic_zone = st.dyn_zone;
+      node.synthesize();
+      ++changed;
+    }
+
+    if (node.dynamic_zone > static_cast<uint8_t>(CostZone::FREE) || node.dynamic_trav > 0.f) {
+      dynamic_nodes_.push_back({node.x, node.y, node.z, node.traversability,
+                                static_cast<float>(node.cost_zone)});
+    }
+  }
+
+  // 2b) 清理上一帧窗口中有动态值但本帧不在 new_dyn 中的节点 (障碍消失/移出视野)
+  if (prev_valid_) {
+    const int wr0 = std::max(0, prev_r0_ - inflate_cells), wc0 = std::max(0, prev_c0_ - inflate_cells);
+    const int wr1 = std::min(graph->getRows() - 1, prev_r1_ + inflate_cells);
+    const int wc1 = std::min(graph->getCols() - 1, prev_c1_ + inflate_cells);
+    for (int r = wr0; r <= wr1; ++r) {
+      for (int c = wc0; c <= wc1; ++c) {
+        for (uint32_t nid : graph->getSpatialCellNodes(r, c)) {
+          if (nid >= graph->numNodes()) continue;
+          if (touched_nids.count(nid) > 0) continue; // 本帧已原子覆写
+
           auto & node = graph->nodeMutable(nid);
-          node.traversability = eff_trav;
-          node.headroom = eff_head;
-          if (it == touched_nodes_.end()) {
-            touched_nodes_.emplace(nid, std::make_pair(prior_trav, prior_head));
+          if (node.dynamic_trav > 0.f || node.dynamic_headroom < 3.0f ||
+              node.dynamic_zone != static_cast<uint8_t>(CostZone::FREE))
+          {
+            node.dynamic_trav = 0.f;
+            node.dynamic_headroom = 3.0f;
+            node.dynamic_zone = static_cast<uint8_t>(CostZone::FREE);
+            node.synthesize();
+            ++changed;
           }
-          ++changed;
-        } else if (it != touched_nodes_.end()) {
-          // 动态值回到先验 (障碍离开): 恢复快照并移除记录
-          auto & node = graph->nodeMutable(nid);
-          node.traversability = prior_trav;
-          node.headroom = prior_head;
-          touched_nodes_.erase(it);
-          ++changed;
         }
       }
     }
   }
 
-  // 已改写但落出当前观测范围 (XY 超出 ROI 或 z 超出层带) 的节点:
-  // 观测不再覆盖, 按无状态语义恢复先验 (与旧独立融合图 "障碍只存在于被观测到的当帧" 一致)
-  for (auto it = touched_nodes_.begin(); it != touched_nodes_.end();) {
-    const GraphNode & nd = graph->getNode(it->first);
-    const int orr = static_cast<int>(std::floor((nd.x - oe.min_x) / res));
-    const int occ = static_cast<int>(std::floor((nd.y - oe.min_y) / res));
-    const bool in_scope = (orr >= 0 && orr < oe.rows && occ >= 0 && occ < oe.cols &&
-                           nd.z >= z_band_low && nd.z <= z_band_high);
-    if (!in_scope) {
-      auto & node = graph->nodeMutable(it->first);
-      node.traversability = it->second.first;
-      node.headroom = it->second.second;
-      it = touched_nodes_.erase(it);
-      ++changed;
-    } else {
-      ++it;
-    }
-  }
-
-  // 当前被动态改写节点的快照 (供宿主发布实时可视化)
-  dynamic_nodes_.clear();
-  dynamic_nodes_.reserve(touched_nodes_.size());
-  for (const auto & kv : touched_nodes_)
-  {
-    const GraphNode & nd = graph->getNode(kv.first);
-    dynamic_nodes_.push_back({nd.x, nd.y, nd.z, nd.traversability});
-  }
+  // 记录本帧窗口供下一帧清理
+  prev_r0_ = r0; prev_c0_ = c0; prev_r1_ = r1; prev_c1_ = c1;
+  prev_valid_ = true;
 
   return changed > 0;
 }

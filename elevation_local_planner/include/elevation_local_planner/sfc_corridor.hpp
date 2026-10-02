@@ -2,6 +2,7 @@
 
 #include "elevation_planner_core/manifold_graph.hpp"
 #include "elevation_planner_core/path_simplifier.hpp"
+#include <ros/console.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Point.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -10,11 +11,28 @@
 #include <queue>
 #include <unordered_set>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 #include <limits>
 
 namespace elevation_local_planner
 {
+
+/**
+ * @brief [DBG] 负空间格诊断记录: 每个非 visited 格的节点信息与未访问原因
+ *
+ * why 分类: N=格内无节点 (空洞/立面)  A=最近节点高出段层带 (z-段高 > max_step)
+ *           B=最近节点低于段层带      K=层带内但硬禁行 (trav>=0.95)
+ *           U=层带内可走但未被 BFS 访问 (半径/去重/前沿互锁伪影)
+ */
+struct NegativeCell
+{
+  Eigen::Vector2d p;      ///< 格中心
+  float z{0.f};           ///< 格内距段折线插值高度最近节点的 z (无节点 = 0)
+  float trav{0.f};        ///< 该节点通行性
+  float dz{0.f};          ///< 该节点相对段折线插值高度的差 (z - z_line)
+  char why{'N'};          ///< 上述分类
+};
 
 /**
  * @brief 单个流形图踏面节点缓存数据 (完全消除坐标二次查图)
@@ -52,6 +70,9 @@ struct ConvexCorridor2D
   int32_t layer_id{0};                    ///< 所在流形图层级
   LinearConstraint2D constraint;          ///< Andrew 凸包线性约束 A*q <= b
   std::vector<CorridorNode3D> node_pts;   ///< BFS 扩散收集的所有真实流形图节点 (x, y, z)
+  std::vector<NegativeCell> negative_cells;    ///< [DBG] 负空间格诊断集 (visited 补集, bbox 内): JSON obstacles 字段数据源
+  double inscribed_width{1e9};            ///< [DBG] 段折线最大内切宽度 (2×线点到自身约束面距离); 段式生成时计算, 未计算=1e9
+  double body_clearance{1e9};             ///< 机体间隙闸: 沿段折线采样点到自身约束面的最小距离; < body_hard_radius → 链贴障碍, 规划失败
 
   /**
    * @brief 完全通过已记录的节点集快速查询 (x, y) 处的高程 Z (零图查表开销)
@@ -81,6 +102,192 @@ using ConvexPolygon2D = ConvexCorridor2D;
 /**
  * @brief 2D 凸走廊生成器 (基于真实拓扑单步相邻 BFS 扩散 + Andrew 单调链算法，零 findClosestNode 查点)
  */
+/**
+ * @brief 迭代半平面交走廊生成器 (Decomp 式): 折线种子 → visited 补集为障碍点集 → 逐刀切割
+ *
+ * 不变量 (每刀保持, 收敛即正确):
+ *   1. 凸性: 半平面交集恒凸;
+ *   2. 折线包含: min_clearance 动态截断保投影点, 最近点性质保整条折线在安全侧;
+ *   3. 无禁行: 终止条件 = 障碍点集清空 (visited 补集 = 墙/悬崖/空洞/未建图/异层/剪枝格统一)。
+ * 顶点仅为可视化 (SH 裁剪), 退化不影响优化 (优化只认 A,b)。
+ */
+class DecompCorridorGenerator
+{
+public:
+  static ConvexCorridor2D generate(
+      const std::vector<Eigen::Vector2d>& line,
+      const elevation_planner::ManifoldGraph& graph,
+      const std::unordered_set<int64_t>& visited_cells,
+      int rmin, int rmax, int cmin, int cmax,
+      double min_clearance = 0.01,
+      double z0 = 0.0, double z1 = 0.0, double max_step = 0.25,
+      std::vector<NegativeCell>* negative_space_out = nullptr)
+  {
+    ConvexCorridor2D cor;
+    if (line.empty()) return cor;
+
+    // 负空间障碍物集: visited 补集 (bbox 内), 每格附分类诊断 (见 NegativeCell):
+    // z_line = 段折线在该格投影处的两端 z 线性插值; 分类是"为什么在负空间里"的
+    // 事实记录 —— 障碍/不联通的语义区分以此为基础, 不靠猜测
+    struct Obstacle { Eigen::Vector2d p; NegativeCell dbg; };
+    std::vector<Obstacle> O;
+    const double res = graph.getResolution();
+    for (int r = rmin; r <= rmax; ++r)
+      for (int c = cmin; c <= cmax; ++c)
+      {
+        const int64_t key = (static_cast<int64_t>(r) << 32) | static_cast<uint32_t>(c);
+        if (visited_cells.count(key)) continue;
+        Eigen::Vector2d p(graph.getMinX() + (r + 0.5) * res,
+                          graph.getMinY() + (c + 0.5) * res);
+        double t = 0.0;
+        if (line.size() >= 2)
+        {
+          const Eigen::Vector2d dv = line.back() - line.front();
+          const double l2 = dv.squaredNorm();
+          if (l2 > 1e-12)
+            t = std::max(0.0, std::min(1.0, (p - line.front()).dot(dv) / l2));
+        }
+        const double z_line = z0 + t * (z1 - z0);
+        NegativeCell dbg;
+        dbg.p = p;
+        bool has = false;
+        for (uint32_t nid : graph.getSpatialCellNodes(r, c))
+        {
+          if (nid >= graph.numNodes()) continue;
+          const auto & nd = graph.getNode(nid);
+          if (!has || std::fabs(nd.z - z_line) < std::fabs(dbg.z - z_line))
+          {
+            dbg.z = nd.z;
+            dbg.trav = nd.traversability;
+            has = true;
+          }
+        }
+        if (!has)
+        {
+          dbg.why = 'N';
+        }
+        else
+        {
+          dbg.dz = static_cast<float>(dbg.z - z_line);
+          if (dbg.dz > max_step) dbg.why = 'A';
+          else if (dbg.dz < -max_step) dbg.why = 'B';
+          else if (dbg.trav >= 0.95f) dbg.why = 'K';
+          else dbg.why = 'U';
+        }
+        O.push_back({p, dbg});
+      }
+
+    // [DBG] 导出负空间诊断集: 前端/离线分析可见走廊是被哪些格、因何原因切出来的
+    if (negative_space_out)
+    {
+      *negative_space_out = {};
+      negative_space_out->reserve(O.size());
+      for (const auto & ob : O) negative_space_out->push_back(ob.dbg);
+    }
+
+    // 初始包围盒 (visited bbox): 4 条半平面恒在, 保证约束非空
+    Eigen::Vector2d dir(1.0, 0.0);
+    if (line.size() >= 2)
+    {
+      Eigen::Vector2d d = line.back() - line.front();
+      if (d.squaredNorm() > 1e-9) dir = d.normalized();
+    }
+    const Eigen::Vector2d nrm(-dir.y(), dir.x());
+    const Eigen::Vector2d mid(graph.getMinX() + (rmin + rmax + 1) * 0.5 * res,
+                              graph.getMinY() + (cmin + cmax + 1) * 0.5 * res);
+    const double half_l = 0.5 * ((rmax - rmin) + (cmax - cmin)) * res + 2.0 * res;
+    const double half_w = half_l;
+
+    Eigen::MatrixX2d A(4, 2);
+    Eigen::VectorXd b(4);
+    A.row(0) = dir;  b(0) = dir.dot(mid) + half_l;
+    A.row(1) = -dir; b(1) = -dir.dot(mid) + half_l;
+    A.row(2) = nrm;  b(2) = nrm.dot(mid) + half_w;
+    A.row(3) = -nrm; b(3) = -nrm.dot(mid) + half_w;
+
+    std::vector<Eigen::Vector2d> verts = {
+        mid + dir * half_l + nrm * half_w,  mid - dir * half_l + nrm * half_w,
+        mid - dir * half_l - nrm * half_w,  mid + dir * half_l - nrm * half_w};
+
+    // 点到折线最近点 (投影 t 截断在段内)
+    auto closestOnLine = [&](const Eigen::Vector2d& o, Eigen::Vector2d& proj) -> double {
+      double best = 1e18;
+      if (line.size() == 1) { proj = line.front(); return (o - proj).norm(); }
+      for (size_t i = 0; i + 1 < line.size(); ++i)
+      {
+        const Eigen::Vector2d a = line[i], dvec = line[i + 1] - line[i];
+        const double l2 = dvec.squaredNorm();
+        const double t = (l2 > 1e-12) ? std::max(0.0, std::min(1.0, (o - a).dot(dvec) / l2)) : 0.0;
+        const Eigen::Vector2d q = a + t * dvec;
+        const double d = (o - q).norm();
+        if (d < best) { best = d; proj = q; }
+      }
+      return best;
+    };
+
+    // 迭代切割 (两层保护)
+    int safety = static_cast<int>(O.size()) + 8;
+    while (!O.empty() && safety-- > 0)
+    {
+      size_t bi = 0;
+      double bd = 1e18;
+      Eigen::Vector2d bproj(0.0, 0.0);
+      for (size_t i = 0; i < O.size(); ++i)
+      {
+        Eigen::Vector2d pr;
+        const double d = closestOnLine(O[i].p, pr);
+        if (d < bd) { bd = d; bi = i; bproj = pr; }
+      }
+      const Eigen::Vector2d o = O[bi].p;
+      const Eigen::Vector2d v = o - bproj;
+      const double d = v.norm();
+      if (d < min_clearance)
+        return ConvexCorridor2D();   // 障碍落在折线上: 真不可行, 放弃本段 (move_base 重试)
+      const Eigen::Vector2d n = v / d;
+      // 无 margin: 贴障碍格中心切割 —— 机体与障碍的间距由 A* 代价层 (膨胀软带
+      // 推链居中) 负责; 本层的机体间隙由 body_clearance 闸验证, 不足即失败冻结
+      const double d_cut = d;
+      const Eigen::Vector2d p_cut = bproj + n * d_cut;
+
+      const int rows = static_cast<int>(A.rows());
+      A.conservativeResize(rows + 1, Eigen::NoChange);
+      A.row(rows) = n.transpose();
+      b.conservativeResize(rows + 1);
+      b(rows) = n.dot(p_cut);
+
+      // 可视化多边形 SH 裁剪
+      std::vector<Eigen::Vector2d> clipped;
+      for (size_t i = 0; i < verts.size(); ++i)
+      {
+        const Eigen::Vector2d& cur = verts[i];
+        const Eigen::Vector2d& nxt = verts[(i + 1) % verts.size()];
+        const bool cur_in = n.dot(cur) <= b(rows) + 1e-12;
+        const bool nxt_in = n.dot(nxt) <= b(rows) + 1e-12;
+        if (cur_in) clipped.push_back(cur);
+        if (cur_in != nxt_in)
+        {
+          const double dc = n.dot(cur) - b(rows), dn = n.dot(nxt) - b(rows);
+          clipped.push_back(cur + (nxt - cur) * (dc / (dc - dn)));
+        }
+      }
+      verts = clipped;
+
+      // 剔除被切除的障碍点
+      std::vector<Obstacle> rest;
+      for (const auto& ok : O)
+        if (n.dot(ok.p) < b(rows) - 1e-12)
+          rest.push_back(ok);
+      O.swap(rest);
+    }
+
+    cor.center = line.front();
+    cor.constraint.A = A;
+    cor.constraint.b = b;
+    cor.constraint.vertices = verts;
+    return cor;
+  }
+};
+
 class SFCGenerator
 {
 public:
@@ -148,407 +355,6 @@ public:
 
   /**
    * @brief 将凸走廊与扩散节点全量序列化为 JSON 字符串供 Web 前端交互诊断
-   */
-  static std::string toJsonString(
-      const std::vector<ConvexCorridor2D>& corridors,
-      const std::vector<Eigen::Vector2d>& opt_control_points = {})
-  {
-    std::string json = "{\"corridors\":[";
-    bool has_opt = (!opt_control_points.empty() && 
-                    (opt_control_points.size() == corridors.size() + 2 || 
-                     opt_control_points.size() == corridors.size()));
-
-    for (size_t i = 0; i < corridors.size(); ++i)
-    {
-      const auto& c = corridors[i];
-      if (i > 0) json += ",";
-      json += "{";
-      json += "\"idx\":" + std::to_string(i) + ",";
-      json += "\"root_id\":" + std::to_string(c.root_node_id) + ",";
-      json += "\"x\":" + std::to_string(c.center.x()) + ",";
-      json += "\"y\":" + std::to_string(c.center.y()) + ",";
-      json += "\"z\":" + std::to_string(c.z_ref) + ",";
-      json += "\"layer\":" + std::to_string(c.layer_id) + ",";
-
-      // 优化后的物理点 p_i 与控制点 q_i 及走廊违约穿透量
-      if (has_opt)
-      {
-        Eigen::Vector2d p_i;
-        Eigen::Vector2d q_i;
-        if (opt_control_points.size() == corridors.size() + 2)
-        {
-          p_i = (opt_control_points[i] + 4.0 * opt_control_points[i + 1] + opt_control_points[i + 2]) / 6.0;
-          q_i = opt_control_points[i + 1];
-        }
-        else
-        {
-          Eigen::Vector2d q_prev = (i > 0) ? opt_control_points[i - 1] : opt_control_points[0];
-          Eigen::Vector2d q_curr = opt_control_points[i];
-          Eigen::Vector2d q_next = (i + 1 < opt_control_points.size()) ? opt_control_points[i + 1] : opt_control_points.back();
-          p_i = (q_prev + 4.0 * q_curr + q_next) / 6.0;
-          q_i = q_curr;
-        }
-        double pz = c.queryZFromNodes(p_i.x(), p_i.y());
-
-        double max_viol = 0.0;
-        if (c.constraint.A.rows() > 0)
-        {
-          Eigen::VectorXd viol = c.constraint.A * q_i - c.constraint.b;
-          for (int j = 0; j < viol.size(); ++j)
-          {
-            if (viol(j) > max_viol) max_viol = viol(j);
-          }
-        }
-
-        json += "\"opt_p\":[" + std::to_string(p_i.x()) + "," + std::to_string(p_i.y()) + "," + std::to_string(pz) + "],";
-        json += "\"opt_q\":[" + std::to_string(q_i.x()) + "," + std::to_string(q_i.y()) + "],";
-        json += "\"viol\":" + std::to_string(max_viol) + ",";
-      }
-
-      // 凸包多边形
-      json += "\"polygon\":[";
-      for (size_t v = 0; v < c.constraint.vertices.size(); ++v)
-      {
-        if (v > 0) json += ",";
-        const auto& pt = c.constraint.vertices[v];
-        double pz = c.queryZFromNodes(pt.x(), pt.y());
-        json += "[" + std::to_string(pt.x()) + "," + std::to_string(pt.y()) + "," + std::to_string(pz) + "]";
-      }
-      json += "],";
-
-      // 扩散图节点
-      json += "\"nodes\":[";
-      for (size_t n = 0; n < c.node_pts.size(); ++n)
-      {
-        if (n > 0) json += ",";
-        const auto& nd = c.node_pts[n];
-        json += "{\"id\":" + std::to_string(nd.id) +
-                ",\"x\":" + std::to_string(nd.x) +
-                ",\"y\":" + std::to_string(nd.y) +
-                ",\"z\":" + std::to_string(nd.z) +
-                ",\"l\":" + std::to_string(nd.layer_id) +
-                ",\"r\":" + std::to_string(nd.row) +
-                ",\"c\":" + std::to_string(nd.col) + "}";
-      }
-      json += "]}";
-    }
-    json += "]}";
-    return json;
-  }
-
-  /**
-   * @brief 完全通过已记录的节点集与凸包顶点进行 MarkerArray 可视化 (零图查表)
-   */
-  static void toVisualMarkers(
-      const std::vector<ConvexCorridor2D>& corridors,
-      const std::string& frame_id,
-      visualization_msgs::MarkerArray& out_markers)
-  {
-    out_markers.markers.clear();
-    if (corridors.empty()) return;
-
-    ros::Time now = ros::Time::now();
-
-    visualization_msgs::Marker line_marker;
-    line_marker.header.frame_id = frame_id;
-    line_marker.header.stamp = now;
-    line_marker.ns = "sfc_corridor_wireframe";
-    line_marker.id = 0;
-    line_marker.type = visualization_msgs::Marker::LINE_LIST;
-    line_marker.action = visualization_msgs::Marker::ADD;
-    line_marker.scale.x = 0.02;
-    line_marker.color.r = 0.0f;
-    line_marker.color.g = 0.95f;
-    line_marker.color.b = 0.95f;
-    line_marker.color.a = 0.9f;
-
-    visualization_msgs::Marker face_marker;
-    face_marker.header.frame_id = frame_id;
-    face_marker.header.stamp = now;
-    face_marker.ns = "sfc_corridor_boxes";
-    face_marker.id = 1;
-    face_marker.type = visualization_msgs::Marker::TRIANGLE_LIST;
-    face_marker.action = visualization_msgs::Marker::ADD;
-    face_marker.scale.x = 1.0;
-    face_marker.scale.y = 1.0;
-    face_marker.scale.z = 1.0;
-    face_marker.color.r = 0.1f;
-    face_marker.color.g = 0.8f;
-    face_marker.color.b = 0.9f;
-    face_marker.color.a = 0.22f;
-
-    for (const auto& corridor : corridors)
-    {
-      const auto& verts = corridor.constraint.vertices;
-      if (verts.size() < 3) continue;
-
-      geometry_msgs::Point center_pt;
-      center_pt.x = corridor.center.x();
-      center_pt.y = corridor.center.y();
-      center_pt.z = corridor.queryZFromNodes(center_pt.x, center_pt.y) + 0.03;
-
-      for (size_t v = 0; v < verts.size(); ++v)
-      {
-        size_t v_next = (v + 1) % verts.size();
-        
-        geometry_msgs::Point p1, p2;
-        p1.x = verts[v].x();
-        p1.y = verts[v].y();
-        p1.z = corridor.queryZFromNodes(p1.x, p1.y) + 0.03;
-
-        p2.x = verts[v_next].x();
-        p2.y = verts[v_next].y();
-        p2.z = corridor.queryZFromNodes(p2.x, p2.y) + 0.03;
-
-        // 边框线
-        line_marker.points.push_back(p1);
-        line_marker.points.push_back(p2);
-
-        // 三角面片 (扇形剖分)
-        face_marker.points.push_back(center_pt);
-        face_marker.points.push_back(p1);
-        face_marker.points.push_back(p2);
-      }
-    }
-
-    out_markers.markers.push_back(line_marker);
-    out_markers.markers.push_back(face_marker);
-  }
-
-  /**
-   * @brief 段式走廊: 以 SC-LOS 支撑链为种子的多源 BFS 扩散 (走廊沿 A→B 连线向外发散)
-   *
-   * 走廊 i (i>=1) 罩住段 (W_{i-1}, W_i) 沿线可单步联通到达的邻域 (阈值同点式 0.5m),
-   * 依然 1:1 约束控制点 q_{i+1}; 走廊 0 保持点式 (围绕 W_0, 优化器豁免 q_1)。
-   * 相邻走廊在共享航点处必然重叠。
-   * 层间隔离是结构性的: 种子链本身同层且单步连通, BFS 只沿单步边扩展, 无需高度过滤。
-   *
-   * @param state_points 机器人状态点 (位姿 + 一步锚点): 非空时并入前两条段走廊 (i=1,2) ——
-   *        最近图节点作为附加 BFS 种子, 状态点本身直接注入凸包输入, 保证转角交集
-   *        C_1 ∩ C_2 覆盖动力学锚点 (起始接缝: 机器人在节点覆盖区外时 q_2 仍可行)
-   * @param state_z 状态点高程 (机器人 z, 用于注入节点与最近节点查询)
-   */
-  static std::vector<ConvexCorridor2D> generateSegmentCorridors(
-      const std::vector<uint32_t>& path_node_ids,
-      const elevation_planner::ManifoldGraph& graph,
-      elevation_planner::PathSimplifier& simplifier,
-      double max_diffusion_radius,
-      double max_step_height,
-      double max_stride_length,
-      const std::vector<Eigen::Vector2d>& state_points = {},
-      double state_z = 0.0,
-      std::vector<Eigen::Vector2d>* out_waypoints = nullptr)
-  {
-    std::vector<ConvexCorridor2D> corridors;
-    if (path_node_ids.empty() || graph.numNodes() == 0) return corridors;
-    corridors.reserve(path_node_ids.size());
-    if (out_waypoints) out_waypoints->clear();
-
-    for (size_t i = 0; i < path_node_ids.size(); ++i)
-    {
-      const uint32_t curr_id = path_node_ids[i];
-      if (curr_id >= graph.numNodes()) continue;
-      const auto& curr_node = graph.getNode(curr_id);
-
-      // 种子链: i==0 点式围绕 W_0; i>=1 = 该段 SC-LOS 支撑链 (失败兜底两端点)
-      std::vector<uint32_t> seeds;
-      if (i == 0)
-      {
-        seeds = {curr_id};
-      }
-      else
-      {
-        const uint32_t prev_id = path_node_ids[i - 1];
-        if (prev_id >= graph.numNodes()) continue;
-
-        if (!simplifier.computeLosChain(prev_id, curr_id, seeds) || seeds.empty())
-        {
-          seeds = {prev_id, curr_id};
-        }
-
-        // 起始两条段走廊并入机器人状态: 最近图节点作为附加 BFS 种子,
-        // 使 C_1 / C_2 的凸包覆盖机器人位姿与一步锚点 (转角交集含动力学锚点)
-        if (!state_points.empty() && (i == 1 || i == 2))
-        {
-          uint32_t near_id = 0;
-          if (graph.findClosestNode(state_points[0].x(), state_points[0].y(), state_z,
-                                    near_id, 0.8, 0.35))
-          {
-            seeds.push_back(near_id);
-          }
-        }
-      }
-
-      // 段级递归走廊构建: 覆盖性检验失败时在孔洞最近的 LOS 链节点处切分,
-      // 子走廊共享真实切分节点 (拼接交集恒可行), 航点 = 各子链末端真实节点
-      std::vector<ConvexCorridor2D> sub_corridors;
-      std::vector<Eigen::Vector2d> sub_waypoints;
-      bool inject_state = !state_points.empty() && (i == 1 || i == 2);
-      buildSegmentPiecesRecursive(
-          seeds, graph, max_diffusion_radius, max_step_height, max_stride_length,
-          /*z_band=*/max_step_height, state_points, state_z, inject_state,
-          /*depth=*/0, sub_corridors, sub_waypoints);
-
-      for (auto& sc : sub_corridors)
-        corridors.push_back(std::move(sc));
-      if (out_waypoints)
-        for (auto& w : sub_waypoints) out_waypoints->push_back(w);
-    }
-
-    return corridors;
-  }
-
-  /**
-   * @brief 转角交集拼接: 把相邻段走廊的线性约束上下拼接 (转角控制点 q_{i+1} ∈ C_i ∩ C_{i+1})
-   *
-   * 走廊 0 (点式) 不变; 内部索引 i 的约束变为 [C_i; C_{i+1}]; 末索引只有进段 C_{M-1}。
-   * 凸性保证: 拼接后相邻控制点连成的折线, 每条边两端点同属一个凸走廊, 折线整体落在
-   * 走廊区域内部, "点和点之间连线穿墙"机制性消失。
-   * vertices/node_pts/center 保留本段走廊字段 (可视化仍显示未拼接的段凸包)。
-   */
-  static void stackAdjacentCorridors(std::vector<ConvexCorridor2D>& corridors)
-  {
-    if (corridors.size() < 3) return;
-
-    std::vector<ConvexCorridor2D> stacked;
-    stacked.reserve(corridors.size());
-    stacked.push_back(corridors[0]);  // 走廊 0 (点式) 不变
-
-    for (size_t i = 1; i + 1 < corridors.size(); ++i)
-    {
-      ConvexCorridor2D cor = corridors[i];
-      const auto& next = corridors[i + 1];
-      const int64_t r1 = static_cast<int64_t>(cor.constraint.A.rows());
-      const int64_t r2 = static_cast<int64_t>(next.constraint.A.rows());
-      if (r2 > 0)
-      {
-        cor.constraint.A.conservativeResize(r1 + r2, Eigen::NoChange);
-        cor.constraint.A.bottomRows(r2) = next.constraint.A;
-        cor.constraint.b.conservativeResize(r1 + r2);
-        cor.constraint.b.tail(r2) = next.constraint.b;
-        cor.constraint.base_rows = static_cast<int>(r1);  // [0, r1) = 本段自身行
-      }
-      stacked.push_back(std::move(cor));
-    }
-    stacked.push_back(corridors.back());  // 末走廊: 只有进段
-    corridors = std::move(stacked);
-  }
-
-private:
-  /**
-   * @brief 基于图单步相邻执行多源 BFS 扩散 (无重叠切断 + 0.5m 截断 + 参数化 step_height & stride_length)
-   * @param seed_ids 种子节点集 (全部以累计距离 0.0 入队; 段式走廊传 SC-LOS 支撑链, 点式走廊传单根节点)
-   */
-  static void performTopologicalBFS(
-      const std::vector<uint32_t>& seed_ids,
-      double max_radius,
-      double max_step_height,
-      double max_stride_length,
-      const elevation_planner::ManifoldGraph& graph,
-      std::vector<CorridorNode3D>& out_nodes)
-  {
-    out_nodes.clear();
-    if (seed_ids.empty()) return;
-
-    struct BFSQueueItem {
-      uint32_t id;
-      double dist_from_root;
-    };
-
-    std::queue<BFSQueueItem> q;
-    std::unordered_set<uint32_t> visited_node_ids;
-    // 栅格判重表: 用于判断当前 (row, col) 是否已有值，无重叠直接切断
-    std::unordered_set<int64_t> visited_cells;
-
-    auto make_cell_key = [](int32_t r, int32_t c) -> int64_t {
-      return (static_cast<int64_t>(r) << 32) | (static_cast<uint32_t>(c));
-    };
-
-    // 压入全部种子节点 (初始累积距离为 0.0)
-    for (uint32_t seed_id : seed_ids)
-    {
-      if (seed_id >= graph.numNodes()) continue;
-      if (!visited_node_ids.insert(seed_id).second) continue;
-      const auto& seed_node = graph.getNode(seed_id);
-      visited_cells.insert(make_cell_key(seed_node.row, seed_node.col));
-      q.push({seed_id, 0.0});
-
-      CorridorNode3D seed_cnd;
-      seed_cnd.id = seed_node.id;
-      seed_cnd.x = seed_node.x;
-      seed_cnd.y = seed_node.y;
-      seed_cnd.z = seed_node.z;
-      seed_cnd.row = seed_node.row;
-      seed_cnd.col = seed_node.col;
-      seed_cnd.layer_id = seed_node.layer_id;
-      out_nodes.push_back(seed_cnd);
-    }
-
-    if (q.empty()) return;
-
-    std::vector<uint32_t> single_step_nbrs;
-
-    while (!q.empty())
-    {
-      auto curr = q.front();
-      q.pop();
-
-      uint32_t curr_id = curr.id;
-      double curr_dist = curr.dist_from_root;
-      const auto& curr_node = graph.getNode(curr_id);
-
-      // 调用流形图暴露的单步相邻检索方法
-      graph.getSingleStepNeighbors(curr_id, single_step_nbrs, max_step_height, max_stride_length);
-
-      for (uint32_t neighbor_id : single_step_nbrs)
-      {
-        if (neighbor_id >= graph.numNodes()) continue;
-
-        // 若节点已访问过，跳过
-        if (visited_node_ids.find(neighbor_id) != visited_node_ids.end()) continue;
-
-        const auto& nb_node = graph.getNode(neighbor_id);
-
-        // 连续累积距离判断：从根节点 A 经由 B 扩展到 C 的实际物理步长累加
-        double step_dx = nb_node.x - curr_node.x;
-        double step_dy = nb_node.y - curr_node.y;
-        double step_dz = nb_node.z - curr_node.z;
-        double step_dist = std::sqrt(step_dx * step_dx + step_dy * step_dy + step_dz * step_dz);
-        double cum_dist = curr_dist + step_dist;
-
-        if (cum_dist > max_radius + 1e-4)
-        {
-          continue; // 连续累积距离超出走廊半径阈值，停止向外扩展
-        }
-
-        // 无重叠切断：判断当前 (row, col) 在本走廊是否已有值，若有则直接切断跳过
-        int64_t cell_key = make_cell_key(nb_node.row, nb_node.col);
-        if (visited_cells.find(cell_key) != visited_cells.end())
-        {
-          continue;
-        }
-
-        // 标记并入队
-        visited_node_ids.insert(neighbor_id);
-        visited_cells.insert(cell_key);
-        q.push({neighbor_id, cum_dist});
-
-        CorridorNode3D cnd;
-        cnd.id = nb_node.id;
-        cnd.x = nb_node.x;
-        cnd.y = nb_node.y;
-        cnd.z = nb_node.z;
-        cnd.row = nb_node.row;
-        cnd.col = nb_node.col;
-        cnd.layer_id = nb_node.layer_id;
-        out_nodes.push_back(cnd);
-      }
-    }
-  }
-
-  /**
-   * @brief Andrew's Monotone Chain 2D 凸包算法并构建 Ax <= b 线性约束
-   * @param fallback_hull 退化 (<3 顶点) 时的自定义兜底多边形 (须 CCW); 空则退回中心 0.06m 小方块
    */
   static void computeAndrewConvexHull(
       const std::vector<CorridorNode3D>& nodes,
@@ -663,388 +469,525 @@ private:
   // 真孔洞存在时: 过孔洞质心沿航段方向切分节点集, 递归验证子集 (深度/片数封顶);
   // 拆出的子凸包按时序对齐航线, 在航线穿入点重采样航点, 保持 corridors==waypoints 1:1。
 
-  struct HoleSplitResult
+
+  static std::string toJsonString(
+      const std::vector<ConvexCorridor2D>& corridors,
+      const std::vector<Eigen::Vector2d>& opt_control_points = {})
   {
-    bool convex{true};                                  ///< 覆盖性检验通过 (无内部孔洞)
-    Eigen::Vector2d hole_centroid{0.0, 0.0};            ///< 最大真孔洞簇质心 (拆分锚点)
-    Eigen::Vector2d hole_dir{0.0, 0.0};                 ///< 建议分割方向 (垂直于航段方向)
-  };
+    std::string json = "{\"corridors\":[";
+    bool has_opt = (!opt_control_points.empty() && 
+                    (opt_control_points.size() == corridors.size() + 2 || 
+                     opt_control_points.size() == corridors.size()));
 
-  /**
-   * @brief 中心点覆盖性检验: 凸包内格中心是否全部被本走廊节点覆盖
-   * @param nodes 本走廊 BFS 节点集 (即中心点集)
-   * @param graph 流形图 (查任意格中心处是否有可通行节点; 含融合动态封锁过滤)
-   * @param seg_dir 航段方向 (输出建议分割方向用)
-   * @return convex=true 直接用; convex=false 时 hole_centroid/hole_dir 给出拆分依据
-   */
-  static HoleSplitResult checkHullCoverage(
-      const std::vector<CorridorNode3D>& nodes,
-      const elevation_planner::ManifoldGraph& graph,
-      const Eigen::Vector2d& seg_dir,
-      double z_band)
-  {
-    HoleSplitResult res;
-    if (nodes.size() < 4) return res;  // 过小节点团不判定 (凸包必退化, 无凹余量)
-
-    // 1. 节点中心点凸包 (Andrew 单调链, 复用叉积写法)
-    std::vector<Eigen::Vector2d> pts;
-    pts.reserve(nodes.size());
-    for (const auto& nd : nodes) pts.emplace_back(nd.x, nd.y);
-    std::sort(pts.begin(), pts.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
-      if (std::abs(a.x() - b.x()) > 1e-4) return a.x() < b.x();
-      return a.y() < b.y();
-    });
-    pts.erase(std::unique(pts.begin(), pts.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
-      return (a - b).squaredNorm() < 1e-6;
-    }), pts.end());
-    if (pts.size() < 4) return res;
-
-    auto cross2 = [](const Eigen::Vector2d& p, const Eigen::Vector2d& q, const Eigen::Vector2d& r) {
-      return (q.x() - p.x()) * (r.y() - p.y()) - (q.y() - p.y()) * (r.x() - p.x());
-    };
-    std::vector<Eigen::Vector2d> hull;
-    size_t n = pts.size(), k = 0;
-    hull.resize(2 * n);
-    for (size_t i = 0; i < n; ++i)
+    for (size_t i = 0; i < corridors.size(); ++i)
     {
-      while (k >= 2 && cross2(hull[k - 2], hull[k - 1], pts[i]) <= 1e-7) k--;
-      hull[k++] = pts[i];
-    }
-    for (size_t i = n - 1, t = k + 1; i > 0; --i)
-    {
-      while (k >= t && cross2(hull[k - 2], hull[k - 1], pts[i - 1]) <= 1e-7) k--;
-      hull[k++] = pts[i - 1];
-    }
-    hull.resize(k - 1);
-    if (hull.size() < 3) return res;
+      const auto& c = corridors[i];
+      if (i > 0) json += ",";
+      json += "{";
+      json += "\"idx\":" + std::to_string(i) + ",";
+      json += "\"root_id\":" + std::to_string(c.root_node_id) + ",";
+      json += "\"x\":" + std::to_string(c.center.x()) + ",";
+      json += "\"y\":" + std::to_string(c.center.y()) + ",";
+      json += "\"z\":" + std::to_string(c.z_ref) + ",";
+      json += "\"layer\":" + std::to_string(c.layer_id) + ",";
 
-    // 2. bbox 内逐格中心做点在凸包内测试, 收集"凸包内但无本走廊节点"的空洞格
-    double min_x = pts.front().x(), max_x = pts.front().x();
-    double min_y = pts.front().y(), max_y = pts.front().y();
-    for (const auto& p : pts)
-    {
-      min_x = std::min(min_x, p.x()); max_x = std::max(max_x, p.x());
-      min_y = std::min(min_y, p.y()); max_y = std::max(max_y, p.y());
-    }
-
-    // 孔洞判据 = 凸包内本层带 (|z| <= z_band) 被禁行节点占据的格。
-    // 凸包含 "BFS 未扩散到的自由/空白区" 无害 (优化器落点处 drape 照常取高程),
-    // 危险的只有禁行区 —— 动态障碍经融合引擎刷新 traversability 后天然被此检验捕获
-    double z_lo = std::numeric_limits<double>::max(), z_hi = -std::numeric_limits<double>::max();
-    for (const auto& nd : nodes)
-    {
-      z_lo = std::min(z_lo, static_cast<double>(nd.z));
-      z_hi = std::max(z_hi, static_cast<double>(nd.z));
-    }
-    z_lo -= z_band;
-    z_hi += z_band;
-
-    const double grid_res = graph.getResolution();
-    struct HoleCell { int r; int c; bool on_rim; };
-    std::vector<HoleCell> hole_cells;
-    const int rim = 1;  // 边界带: 距凸包边缘一格内的空洞视为斜边伪影
-
-    int r_lo = 0, c_lo = 0, r_hi = 0, c_hi = 0;
-    graph.toGridIndex(min_x, min_y, r_lo, c_lo);
-    graph.toGridIndex(max_x, max_y, r_hi, c_hi);
-    for (int r = r_lo; r <= r_hi; ++r)
-    {
-      for (int c = c_lo; c <= c_hi; ++c)
+      // 优化后的物理点 p_i 与控制点 q_i 及走廊违约穿透量
+      if (has_opt)
       {
-        const double cx = graph.getMinX() + (r + 0.5) * grid_res;
-        const double cy = graph.getMinY() + (c + 0.5) * grid_res;
-        if (cx < min_x || cx > max_x || cy < min_y || cy > max_y) continue;
-
-        // 点在凸包内 (半平面法, 凸包 CCW: 全部叉积 >= -eps)
-        bool inside = true;
-        int inside_edge_count = 0;
-        for (size_t i = 0; i < hull.size() && inside; ++i)
+        Eigen::Vector2d p_i;
+        Eigen::Vector2d q_i;
+        if (opt_control_points.size() == corridors.size() + 2)
         {
-          const auto& p1 = hull[i];
-          const auto& p2 = hull[(i + 1) % hull.size()];
-          const double cr = cross2(p1, p2, Eigen::Vector2d(cx, cy));
-          if (cr < -1e-9) inside = false;
-          (void)inside_edge_count;
+          p_i = (opt_control_points[i] + 4.0 * opt_control_points[i + 1] + opt_control_points[i + 2]) / 6.0;
+          q_i = opt_control_points[i + 1];
         }
-        if (!inside) continue;
-
-        // 本层带被禁行 → 孔洞格 (格内无节点/节点全可通行则合格)
-        bool blocked_here = false;
-        for (uint32_t nid : graph.getSpatialCellNodes(r, c))
+        else
         {
-          const auto& nd = graph.getNode(nid);
-          if (nd.traversability >= 0.95f &&
-              static_cast<double>(nd.z) >= z_lo && static_cast<double>(nd.z) <= z_hi)
+          Eigen::Vector2d q_prev = (i > 0) ? opt_control_points[i - 1] : opt_control_points[0];
+          Eigen::Vector2d q_curr = opt_control_points[i];
+          Eigen::Vector2d q_next = (i + 1 < opt_control_points.size()) ? opt_control_points[i + 1] : opt_control_points.back();
+          p_i = (q_prev + 4.0 * q_curr + q_next) / 6.0;
+          q_i = q_curr;
+        }
+        double pz = c.queryZFromNodes(p_i.x(), p_i.y());
+
+        double max_viol = 0.0;
+        if (c.constraint.A.rows() > 0)
+        {
+          Eigen::VectorXd viol = c.constraint.A * q_i - c.constraint.b;
+          for (int j = 0; j < viol.size(); ++j)
           {
-            blocked_here = true;
-            break;
+            if (viol(j) > max_viol) max_viol = viol(j);
           }
         }
-        if (!blocked_here) continue;
 
-        // 判断是否贴凸包边缘 (bbox 边缘近似 —— 凸包 ⊆ bbox, bbox 边缘即外圈)
-        const bool on_rim = (r <= r_lo + rim || r >= r_hi - rim || c <= c_lo + rim || c >= c_hi - rim);
-        hole_cells.push_back({r, c, on_rim});
+        json += "\"opt_p\":[" + std::to_string(p_i.x()) + "," + std::to_string(p_i.y()) + "," + std::to_string(pz) + "],";
+        json += "\"opt_q\":[" + std::to_string(q_i.x()) + "," + std::to_string(q_i.y()) + "],";
+        json += "\"viol\":" + std::to_string(max_viol) + ",";
       }
-    }
 
-    // 3. 过滤边缘伪影后聚类取最大真孔洞簇
-    std::vector<HoleCell> real_holes;
-    for (const auto& hc : hole_cells)
-    {
-      if (!hc.on_rim) real_holes.push_back(hc);
-    }
-    if (real_holes.empty()) return res;
-
-    // 真孔洞簇质心 (4 邻域 flood fill 找最大簇, 防孤立噪声格误导拆分方向)
-    std::vector<char> used(real_holes.size(), 0);
-    size_t best_cluster_pts = 0;
-    double sx = 0.0, sy = 0.0;
-    size_t best_count = 0;
-    for (size_t i = 0; i < real_holes.size(); ++i)
-    {
-      if (used[i]) continue;
-      // BFS 聚簇
-      std::vector<size_t> stack = {i};
-      used[i] = 1;
-      double cx = 0.0, cy = 0.0;
-      size_t cnt = 0;
-      while (!stack.empty())
+      // [DBG] 内切宽度 (沿段折线采样, 只统计自身行 [0, base_rows)): 退化细条可视化
       {
-        size_t idx = stack.back();
-        stack.pop_back();
-        cx += graph.getMinX() + (real_holes[idx].r + 0.5) * grid_res;
-        cy += graph.getMinY() + (real_holes[idx].c + 0.5) * grid_res;
-        ++cnt;
-        for (size_t j = 0; j < real_holes.size(); ++j)
+        const int total_rows = static_cast<int>(c.constraint.A.rows());
+        const int own_rows = (c.constraint.base_rows >= 0 && c.constraint.base_rows <= total_rows)
+                                 ? c.constraint.base_rows : total_rows;
+        double width_dbg = 0.0;
+        if (own_rows > 0 && !c.node_pts.empty())
         {
-          if (used[j]) continue;
-          if (std::abs(real_holes[j].r - real_holes[idx].r) + std::abs(real_holes[j].c - real_holes[idx].c) == 1)
-          {
-            used[j] = 1;
-            stack.push_back(j);
-          }
+          auto clearance = [&](const Eigen::Vector2d & p) {
+            double m = std::numeric_limits<double>::max();
+            for (int j = 0; j < own_rows; ++j)
+              m = std::min(m, c.constraint.b(j) - c.constraint.A.row(j).dot(p));
+            return m;
+          };
+          // node_pts: front = 段末端 (curr), back = 段起点 (prev); 单点走廊两点重合
+          const Eigen::Vector2d p0(c.node_pts.back().x, c.node_pts.back().y);
+          const Eigen::Vector2d p1(c.node_pts.front().x, c.node_pts.front().y);
+          for (double t : {0.0, 0.25, 0.5, 0.75, 1.0})
+            width_dbg = std::max(width_dbg, 2.0 * clearance(p0 + t * (p1 - p0)));
         }
+        json += "\"width\":" + std::to_string(width_dbg) + ",";
       }
-      if (cnt > best_count)
+
+      // 凸包多边形
+      json += "\"polygon\":[";
+      for (size_t v = 0; v < c.constraint.vertices.size(); ++v)
       {
-        best_count = cnt;
-        best_cluster_pts = cnt;
-        sx = cx; sy = cy;
+        if (v > 0) json += ",";
+        const auto& pt = c.constraint.vertices[v];
+        double pz = c.queryZFromNodes(pt.x(), pt.y());
+        json += "[" + std::to_string(pt.x()) + "," + std::to_string(pt.y()) + "," + std::to_string(pz) + "]";
       }
+      json += "],";
+
+      // [DBG] 负空间格诊断 (visited 补集, 走廊 bbox 内): 每格记录距段高度最近
+      //       节点的 z / 通行性 / 相对段高差 / 未访问原因 —— why 分类:
+      //       no_node=空洞立面  z_above=高出段层带  z_below=低于段层带
+      //       blocked=层带内硬禁行  unvisited=层带内可走但 BFS 未访问(伪影)
+      json += "\"obstacles\":[";
+      for (size_t o = 0; o < c.negative_cells.size(); ++o)
+      {
+        if (o > 0) json += ",";
+        const auto & nc = c.negative_cells[o];
+        const char * why = "no_node";
+        switch (nc.why)
+        {
+          case 'A': why = "z_above"; break;
+          case 'B': why = "z_below"; break;
+          case 'K': why = "blocked"; break;
+          case 'U': why = "unvisited"; break;
+          default: break;
+        }
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"p\":[%.2f,%.2f],\"z\":%.2f,\"dz\":%.2f,\"trav\":%.2f,\"why\":\"%s\"}",
+                      nc.p.x(), nc.p.y(), nc.z, nc.dz, nc.trav, why);
+        json += buf;
+      }
+      json += "],";
+
+      // 扩散图节点
+      json += "\"nodes\":[";
+      for (size_t n = 0; n < c.node_pts.size(); ++n)
+      {
+        if (n > 0) json += ",";
+        const auto& nd = c.node_pts[n];
+        json += "{\"id\":" + std::to_string(nd.id) +
+                ",\"x\":" + std::to_string(nd.x) +
+                ",\"y\":" + std::to_string(nd.y) +
+                ",\"z\":" + std::to_string(nd.z) +
+                ",\"l\":" + std::to_string(nd.layer_id) +
+                ",\"r\":" + std::to_string(nd.row) +
+                ",\"c\":" + std::to_string(nd.col) + "}";
+      }
+      json += "]}";
     }
-    (void)best_cluster_pts;
-    if (best_count == 0) return res;
-
-    // 孔洞过小 (少于 3 格) 视为噪声, 不拆 —— 避免在临界覆盖上反复切分
-    if (best_count < 3) return res;
-
-    res.convex = false;
-    res.hole_centroid = Eigen::Vector2d(sx / best_count, sy / best_count);
-    // 分割方向 = 垂直于航段方向 (沿航段切, 保持时序性)
-    Eigen::Vector2d d = seg_dir;
-    if (d.squaredNorm() < 1e-8) d = Eigen::Vector2d(1.0, 0.0);
-    d.normalize();
-    res.hole_dir = Eigen::Vector2d(-d.y(), d.x());
-    return res;
+    json += "]}";
+    return json;
   }
 
   /**
-   * @brief 递归构建凸性保证走廊: 覆盖性检验失败时沿孔洞质心切分节点集, 递归验证子集
-   * @return 按时序 (沿分割轴坐标排序) 的子走廊节点集列表
+   * @brief 完全通过已记录的节点集与凸包顶点进行 MarkerArray 可视化 (零图查表)
    */
+  static void toVisualMarkers(
+      const std::vector<ConvexCorridor2D>& corridors,
+      const std::string& frame_id,
+      visualization_msgs::MarkerArray& out_markers)
+  {
+    out_markers.markers.clear();
+    if (corridors.empty()) return;
+
+    ros::Time now = ros::Time::now();
+
+    visualization_msgs::Marker line_marker;
+    line_marker.header.frame_id = frame_id;
+    line_marker.header.stamp = now;
+    line_marker.ns = "sfc_corridor_wireframe";
+    line_marker.id = 0;
+    line_marker.type = visualization_msgs::Marker::LINE_LIST;
+    line_marker.action = visualization_msgs::Marker::ADD;
+    line_marker.scale.x = 0.02;
+    line_marker.color.r = 0.0f;
+    line_marker.color.g = 0.95f;
+    line_marker.color.b = 0.95f;
+    line_marker.color.a = 0.9f;
+
+    visualization_msgs::Marker face_marker;
+    face_marker.header.frame_id = frame_id;
+    face_marker.header.stamp = now;
+    face_marker.ns = "sfc_corridor_boxes";
+    face_marker.id = 1;
+    face_marker.type = visualization_msgs::Marker::TRIANGLE_LIST;
+    face_marker.action = visualization_msgs::Marker::ADD;
+    face_marker.scale.x = 1.0;
+    face_marker.scale.y = 1.0;
+    face_marker.scale.z = 1.0;
+    face_marker.color.r = 0.1f;
+    face_marker.color.g = 0.8f;
+    face_marker.color.b = 0.9f;
+    face_marker.color.a = 0.22f;
+
+    for (const auto& corridor : corridors)
+    {
+      const auto& verts = corridor.constraint.vertices;
+      if (verts.size() < 3) continue;
+
+      geometry_msgs::Point center_pt;
+      center_pt.x = corridor.center.x();
+      center_pt.y = corridor.center.y();
+      center_pt.z = corridor.queryZFromNodes(center_pt.x, center_pt.y) + 0.03;
+
+      for (size_t v = 0; v < verts.size(); ++v)
+      {
+        size_t v_next = (v + 1) % verts.size();
+        
+        geometry_msgs::Point p1, p2;
+        p1.x = verts[v].x();
+        p1.y = verts[v].y();
+        p1.z = corridor.queryZFromNodes(p1.x, p1.y) + 0.03;
+
+        p2.x = verts[v_next].x();
+        p2.y = verts[v_next].y();
+        p2.z = corridor.queryZFromNodes(p2.x, p2.y) + 0.03;
+
+        // 边框线
+        line_marker.points.push_back(p1);
+        line_marker.points.push_back(p2);
+
+        // 三角面片 (扇形剖分)
+        face_marker.points.push_back(center_pt);
+        face_marker.points.push_back(p1);
+        face_marker.points.push_back(p2);
+      }
+    }
+
+    out_markers.markers.push_back(line_marker);
+    out_markers.markers.push_back(face_marker);
+  }
+
   /**
-   * @brief 段级递归走廊构建 (凸性保证): 覆盖性检验失败时, 取孔洞质心向 LOS 支撑链的投影节点 M,
-   *        把链切成 [首..M] 与 [M..尾] 两个子链各自递归 —— 相邻子走廊共享真实节点 M
-   *        (两端点必为 BFS 种子, 必在凸包内), 拼接约束 C_i ∩ C_i+1 ∋ M 恒可行;
-   *        航点 = 各子链末端节点 (真实 A* 路径踏面, 依次为 M, ..., W_i)
-   * @param seeds 有序支撑链节点 id (LOS 链 / 两端点兜底)
-   * @param inject_state 首个输出走廊并入状态点 (i==1/2 动力学锚点覆盖), 用后清零
+   * @brief 段式走廊: 以 SC-LOS 支撑链为种子的多源 BFS 扩散 (走廊沿 A→B 连线向外发散)
+   *
+   * 走廊 i (i>=1) 罩住段 (W_{i-1}, W_i) 沿线可单步联通到达的邻域 (阈值同点式 0.5m),
+   * 依然 1:1 约束控制点 q_{i+1}; 走廊 0 保持点式 (围绕 W_0, 优化器豁免 q_1)。
+   * 相邻走廊在共享航点处必然重叠。
+   * 层间隔离是结构性的: 种子链本身同层且单步连通, BFS 只沿单步边扩展, 无需高度过滤。
+   *
+   * @param state_points 已废弃 (走廊纯 A* 生成, 动力学锚点由优化器软约束处理) ——
+   *        最近图节点作为附加 BFS 种子, 状态点本身直接注入凸包输入, 保证转角交集
+   *        C_1 ∩ C_2 覆盖动力学锚点 (起始接缝: 机器人在节点覆盖区外时 q_2 仍可行)
+   * @param state_z 状态点高程 (机器人 z, 用于注入节点与最近节点查询)
    */
-  static void buildSegmentPiecesRecursive(
-      const std::vector<uint32_t>& seeds,
+  static std::vector<ConvexCorridor2D> generateSegmentCorridors(
+      const std::vector<uint32_t>& path_node_ids,
       const elevation_planner::ManifoldGraph& graph,
+      elevation_planner::PathSimplifier& simplifier,
       double max_diffusion_radius,
       double max_step_height,
       double max_stride_length,
-      double z_band,
-      const std::vector<Eigen::Vector2d>& state_points,
-      double state_z,
-      bool& inject_state,
-      int depth,
-      std::vector<ConvexCorridor2D>& out_corridors,
-      std::vector<Eigen::Vector2d>& out_waypoints)
+      const std::vector<Eigen::Vector2d>& state_points = {},
+      double state_z = 0.0,
+      std::vector<Eigen::Vector2d>* out_waypoints = nullptr)
   {
-    if (seeds.empty()) return;
-    const auto& first_nd = graph.getNode(seeds.front());
-    const auto& last_nd = graph.getNode(seeds.back());
-    const Eigen::Vector2d seg_a(first_nd.x, first_nd.y);
-    const Eigen::Vector2d seg_b(last_nd.x, last_nd.y);
+    std::vector<ConvexCorridor2D> corridors;
+    if (path_node_ids.empty() || graph.numNodes() == 0) return corridors;
+    corridors.reserve(path_node_ids.size());
+    if (out_waypoints) out_waypoints->clear();
+    (void)simplifier; (void)max_diffusion_radius; (void)max_stride_length; (void)state_z; (void)state_points;
 
-    // 1. 围绕本子链 BFS
-    std::vector<CorridorNode3D> nodes;
-    performTopologicalBFS(seeds, max_diffusion_radius, max_step_height, max_stride_length, graph, nodes);
-    if (nodes.empty()) return;
-
-    // 2. 覆盖性检验
-    HoleSplitResult chk = checkHullCoverage(nodes, graph, seg_b - seg_a, z_band);
-
-    // 3. 非凸且可继续切: 选切分节点 M = 链内部节点距孔洞质心最近者
-    if (!chk.convex && depth < 3 && seeds.size() >= 3)
+    for (size_t i = 0; i < path_node_ids.size(); ++i)
     {
-      size_t best_k = 0;
-      double best_d = 1e18;
-      for (size_t k = 1; k + 1 < seeds.size(); ++k)
+      const uint32_t curr_id = path_node_ids[i];
+      if (curr_id >= graph.numNodes()) continue;
+      const auto& curr_node = graph.getNode(curr_id);
+      const Eigen::Vector2d curr(curr_node.x, curr_node.y);
+
+      // 1. 种子链: i==0 单点; i>=1 = SC-LOS 支撑链 (失败兜底两端点);
+      //    起始两段链首并入机器人位姿锚点 (BFS 覆盖动力学锚点)
+      std::vector<uint32_t> seeds;
+      if (i == 0)
+        seeds = {curr_id};
+      else
       {
-        const auto& nd = graph.getNode(seeds[k]);
-        const double d = (Eigen::Vector2d(nd.x, nd.y) - chk.hole_centroid).squaredNorm();
-        if (d < best_d) { best_d = d; best_k = k; }
+        const uint32_t prev_id = path_node_ids[i - 1];
+        if (prev_id >= graph.numNodes()) continue;
+        if (!simplifier.computeLosChain(prev_id, curr_id, seeds) || seeds.empty())
+          seeds = {prev_id, curr_id};
       }
-      if (best_k > 0)
+
+      // 2. BFS: visited 连通安全格集 (正空间) + 节点云
+      std::vector<CorridorNode3D> nodes;
+      std::unordered_set<int64_t> visited;
+      performTopologicalBFS(seeds, max_diffusion_radius, max_step_height, max_stride_length,
+                            graph, nodes, &visited);
+      if (visited.empty()) continue;
+
+      // 3. visited 包围盒
+      int rmin = 1 << 30, rmax = -(1 << 30), cmin = 1 << 30, cmax = -(1 << 30);
+      for (int64_t key : visited)
       {
-        std::vector<uint32_t> left(seeds.begin(), seeds.begin() + best_k + 1);
-        std::vector<uint32_t> right(seeds.begin() + best_k, seeds.end());
-        buildSegmentPiecesRecursive(left, graph, max_diffusion_radius, max_step_height,
-                                    max_stride_length, z_band, state_points, state_z,
-                                    inject_state, depth + 1, out_corridors, out_waypoints);
-        buildSegmentPiecesRecursive(right, graph, max_diffusion_radius, max_step_height,
-                                    max_stride_length, z_band, state_points, state_z,
-                                    inject_state, depth + 1, out_corridors, out_waypoints);
-        return;
+        const int r = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffff);
+        rmin = std::min(rmin, r); rmax = std::max(rmax, r);
+        cmin = std::min(cmin, c); cmax = std::max(cmax, c);
       }
+
+      // 4. 折线 (i>=1 = [W_{i-1}, W_i]; 起始两段并入机器人状态点)
+      std::vector<Eigen::Vector2d> line;
+      double z0 = curr_node.z, z1 = curr_node.z;   // 段两端高程: 负空间诊断的插值基准
+      if (i == 0)
+        line = {curr};
+      else
+      {
+        const auto& prev_node = graph.getNode(path_node_ids[i - 1]);
+        line.push_back(Eigen::Vector2d(prev_node.x, prev_node.y));
+        line.push_back(curr);   // 两点直线段: 凸集, 切割面恒不切线段 (最近点性质)
+        z0 = prev_node.z;
+      }
+
+      // 5. 迭代半平面切割 (visited 补集 = 负空间障碍物; 两层保护: min_clearance 保投影点,
+      //    最近点性质保整条折线; 障碍落线上 -> 返回空走廊, move_base 重试)
+      //    margin = robot_radius(body_hard_radius 0.17): 单一膨胀架构下负空间只剩障碍
+      //    本体格, 走廊边界距障碍格中心 >= 0.17 —— 规划使用膨胀带作为禁改区,
+      //    轨迹中心线保持一个机体半径, 机体缘恰好不过界
+      std::vector<NegativeCell> negative_space;
+      ConvexCorridor2D cor = DecompCorridorGenerator::generate(
+          line, graph, visited, rmin, rmax, cmin, cmax, /*min_clearance=*/0.01,
+          /*z0=*/z0, /*z1=*/z1, /*max_step=*/max_step_height, &negative_space);
+      cor.negative_cells = std::move(negative_space);   // [DBG] JSON obstacles 字段数据源
+      if (cor.constraint.A.rows() < 4)
+      {
+        ROS_WARN_THROTTLE(2.0, "[SFC][DBG] segment %zu decomp infeasible (obstacle on line), skipping", i);
+        continue;
+      }
+
+      // [DBG] 走廊几何诊断: 沿段折线采样的最大内切宽度 (2 × 折线点到自身约束面最近距离)。
+      //       切割行数 = A.rows() − 4 (初始包围盒恒 4 行); 内切宽度 < 机体直径
+      //       (2×body_hard_radius = 0.34m) 即"图语义可走但机体物理上过不去"的退化细条,
+      //       当前管线不据此触发重规划 —— 此日志/JSON width 字段是它的唯一可见性
+      {
+        auto clearance = [&cor](const Eigen::Vector2d & p) {
+          double m = std::numeric_limits<double>::max();
+          for (int j = 0; j < cor.constraint.A.rows(); ++j)
+            m = std::min(m, cor.constraint.b(j) - cor.constraint.A.row(j).dot(p));
+          return m;
+        };
+        double inscribed = 0.0, body_clear = 1e9;
+        for (double t : {0.0, 0.25, 0.5, 0.75, 1.0})
+        {
+          const double cl = clearance(line.front() + t * (line.back() - line.front()));
+          inscribed = std::max(inscribed, cl);
+          body_clear = std::min(body_clear, cl);   // 逐点最小间隙 (闸判据)
+        }
+        cor.inscribed_width = 2.0 * inscribed;   // JSON width 展示
+        cor.body_clearance = body_clear;         // 机体间隙闸数据源 (astar_local_planner)
+        const double width = 2.0 * inscribed;
+        ROS_INFO_THROTTLE(2.0, "[SFC][DBG] seg %zu: visited=%zu cells, cuts=%d, inscribed width=%.3fm",
+                          i, visited.size(), static_cast<int>(cor.constraint.A.rows()) - 4, width);
+        if (width < 0.34)
+          ROS_WARN_THROTTLE(1.0, "[SFC][DBG] seg %zu corridor DEGENERATE: width=%.3fm < body 0.34m "
+                                 "(optimizer will confine control points inside this sliver)", i, width);
+      }
+
+      cor.root_node_id = curr_id;
+      cor.layer_id = curr_node.layer_id;
+      cor.z_ref = curr_node.z;   // 段末端节点高程: JSON "z"/se调试渲染的地形基准 (此前漏赋值恒 0, 蓝球不贴地)
+      CorridorNode3D cn;
+      cn.id = curr_id;
+      cn.x = curr_node.x; cn.y = curr_node.y; cn.z = curr_node.z;
+      cn.row = curr_node.row; cn.col = curr_node.col; cn.layer_id = curr_node.layer_id;
+      cor.node_pts.push_back(cn);
+      if (i > 0)
+      {
+        const auto& pn = graph.getNode(path_node_ids[i - 1]);
+        CorridorNode3D cp;
+        cp.id = path_node_ids[i - 1];
+        cp.x = pn.x; cp.y = pn.y; cp.z = pn.z;
+        cp.row = pn.row; cp.col = pn.col; cp.layer_id = pn.layer_id;
+        cor.node_pts.push_back(cp);
+      }
+
+      corridors.push_back(std::move(cor));
+      if (out_waypoints) out_waypoints->push_back(curr);   // 航点 = 段末端节点 (恒在走廊内)
     }
 
-    // 4. 基例: 单走廊 (凸 / 封顶回退 / 链太短不可再切)
-    ConvexCorridor2D cor;
-    cor.center = 0.5 * (seg_a + seg_b);
-    cor.z_ref = first_nd.z;
-    cor.layer_id = first_nd.layer_id;
-    cor.root_node_id = seeds.front();
-    cor.node_pts = nodes;
-
-    // 状态点注入 (仅首走廊, 保证动力学锚点在凸包内)
-    if (inject_state && !state_points.empty())
-    {
-      for (const auto& sp : state_points)
-      {
-        CorridorNode3D cnd;
-        cnd.id = std::numeric_limits<uint32_t>::max();
-        cnd.x = static_cast<float>(sp.x());
-        cnd.y = static_cast<float>(sp.y());
-        cnd.z = static_cast<float>(state_z);
-        cnd.row = -1;
-        cnd.col = -1;
-        cnd.layer_id = first_nd.layer_id;
-        cor.node_pts.push_back(cnd);
-      }
-      inject_state = false;
-    }
-
-    computeAndrewConvexHull(cor.node_pts, cor.center, max_diffusion_radius, cor.constraint);
-    // 逐面受限膨胀: 外推 0.15m (> 格距), 距禁行格留 0.05m (凸 + 不吞禁行格均为数学保证)
-    expandCorridorConstrained(cor, graph, z_band, /*expand_r=*/0.15, /*margin=*/0.05);
-
-    out_corridors.push_back(std::move(cor));
-    out_waypoints.push_back(seg_b);   // 航点 = 子链末端真实节点
+    return corridors;
   }
-
-  // ==================== 逐面受限于障碍的走廊膨胀 (per-face capped offset) ====================
-  //
-  // 数学保证 (无需任何事后复检):
-  // 1. 凸性: 凸集 = 半空间交集, 把某些 b_j 外推不改变集合性质, 交集恒为凸;
-  // 2. 无障碍: d_j 取所有禁行格对该面的有向余量最小值 —— 对每个禁行格 c,
-  //    它原本至少违反一条边 k (a_k·c - b_k > 0), 而 d_k <= (a_k·c - b_k) - margin,
-  //    故膨胀后 a_k·c - b_k' >= margin > 0, c 仍被挡在外面。每个禁行格自带一条永不失效的约束。
 
   /**
-   * @brief 对凸走廊约束做逐面封顶外推: 每条边外推 min(r, 该方向最近禁行格余量) - margin
-   * @param cor 目标走廊 (constraint.A/b 原位更新, 顶点重建)
-   * @param graph 流形图 (查禁行节点)
-   * @param z_band 禁行格判定的 z 层带 (与走廊节点 z 范围匹配)
-   * @param expand_r 目标膨胀半径 (m)
-   * @param margin 距禁行格的安全余量 (m)
+   * @brief 转角交集拼接: 把相邻段走廊的线性约束上下拼接 (转角控制点 q_{i+1} ∈ C_i ∩ C_{i+1})
+   *
+   * 走廊 0 (点式) 不变; 内部索引 i 的约束变为 [C_i; C_{i+1}]; 末索引只有进段 C_{M-1}。
+   * 凸性保证: 拼接后相邻控制点连成的折线, 每条边两端点同属一个凸走廊, 折线整体落在
+   * 走廊区域内部, "点和点之间连线穿墙"机制性消失。
+   * vertices/node_pts/center 保留本段走廊字段 (可视化仍显示未拼接的段凸包)。
    */
-  static void expandCorridorConstrained(
-      ConvexCorridor2D& cor,
-      const elevation_planner::ManifoldGraph& graph,
-      double z_band,
-      double expand_r,
-      double margin)
+  static void stackAdjacentCorridors(std::vector<ConvexCorridor2D>& corridors)
   {
-    const auto& A = cor.constraint.A;
-    const auto& b = cor.constraint.b;
-    const int M = static_cast<int>(A.rows());
-    if (M == 0) return;
+    if (corridors.size() < 3) return;
 
-    // 走廊 bbox 外扩 expand_r 范围内的本层带禁行节点
-    double min_x = 1e18, max_x = -1e18, min_y = 1e18, max_y = -1e18;
-    for (const auto& v : cor.constraint.vertices)
-    {
-      min_x = std::min(min_x, static_cast<double>(v.x()));
-      max_x = std::max(max_x, static_cast<double>(v.x()));
-      min_y = std::min(min_y, static_cast<double>(v.y()));
-      max_y = std::max(max_y, static_cast<double>(v.y()));
-    }
+    std::vector<ConvexCorridor2D> stacked;
+    stacked.reserve(corridors.size());
+    stacked.push_back(corridors[0]);  // 走廊 0 (点式) 不变
 
-    const double z_lo = cor.z_ref - z_band, z_hi = cor.z_ref + z_band;
-    std::vector<Eigen::Vector2d> blocked;
-    int r_lo = 0, c_lo = 0, r_hi = 0, c_hi = 0;
-    if (graph.toGridIndex(min_x - expand_r, min_y - expand_r, r_lo, c_lo) &&
-        graph.toGridIndex(max_x + expand_r, max_y + expand_r, r_hi, c_hi))
+    for (size_t i = 1; i + 1 < corridors.size(); ++i)
     {
-      const int pad = 1;
-      for (int r = std::max(0, r_lo - pad); r <= r_hi + pad; ++r)
+      ConvexCorridor2D cor = corridors[i];
+      const auto& next = corridors[i + 1];
+      const int64_t r1 = static_cast<int64_t>(cor.constraint.A.rows());
+      const int64_t r2 = static_cast<int64_t>(next.constraint.A.rows());
+      if (r2 > 0)
       {
-        for (int c = std::max(0, c_lo - pad); c <= c_hi + pad; ++c)
-        {
-          for (uint32_t nid : graph.getSpatialCellNodes(r, c))
-          {
-            const auto& nd = graph.getNode(nid);
-            if (nd.traversability >= 0.95f && nd.z >= z_lo && nd.z <= z_hi)
-              blocked.emplace_back(nd.x, nd.y);
-          }
-        }
+        cor.constraint.A.conservativeResize(r1 + r2, Eigen::NoChange);
+        cor.constraint.A.bottomRows(r2) = next.constraint.A;
+        cor.constraint.b.conservativeResize(r1 + r2);
+        cor.constraint.b.tail(r2) = next.constraint.b;
+        cor.constraint.base_rows = static_cast<int>(r1);  // [0, r1) = 本段自身行
       }
+      stacked.push_back(std::move(cor));
     }
-
-    if (blocked.empty())
-    {
-      cor.constraint.b = b + Eigen::VectorXd::Constant(M, expand_r);  // 周边无禁行: 各面扩满 r
-    }
-    else
-    {
-      Eigen::VectorXd b_new = b;
-      for (int j = 0; j < M; ++j)
-      {
-        double min_slack = 1e18;
-        for (const auto& c : blocked)
-        {
-          const double slack = A.row(j).dot(c) - b(j);   // >0: 禁行格在本面外侧的余量
-          if (slack > -1e-9 && slack < min_slack) min_slack = slack;
-        }
-        const double d = std::min(expand_r, min_slack) - margin;
-        b_new(j) = b(j) + std::max(0.0, d);
-      }
-      cor.constraint.b = b_new;
-    }
-
-    // 顶点重建: 相邻半平面两两求交
-    std::vector<Eigen::Vector2d> verts;
-    verts.reserve(M);
-    for (int j = 0; j < M; ++j)
-    {
-      const int k = (j + 1) % M;
-      Eigen::Matrix2d Ab;
-      Ab.row(0) = A.row(j);
-      Ab.row(1) = A.row(k);
-      const Eigen::Vector2d bb(cor.constraint.b(j), cor.constraint.b(k));
-      Eigen::FullPivLU<Eigen::Matrix2d> lu(Ab);
-      if (lu.rank() < 2) continue;  // 平行退化边, 跳过
-      verts.push_back(lu.solve(bb));
-    }
-    if (verts.size() >= 3) cor.constraint.vertices = verts;
-    // 求交退化 (<3 顶点): 保留原顶点 (仅约束外推生效, 可视化滞后无碍)
+    stacked.push_back(corridors.back());  // 末走廊: 只有进段
+    corridors = std::move(stacked);
   }
+
+private:
+  /**
+   * @brief 基于图单步相邻执行多源 BFS 扩散 (无重叠切断 + 0.5m 截断 + 参数化 step_height & stride_length)
+   * @param seed_ids 种子节点集 (全部以累计距离 0.0 入队; 段式走廊传 SC-LOS 支撑链, 点式走廊传单根节点)
+   */
+  static void performTopologicalBFS(
+      const std::vector<uint32_t>& seed_ids,
+      double max_radius,
+      double max_step_height,
+      double max_stride_length,
+      const elevation_planner::ManifoldGraph& graph,
+      std::vector<CorridorNode3D>& out_nodes,
+      std::unordered_set<int64_t>* visited_cells_out = nullptr)
+  {
+    out_nodes.clear();
+    if (seed_ids.empty()) return;
+
+    struct BFSQueueItem {
+      uint32_t id;
+      double dist_from_root;
+    };
+
+    std::queue<BFSQueueItem> q;
+    std::unordered_set<uint32_t> visited_node_ids;
+    // 栅格判重表: 用于判断当前 (row, col) 是否已有值，无重叠直接切断
+    std::unordered_set<int64_t> visited_cells;
+    if (visited_cells_out) visited_cells_out->clear();
+
+    auto make_cell_key = [](int32_t r, int32_t c) -> int64_t {
+      return (static_cast<int64_t>(r) << 32) | (static_cast<uint32_t>(c));
+    };
+
+    // 压入全部种子节点 (初始累积距离为 0.0)
+    for (uint32_t seed_id : seed_ids)
+    {
+      if (seed_id >= graph.numNodes()) continue;
+      if (!visited_node_ids.insert(seed_id).second) continue;
+      const auto& seed_node = graph.getNode(seed_id);
+      visited_cells.insert(make_cell_key(seed_node.row, seed_node.col));
+      q.push({seed_id, 0.0});
+
+      CorridorNode3D seed_cnd;
+      seed_cnd.id = seed_node.id;
+      seed_cnd.x = seed_node.x;
+      seed_cnd.y = seed_node.y;
+      seed_cnd.z = seed_node.z;
+      seed_cnd.row = seed_node.row;
+      seed_cnd.col = seed_node.col;
+      seed_cnd.layer_id = seed_node.layer_id;
+      out_nodes.push_back(seed_cnd);
+    }
+
+    if (q.empty()) return;
+
+    std::vector<uint32_t> single_step_nbrs;
+
+    while (!q.empty())
+    {
+      auto curr = q.front();
+      q.pop();
+
+      uint32_t curr_id = curr.id;
+      double curr_dist = curr.dist_from_root;
+      const auto& curr_node = graph.getNode(curr_id);
+
+      // 调用流形图暴露的单步相邻检索方法
+      graph.getSingleStepNeighbors(curr_id, single_step_nbrs, max_step_height, max_stride_length);
+
+      for (uint32_t neighbor_id : single_step_nbrs)
+      {
+        if (neighbor_id >= graph.numNodes()) continue;
+
+        // 若节点已访问过，跳过
+        if (visited_node_ids.find(neighbor_id) != visited_node_ids.end()) continue;
+
+        const auto& nb_node = graph.getNode(neighbor_id);
+
+        // 连续累积距离判断：从根节点 A 经由 B 扩展到 C 的实际物理步长累加
+        double step_dx = nb_node.x - curr_node.x;
+        double step_dy = nb_node.y - curr_node.y;
+        double step_dz = nb_node.z - curr_node.z;
+        double step_dist = std::sqrt(step_dx * step_dx + step_dy * step_dy + step_dz * step_dz);
+        double cum_dist = curr_dist + step_dist;
+
+        if (cum_dist > max_radius + 1e-4)
+        {
+          continue; // 连续累积距离超出走廊半径阈值，停止向外扩展
+        }
+
+        // 无重叠切断：判断当前 (row, col) 在本走廊是否已有值，若有则直接切断跳过
+        int64_t cell_key = make_cell_key(nb_node.row, nb_node.col);
+        if (visited_cells.find(cell_key) != visited_cells.end())
+        {
+          continue;
+        }
+
+        // 标记并入队
+        visited_node_ids.insert(neighbor_id);
+        visited_cells.insert(cell_key);
+        q.push({neighbor_id, cum_dist});
+
+        CorridorNode3D cnd;
+        cnd.id = nb_node.id;
+        cnd.x = nb_node.x;
+        cnd.y = nb_node.y;
+        cnd.z = nb_node.z;
+        cnd.row = nb_node.row;
+        cnd.col = nb_node.col;
+        cnd.layer_id = nb_node.layer_id;
+        out_nodes.push_back(cnd);
+      }
+    }
+
+    if (visited_cells_out) *visited_cells_out = visited_cells;
+  }
+
+
+
 
 };
 

@@ -176,6 +176,133 @@ export function initRobotTracker(scene, controls) {
         scene.add(localAStarPathLine);
     }
 
+    // ---- 碰撞/锁止格子高亮显示 (3D 标记柱: 圆点 + 竖线 + 踏面底框) ----
+    const collisionGroup = new THREE.Group();
+    collisionGroup.visible = false;
+    scene.add(collisionGroup);
+
+    // 1. 贴地高清晰边缘方框 (0.092m 踏面外框)
+    const colHalfSize = 0.046;
+    const colOutlinePos = new Float32Array([
+        -colHalfSize, -colHalfSize, 0,   colHalfSize, -colHalfSize, 0,
+         colHalfSize, -colHalfSize, 0,   colHalfSize,  colHalfSize, 0,
+         colHalfSize,  colHalfSize, 0,  -colHalfSize,  colHalfSize, 0,
+        -colHalfSize,  colHalfSize, 0,  -colHalfSize, -colHalfSize, 0
+    ]);
+    const colOutlineGeo = new THREE.BufferGeometry();
+    colOutlineGeo.setAttribute('position', new THREE.BufferAttribute(colOutlinePos, 3));
+    const colOutlineMat = new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        linewidth: 3,
+        transparent: true,
+        opacity: 0.98
+    });
+    const colOutlineLine = new THREE.LineSegments(colOutlineGeo, colOutlineMat);
+    colOutlineLine.position.set(0, 0, 0.003);
+    colOutlineLine.renderOrder = 20;
+    collisionGroup.add(colOutlineLine);
+
+    // 2. 贴地半透明发光底面
+    const colTileGeo = new THREE.PlaneGeometry(0.092, 0.092);
+    const colTileMat = new THREE.MeshBasicMaterial({
+        color: 0xff1744,
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false
+    });
+    const colTileMesh = new THREE.Mesh(colTileGeo, colTileMat);
+    colTileMesh.position.set(0, 0, 0.002);
+    colTileMesh.renderOrder = 19;
+    collisionGroup.add(colTileMesh);
+
+    // 3. 立体竖线标杆 (Cylinder)
+    const poleH = 0.28;
+    const colPoleGeo = new THREE.CylinderGeometry(0.012, 0.012, poleH, 12);
+    const colPoleMat = new THREE.MeshBasicMaterial({ color: 0xff1744 });
+    const colPoleMesh = new THREE.Mesh(colPoleGeo, colPoleMat);
+    colPoleMesh.rotation.x = Math.PI / 2;
+    colPoleMesh.position.set(0, 0, poleH * 0.5);
+    colPoleMesh.renderOrder = 21;
+    collisionGroup.add(colPoleMesh);
+
+    // 4. 顶部高亮警示圆点 (Sphere)
+    const colSphereGeo = new THREE.SphereGeometry(0.065, 20, 20);
+    const colSphereMat = new THREE.MeshStandardMaterial({
+        color: 0xff1744,
+        emissive: 0xd50000,
+        roughness: 0.2,
+        metalness: 0.3
+    });
+    const colSphereMesh = new THREE.Mesh(colSphereGeo, colSphereMat);
+    colSphereMesh.position.set(0, 0, poleH);
+    colSphereMesh.renderOrder = 22;
+    collisionGroup.add(colSphereMesh);
+
+    // 5. 顶部环绕发光光环 (Torus)
+    const colHaloGeo = new THREE.TorusGeometry(0.095, 0.008, 8, 32);
+    const colHaloMat = new THREE.MeshBasicMaterial({
+        color: 0xff8a80,
+        transparent: true,
+        opacity: 0.90
+    });
+    const colHaloMesh = new THREE.Mesh(colHaloGeo, colHaloMat);
+    colHaloMesh.position.set(0, 0, poleH);
+    colHaloMesh.renderOrder = 23;
+    collisionGroup.add(colHaloMesh);
+
+    function updateCollisionNode(node) {
+        if (!node || !Array.isArray(node) || node.length < 3) {
+            collisionGroup.visible = false;
+            return;
+        }
+        const [cx, cy, cz, zone] = node;
+        // 定位到碰撞节点踏面坐标
+        collisionGroup.position.set(cx, cy, cz);
+
+        if (zone === 2) {
+            // BODY_HARD 机体禁行环 (亮橙)
+            colTileMat.color.setHex(0xff9100);
+            colPoleMat.color.setHex(0xff9100);
+            colSphereMat.color.setHex(0xff9100);
+            colSphereMat.emissive.setHex(0xff6d00);
+            colHaloMat.color.setHex(0xffd180);
+            colOutlineMat.color.setHex(0xffe57f);
+        } else if (zone === 4) {
+            // 顶盖碰撞 (紫红)
+            colTileMat.color.setHex(0xd500f9);
+            colPoleMat.color.setHex(0xd500f9);
+            colSphereMat.color.setHex(0xd500f9);
+            colSphereMat.emissive.setHex(0xaa00ff);
+            colHaloMat.color.setHex(0xea80fc);
+            colOutlineMat.color.setHex(0xff80ab);
+        } else {
+            // zone === 3 或默认 真实物理障碍禁行 (鲜红)
+            colTileMat.color.setHex(0xff1744);
+            colPoleMat.color.setHex(0xff1744);
+            colSphereMat.color.setHex(0xff1744);
+            colSphereMat.emissive.setHex(0xd50000);
+            colHaloMat.color.setHex(0xff8a80);
+            colOutlineMat.color.setHex(0xffffff);
+        }
+
+        collisionGroup.visible = true;
+    }
+
+    function updateCollisionAnimation() {
+        if (!collisionGroup.visible) return;
+        const now = Date.now();
+        const bounce = 0.03 * Math.sin(now * 0.008);
+        const curH = poleH + bounce;
+
+        colSphereMesh.position.set(0, 0, curH);
+        colHaloMesh.position.set(0, 0, curH);
+        colHaloMesh.rotation.z = now * 0.002;
+
+        colPoleMesh.scale.set(1, curH / poleH, 1);
+        colPoleMesh.position.set(0, 0, curH * 0.5);
+    }
+
     function updatePose(pose) {
         if (!pose) return;
         currentPose = pose;
@@ -284,6 +411,8 @@ export function initRobotTracker(scene, controls) {
 
     return {
         updatePose,
+        updateCollisionNode,
+        updateCollisionAnimation,
         updatePath,
         updateLocalPath,
         updateLocalAStarPath,

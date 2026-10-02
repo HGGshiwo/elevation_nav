@@ -234,99 +234,138 @@ private:
     return losWalk(a_id, b_id, nullptr);
   }
 
-  /// @brief z 链行走主体: chain_out 非空时输出匹配节点序列 (含 A、B)
+  /// @brief 流形拓扑视线跟踪: 沿图连通边向目标 B 投影步进 (严格沿流形拓扑表面推进, 杜绝跨空洞/跨障碍借道)
   bool losWalk(uint32_t a_id, uint32_t b_id, std::vector<uint32_t>* chain_out)
   {
+    if (!graph_ || a_id >= bound_nodes_ || b_id >= bound_nodes_) return false;
+
     const GraphNode& A = graph_->getNode(a_id);
     const GraphNode& B = graph_->getNode(b_id);
-    const double ax = A.x, ay = A.y;
-    const double dist = std::hypot(B.x - ax, B.y - ay);
+    if (A.hardBlocked() || A.cost_zone >= static_cast<uint8_t>(CostZone::BODY_HARD) || A.headroom < cfg_.min_headroom) return false;
+    if (B.hardBlocked() || B.cost_zone >= static_cast<uint8_t>(CostZone::BODY_HARD) || B.headroom < cfg_.min_headroom) return false;
 
-    int n = 1;
-    if (cfg_.sample_step > 1e-9)
-      n = static_cast<int>(std::ceil(dist / cfg_.sample_step));
-    n = std::max(1, std::min(cfg_.max_samples, n));
+    if (a_id == b_id)
+    {
+      if (chain_out) {
+        chain_out->clear();
+        chain_out->push_back(a_id);
+      }
+      return true;
+    }
+
+    const double ax = A.x, ay = A.y;
+    const double bx = B.x, by = B.y;
+    const double vx = bx - ax;
+    const double vy = by - ay;
+    const double dist = std::hypot(vx, vy);
+
+    if (dist < 1e-4)
+    {
+      if (chain_out) {
+        chain_out->clear();
+        chain_out->push_back(a_id);
+        if (a_id != b_id) chain_out->push_back(b_id);
+      }
+      return graph_->isConnected(a_id, b_id, 1);
+    }
+
+    const double ux = vx / dist;
+    const double uy = vy / dist;
+    const double res = std::max(1e-4, graph_->getResolution());
+    const double ds = std::max(0.02, 0.45 * res);
+    const int num_samples = std::max(1, static_cast<int>(std::ceil(dist / ds)));
 
     if (chain_out)
     {
       chain_out->clear();
       chain_out->push_back(a_id);
     }
-    uint32_t prev = a_id;
-    double z_prev = A.z;
-    for (int k = 1; k < n; ++k)
+
+    uint32_t curr = a_id;
+
+    for (int k = 1; k <= num_samples; ++k)
     {
-      const double t = static_cast<double>(k) / n;
-      const double px = ax + (B.x - ax) * t;
-      const double py = ay + (B.y - ay) * t;
-      uint32_t matched = prev;
-      if (!matchSupport(px, py, prev, z_prev, matched)) return false;
-      if (chain_out && matched != prev) chain_out->push_back(matched);
-      prev = matched;
-      z_prev = graph_->getNode(matched).z;
-    }
+      const double s = std::min(dist, k * ds);
+      const double px = ax + s * ux;
+      const double py = ay + s * uy;
 
-    if (prev == b_id) return true;
-    if (!graph_->isConnected(prev, b_id, 1)) return false;
-    if (chain_out) chain_out->push_back(b_id);
-    return true;
-  }
-
-  /**
-   * @brief 在 (px,py) 附近匹配支撑节点: z 链高度容差 + 净空 + 可通行度过滤,
-   *        候选按 (距离 + 高差) 评分取最优; 严格模式下要求与前一匹配节点直接邻接
-   */
-  bool matchSupport(double px, double py, uint32_t prev, double z_prev, uint32_t& out_id)
-  {
-    int r = 0, c = 0;
-    if (!graph_->toGridIndex(px, py, r, c))
-    {
-      // 地图边界外微量截断 (与 findClosestNode 行为一致)
-      r = std::max(0, std::min(graph_->getRows() - 1,
-                               static_cast<int>(std::floor((px - graph_->getMinX()) / graph_->getResolution()))));
-      c = std::max(0, std::min(graph_->getCols() - 1,
-                               static_cast<int>(std::floor((py - graph_->getMinY()) / graph_->getResolution()))));
-    }
-
-    const double res = std::max(1e-6, graph_->getResolution());
-    const int rad = std::max(1, static_cast<int>(std::ceil(cfg_.support_radius / res)));
-
-    std::vector<Candidate> cands;
-    cands.reserve(8);
-    for (int dr = -rad; dr <= rad; ++dr)
-    {
-      const int rr = r + dr;
-      if (rr < 0 || rr >= graph_->getRows()) continue;
-      for (int dc = -rad; dc <= rad; ++dc)
+      int target_r = 0, target_c = 0;
+      if (!graph_->toGridIndex(px, py, target_r, target_c))
       {
-        const int cc = c + dc;
-        if (cc < 0 || cc >= graph_->getCols()) continue;
-        for (uint32_t nid : graph_->getSpatialCellNodes(rr, cc))
+        return false; // 离开地图边界
+      }
+
+      const GraphNode& curr_nd = graph_->getNode(curr);
+      if (curr_nd.row == target_r && curr_nd.col == target_c)
+      {
+        continue; // 仍处于当前节点所在栅格，继续沿射线前进
+      }
+
+      // 射线进入了新的栅格 (target_r, target_c):
+      // 必须从当前节点 curr 的流形出边中寻找位于该栅格且合法可通行的相邻节点
+      if (curr == b_id) break;
+
+      uint16_t edge_cnt = 0;
+      const GraphEdge* edges = graph_->getEdges(curr, edge_cnt);
+      if (edge_cnt == 0 || !edges) return false;
+
+      uint32_t next_nid = 0;
+      double best_score = std::numeric_limits<double>::max();
+      bool found = false;
+
+      const double t_frac = s / dist;
+      const double z_target = A.z + (B.z - A.z) * t_frac;
+
+      for (uint16_t i = 0; i < edge_cnt; ++i)
+      {
+        const uint32_t nid = edges[i].target_id;
+        if (nid >= bound_nodes_) continue;
+
+        const GraphNode& nv = graph_->getNode(nid);
+        if (nv.row != target_r || nv.col != target_c) continue; // 必须匹配目标栅格
+
+        // 1. 通行性检查: 仅允许 FREE 和 SOFT, 禁行/硬障碍/净空不足严禁通行
+        if (nv.hardBlocked() || nv.cost_zone >= static_cast<uint8_t>(CostZone::BODY_HARD)) continue;
+        if (nv.headroom < cfg_.min_headroom) continue;
+
+        // 2. 高度连续性
+        const double dz_step = std::abs(static_cast<double>(nv.z) - curr_nd.z);
+        if (dz_step > cfg_.max_step_height) continue;
+
+        const double dz_target = std::abs(static_cast<double>(nv.z) - z_target);
+        if (dz_target > cfg_.max_step_height + 0.15) continue;
+
+        double score = dz_step + 2.0 * dz_target + nv.traversability * 0.5;
+        if (score < best_score)
         {
-          const GraphNode& nd = graph_->getNode(nid);
-          if (nd.traversability >= 0.95f) continue;
-          if (nd.headroom < cfg_.min_headroom) continue;
-          const double dz = std::abs(static_cast<double>(nd.z) - z_prev);
-          if (dz > cfg_.max_step_height) continue;
-          const double dxy = std::hypot(static_cast<double>(nd.x) - px,
-                                        static_cast<double>(nd.y) - py);
-          if (dxy > cfg_.support_radius) continue;
-          cands.push_back({nid, dxy + 2.0 * dz});
+          best_score = score;
+          next_nid = nid;
+          found = true;
         }
       }
-    }
-    if (cands.empty()) return false;
 
-    std::sort(cands.begin(), cands.end(),
-              [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
-    for (const auto& cd : cands)
-    {
-      if (!cfg_.strict_adjacency || cd.id == prev || graph_->isConnected(prev, cd.id, 1))
+      if (!found)
       {
-        out_id = cd.id;
+        // 目标栅格在流形图上不存在连通边、为空洞或为障碍物
+        return false;
+      }
+
+      curr = next_nid;
+      if (chain_out) chain_out->push_back(curr);
+    }
+
+    // 最终检查是否已到达目标节点 B (或与 B 直接单步邻接)
+    if (curr == b_id) return true;
+    if (graph_->isConnected(curr, b_id, 1))
+    {
+      const GraphNode& curr_nd = graph_->getNode(curr);
+      if (std::abs(static_cast<double>(B.z) - curr_nd.z) <= cfg_.max_step_height)
+      {
+        if (chain_out) chain_out->push_back(b_id);
         return true;
       }
     }
+
     return false;
   }
 

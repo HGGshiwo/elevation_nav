@@ -4,6 +4,7 @@
 #include <geometry_msgs/Point.h>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -31,6 +32,21 @@ constexpr uint16_t BLOCK_LATERAL = 0x20;  ///< 禁行原因: 侧向障碍落入�
 }
 
 /**
+ * @brief 三档代价区划: 图上每个节点显式归属的通行语义档位。
+ *
+ * 区划由建图 (静态层) 与融合 (动态层) 分别计算, 合成取严 (max)。
+ * 不变量: cost_zone >= BODY_HARD 的节点合成 traversability 恒为 1.0,
+ * 因此所有 trav>=0.95 的历史消费者自动尊重机体硬环, 无需逐一改造。
+ */
+enum class CostZone : uint8_t
+{
+  FREE = 0,       ///< 自由区: 无侧向障碍影响, 可通行
+  SOFT = 1,       ///< 软代价带: body_hard_radius < d <= inflation_radius, 可通行代价递增
+  BODY_HARD = 2,  ///< 机体硬禁行环: d < body_hard_radius, 机体不可入 (非障碍本体), A* 硬排除
+  FORBIDDEN = 3   ///< 绝对禁行: 障碍本体 (行走层无节点) / 顶头净空不足 / 动态封锁
+};
+
+/**
  * @brief 紧凑流形拓扑踏面节点 (32字节对齐，硬件缓存友好)
  */
 struct alignas(32) GraphNode
@@ -39,8 +55,15 @@ struct alignas(32) GraphNode
   float x{0.0f};            ///< 真实空间世界坐标 X
   float y{0.0f};            ///< 真实空间世界坐标 Y
   float z{0.0f};            ///< 真实空间脚掌踏面高程 Z
-  float traversability{0.0f};///< 可通行度代价 (0.0: 完全平坦, 1.0: 致命障碍)
-  float headroom{2.0f};     ///< 上方净空高度 (距上一层底板距离，四足机器人需大于自身身高)
+  float traversability{0.0f};///< 可通行度代价合成值 = min(1.0, 静态层+动态层), 所有消费者只读
+  float static_trav{0.0f};   ///< 静态层通行性: 建图期烘焙 (墙体/楼梯/静态软带), 融合不修改
+  float dynamic_trav{0.0f};  ///< 动态层通行性: 融合每帧全量重算 (0=无叠加; <=0.9 膨胀; 1.0 禁行)
+  float headroom{2.0f};      ///< 上方净空合成值 = min(静态层, 动态层)
+  float static_headroom{2.0f};  ///< 静态层净空: 建图期烘焙, 融合不修改
+  float dynamic_headroom{3.0f}; ///< 动态层净空: 融合每帧重算 (3.0 = 无动态顶盖)
+  uint8_t static_zone{0};    ///< 静态层区划 (CostZone): 建图期烘焙, 融合不修改
+  uint8_t dynamic_zone{0};   ///< 动态层区划 (CostZone): 融合每帧全量重算 (0=FREE 无叠加)
+  uint8_t cost_zone{0};      ///< 区划合成值 = max(静态层, 动态层), 消费者只读 (CostZone)
   int32_t row{0};           ///< 空间栅格行
   int32_t col{0};           ///< 空间栅格列
   int32_t layer_id{0};      ///< 曲面层级编号 (0: 最底层, 1, 2...)
@@ -53,6 +76,22 @@ struct alignas(32) GraphNode
     return (static_cast<int64_t>(layer_id) << 48) ^
            (static_cast<int64_t>(row) << 24) ^
            (static_cast<int64_t>(col));
+  }
+
+  /// 硬排除判定: 机体硬环与绝对禁行 (zone 优先, trav 阈值兜底兼容旧构造路径)
+  bool hardBlocked() const
+  {
+    return cost_zone >= static_cast<uint8_t>(CostZone::BODY_HARD) || traversability >= 0.95f;
+  }
+
+  /// 三层属性合成 (唯一写入点): 区划取严 (动态只许变差), 机体环/禁行强制 trav=1.0
+  void synthesize()
+  {
+    cost_zone = std::max(static_zone, dynamic_zone);
+    traversability = (cost_zone >= static_cast<uint8_t>(CostZone::BODY_HARD))
+                         ? 1.0f
+                         : std::min(1.0f, static_trav + dynamic_trav);
+    headroom = std::min(static_headroom, dynamic_headroom);
   }
 };
 

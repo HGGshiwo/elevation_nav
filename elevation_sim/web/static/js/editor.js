@@ -184,15 +184,25 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     }
 
     // 请求 C++ 规划器单节点权威诊断, 将禁行原因写入面板行 (queryEl 不存在或查询失败时静默跳过)
-    function fetchNodeReason(node, reasonElId) {
+    // 权威值一律以后端活图诊断为准: 前端缓存的节点通行性来自加载时的静态快照,
+    // 融合引擎的动态封锁/机体环只存在于后端活图 —— 不能用本地静态值短路查询
+    function applyBackendStatus(statusEl, data) {
+        if (!statusEl || !data || data.status !== 'ok') return;
+        const nd = data.node || {};
+        const trav = (typeof nd.traversability === 'number') ? nd.traversability
+                   : (typeof data.traversability === 'number') ? data.traversability : 0;
+        let text, color;
+        if (data.reason_code === 'dynamic_blocked') { text = '动态禁行'; color = '#e040fb'; }
+        else if (data.blocked) { text = '禁行/障碍'; color = '#ff5252'; }
+        else if (data.reason_code === 'dynamic_inflation' || trav > 0.05) { text = '软代价区'; color = '#ffab40'; }
+        else { text = '可通行'; color = '#69f0ae'; }
+        statusEl.innerText = `${text} (trav=${trav.toFixed(2)})`;
+        statusEl.style.color = color;
+    }
+
+    function fetchNodeReason(node, reasonElId, statusElId) {
         const reasonEl = document.getElementById(reasonElId);
         if (!reasonEl) return;
-        // 可通行且非软代价区无需查询原因, 显示确定文案
-        if (!node.isBlocked && node.traversability <= 0.05) {
-            reasonEl.innerText = '可安全通行';
-            reasonEl.style.color = '#69f0ae';
-            return;
-        }
         reasonEl.innerText = '查询中...';
         reasonEl.style.color = '#aaa';
         fetch(`/api/nav/diagnose_node?x=${node.x}&y=${node.y}&z=${node.z}`)
@@ -207,11 +217,15 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 const colors = {
                     free: '#69f0ae',
                     soft_inflation: '#ffab40',
+                    dynamic_inflation: '#ffab40',
                     lateral_body: '#ff5252',
                     headroom: '#ff5252',
+                    dynamic_blocked: '#e040fb',
                     blocked: '#ff5252'
                 };
                 reasonEl.style.color = colors[data.reason_code] || '#ff5252';
+                // 状态行同步为后端权威值 (含当前动态层叠加结果)
+                applyBackendStatus(document.getElementById(statusElId), data);
             })
             .catch(() => {
                 reasonEl.innerText = '诊断请求失败';
@@ -220,11 +234,13 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
     }
 
     // 踏面方块深度调试与两点邻边关系诊断
-    function handleDebugInspection(node) {
+    function handleDebugInspection(node, forceSlot = null) {
         if (!node) return;
 
-        // 若尚未选择 A，或 A与B 均已选择过：重置并选择 A
-        if (!debugNodeA || (debugNodeA && debugNodeB)) {
+        const isSlotA = (forceSlot === 'A') || (!forceSlot && (!debugNodeA || (debugNodeA && debugNodeB)));
+
+        // 设定基准方块 A
+        if (isSlotA) {
             debugNodeA = node;
             debugNodeB = null;
 
@@ -245,7 +261,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 const cnt = graphVisualizer ? graphVisualizer.getNodeEdgeCount(node) : 0;
                 edgesElA.innerText = `${cnt} 条连通边`;
             }
-            fetchNodeReason(node, 'debug-node-a-reason');
+            fetchNodeReason(node, 'debug-node-a-reason', 'debug-node-a-status');
 
             // 清空 B 与 对比关系
             document.getElementById('debug-node-b-xy') && (document.getElementById('debug-node-b-xy').innerText = '-');
@@ -259,9 +275,13 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             document.getElementById('debug-rel-connected') && (document.getElementById('debug-rel-connected').innerText = '等待选择方块 B...');
             document.getElementById('debug-rel-reason') && (document.getElementById('debug-rel-reason').innerText = '请点击第二个方块以进行拓扑分析');
 
-            console.log(`[Debug] 选中基准方块 A: (${node.x.toFixed(2)}, ${node.y.toFixed(2)}, ${node.z.toFixed(2)})`);
+            console.log(`[Debug] 选中基准方块 A: #${node.id} (${node.x.toFixed(2)}, ${node.y.toFixed(2)}, ${node.z.toFixed(2)})`);
         } else {
-            // 已有 A，当前点击作为 B 进行两点比对
+            // 设定对比方块 B 并进行两点比对
+            if (!debugNodeA) {
+                handleDebugInspection(node, 'A');
+                return;
+            }
             if (Math.hypot(node.x - debugNodeA.x, node.y - debugNodeA.y) < 0.03 && Math.abs(node.z - debugNodeA.z) < 0.05) {
                 return;
             }
@@ -285,7 +305,7 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
                 const cnt = graphVisualizer ? graphVisualizer.getNodeEdgeCount(node) : 0;
                 edgesElB.innerText = `${cnt} 条连通边`;
             }
-            fetchNodeReason(node, 'debug-node-b-reason');
+            fetchNodeReason(node, 'debug-node-b-reason', 'debug-node-b-status');
 
             // 计算相对几何量
             const dxy = Math.hypot(debugNodeB.x - debugNodeA.x, debugNodeB.y - debugNodeA.y);
@@ -364,6 +384,49 @@ export function initEditor(scene, camera, renderer, controls, layers, editPlane,
             console.log(`[Debug] A-B 对比: dxy=${dxy.toFixed(3)}, dz=${dz.toFixed(3)}, slope=${slopeDeg.toFixed(1)}°, connected=${isConn}`);
         }
     }
+
+    // 绑定方块搜索定位交互
+    const debugSearchInput = document.getElementById('debug-search-input');
+    const btnLocateA = document.getElementById('btn-debug-locate-a');
+    const btnLocateB = document.getElementById('btn-debug-locate-b');
+    const debugSearchMsg = document.getElementById('debug-search-msg');
+
+    function performDebugLocate(slot = 'A') {
+        if (!debugSearchInput || !graphVisualizer) return;
+        const q = debugSearchInput.value.trim();
+        if (!q) {
+            if (debugSearchMsg) {
+                debugSearchMsg.innerText = '请输入坐标 (例如: -8.24, -2.57, 0.04) 或节点 ID';
+                debugSearchMsg.style.color = '#ff5252';
+            }
+            return;
+        }
+        const node = graphVisualizer.findNodeByCoordOrId(q);
+        if (!node) {
+            if (debugSearchMsg) {
+                debugSearchMsg.innerText = `❌ 未检索到匹配方块: "${q}"`;
+                debugSearchMsg.style.color = '#ff5252';
+            }
+            return;
+        }
+
+        if (debugSearchMsg) {
+            debugSearchMsg.innerText = `✔ 已定位方块 #${node.id}: (${node.x.toFixed(2)}, ${node.y.toFixed(2)}, ${node.z.toFixed(2)}) ${node.isBlocked ? '[禁行]' : '[通行]'}`;
+            debugSearchMsg.style.color = node.isBlocked ? '#ff8a80' : '#69f0ae';
+        }
+
+        handleDebugInspection(node, slot);
+        graphVisualizer.focusOnNode(node);
+    }
+
+    btnLocateA?.addEventListener('click', () => performDebugLocate('A'));
+    btnLocateB?.addEventListener('click', () => performDebugLocate('B'));
+    debugSearchInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            performDebugLocate('A');
+        }
+    });
 
 
     // 事件监听
