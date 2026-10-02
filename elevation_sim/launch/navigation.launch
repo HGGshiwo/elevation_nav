@@ -31,7 +31,7 @@
     <node pkg="elevation_sim" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
         <param name="pcd_file" value="$(arg pcd_file)"/>
         <param name="config_file" value="$(arg config_file)"/>
-        <param name="map_config_file" value="$(arg map_config_file)"/>
+        <rosparam file="$(arg map_config_file)" command="load" if="$(eval arg('map_config_file') != '')"/>
         <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
         <param name="grid_map_topic" value="/grid_map"/>
         <param name="frame_id" value="map"/>
@@ -54,6 +54,8 @@
     <group if="$(eval arg('sim') and not arg('bag'))">
         <node pkg="elevation_sim" type="simulator.py" name="quadruped_simulator" output="screen">
             <param name="pcd_file" value="$(arg pcd_file)"/>
+            <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load"/>
+            <rosparam file="$(arg map_config_file)" command="load" if="$(eval arg('map_config_file') != '')"/>
             <param name="cmd_vel_freeze" value="$(arg freeze)"/>
             <param name="base_frame" value="base_link"/>
             <param name="map_frame" value="map"/>
@@ -66,9 +68,6 @@
             <param name="linear_noise_std" value="$(arg sim_noise_linear)"/>
             <param name="lateral_noise_std" value="$(arg sim_noise_lateral)"/>
             <param name="angular_noise_std" value="$(arg sim_noise_angular)"/>
-            <param name="footprint_radius" value="0.22"/>
-            <param name="max_step_height" value="0.25"/>
-            <param name="dog_height" value="0.45"/>
         </node>
     </group>
 

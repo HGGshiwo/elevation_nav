@@ -70,27 +70,6 @@ struct ColumnTable
   bool empty() const { return cells.empty(); }
 };
 
-/**
- * @brief 逐柱并集融合: 先验柱表 + 实时观测柱表 -> 融合柱表 (无时间维度)
- *
- * 融合规则 (每格独立, 两表须同 resolution):
- *  1. 同一物理面 (两侧 z_top 差 <= same_surface_tol): 合并为一层, 几何取观测值,
- *     点数取 max —— 当前状态由观测反映, 但一次稀疏观测不推翻先验已确认的支撑面;
- *  2. 仅存在于先验: 原样保留 —— 实时雷达被机体遮挡扫不到脚下时, 先验地面层仍在;
- *  3. 仅存在于观测: 新增一层 (实时发现的新踏面/新障碍);
- *  4. 窗口最外 boundary_ring 圈强制采用先验 (先验缺失才回退观测), 保证出窗衔接;
- *
- * 观测柱表每帧从零重建、先验柱表永不被写入, 动态障碍只存在于当帧, 无需衰减。
- * 净空/膨胀/建边不在融合层处理, 统一交由 buildGraphFromColumnTable 重算,
- * 保证融合图与全局图的通行性判定口径完全一致。
- *
- * @return 融合柱表, extent 沿用观测表; 两表分辨率不一致时原样返回观测表
- */
-ColumnTable fuseColumnTables(const ColumnTable & prior,
-                             const ColumnTable & observed,
-                             double same_surface_tol = 0.08,
-                             int boundary_ring = 1);
-
 struct GraphBuildConfig
 {
   double resolution{0.10};          ///< 2D 空间栅格投影分辨率 (m)
@@ -104,6 +83,12 @@ struct GraphBuildConfig
   //      水平表面, 撑爆上方净空判定; 其近邻距离远大于真实表面点, 统计上可分离 ----
   int sor_mean_k{16};               ///< SOR 近邻统计点数
   double sor_std_mul{1.5};          ///< SOR 标准差倍数阈值 (越大越保守, 极大值等效关闭)
+
+  // ---- 欧氏聚类残影/小碎片过滤 (Euclidean Cluster Filtering) ----
+  bool cluster_filter_enable{true}; ///< 是否启用欧氏聚类过滤
+  double cluster_tolerance{0.15};   ///< 空间聚类连通容差半径 (m)
+  int cluster_min_size{30};         ///< 形成有效结构的最小聚类点数 (小于此点数的小团块碎片直接剔除, 0 表示关闭)
+  int cluster_max_size{1000000};    ///< 最大聚类点数
 
   // ---- 机体碰撞建模 (足印膨胀 + 建边扫掠) ----
   double footprint_radius{0.30};    ///< 机体足印外接半径 (m): 侧向障碍硬/软判据的垂直结构扫描窗口

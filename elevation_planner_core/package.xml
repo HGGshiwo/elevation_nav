@@ -19,7 +19,6 @@
   <depend>pcl_conversions</depend>
   <depend>costmap_2d</depend>
   <depend>tf2_ros</depend>
-  <depend>yaml-cpp</depend>
   <build_depend>message_generation</build_depend>
   <exec_depend>message_runtime</exec_depend>
   <build_depend>libpcl-all-dev</build_depend>

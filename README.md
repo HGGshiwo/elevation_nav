@@ -881,3 +881,57 @@ trav=0.9 可通行，SC-LOS 剪枝的支撑匹配又不感知软代价数值，�
 
 ---
 
+## ⚠️ 十七、2026-10-02 续更：跨层目标到达判定、局部规划航向门控、点云仿真碰撞高亮与全工程死代码深度清理
+
+### 1. 局部规划器控制与到达判定全面升级 (`astar_local_planner.cpp`)
+
+- **跨层目标到达判定与距离复用**：
+  - 修复上下层垂直重叠时（如楼层垂直相距 4m，xy 平面相距仅 0.22m）仅按二维投影距离 $d_{xy}$ 提前误判进入“最终姿态对齐”的问题；
+  - 统一度量口径，严格复用 3D 路径距离并在进入终点对齐前严格校验高差（$|\Delta z| \le \text{goal\_z\_tolerance}$）；
+  - **消灭自递归**：在近终点判定阶段直接就地计算三自由度解耦控制量下发，杜绝自递归调用 `computeVelocityCommands` 引起的栈溢出风险。
+- **SCAN-Planner 航向门控（Heading Gating）**：
+  - 当航向偏差较大（$|\text{heading\_error}| > 0.60\text{rad} \approx 35^\circ$）时，主动抑制前进线速度并切换为原地旋转对准，彻底消除大角度掉头时的绕大圈现象。
+- **近终点平滑减速与保底速度淡出（Fade-out Floor）**：
+  - 在剩余路径距离 $< 0.50\text{m}$ 时，将巡航保底速度（$0.12\text{m/s}$）平滑线性淡出至 $0.0\text{m/s}$，消除机器人进站时的冲出动量与超调。
+
+### 2. 点云物理仿真引擎升级与碰撞触碰点云可视化 (`simulator.py`, `ros_bridge.py`, `robot_tracker.js`)
+
+- **触碰点云精细化提取与回传**：
+  - `evaluate_step_motion` 碰撞检测接口新增返回具体发生干涉与碰撞的局部点云坐标列表（`hit_points`）；
+  - 仿真器将冲突节点与触碰点云一同序列化为 JSON 广播至 `/elevation_collision_node`；
+  - Web 前端 `robot_tracker.js` 实时在 3D 场景中高亮渲染具体碰壁/阻挡的激光点云簇，实现毫米级直观碰撞溯源。
+- **立面高墙与点云噪声过滤**：
+  - 引入 `min_obstacle_points` 过滤孤立噪点，动态障碍硬拦截与下台阶断崖跌落保护更加精准稳定。
+
+### 3. PCD 点云地图加载与欧氏聚类滤波 (`pcd_map_io.hpp`, `pcd_map_io.cpp`)
+
+- **集成 EuclideanClusterExtraction 欧氏聚类**：
+  - PCD 先验地图加载链路新增可选的欧氏聚类过滤，自动滤除空间中的孤立悬浮漂移噪点，保留主体连续结构；
+  - 参数配置收敛至 ROS NodeHandle 标准读取接口（`loadCropBoxConfig`, `loadClusterFilterConfig`）。
+
+### 4. 进程级 CrashHandler 强化与符号化调用栈输出 (`crash_handler.hpp`)
+
+- 为全仓核心组件（`elevation_planner_core`, `elevation_global_planner`, `elevation_local_planner`, `elevation_costmap`）统一挂载安全崩溃捕获机制；
+- 拦截 `SIGSEGV`、`SIGABRT`、`SIGFPE`、`SIGILL`、`SIGBUS` 等致命信号以及 C++ 未捕获逃逸异常；
+- 崩溃时安全输出格式化时间戳、触发信号与解析后的符号化调用栈（Backtrace）至 `/tmp/elevation_nav_crash.log`，避免进程无声闪退；
+- 修复底层 `safe_write` 中对 `write()` 系统调用返回值的忽略告警。
+
+### 5. 全工程死代码与冗余组件深度清理
+
+通过语法树调用链追溯与 `-ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--print-gc-sections` 链接期符号分析，彻底清理已废弃且无任何外部引用的历史遗留文件与接口：
+
+- **移除冗余 C++ 模块与头文件**：
+  - `elevation_local_planner`: [`bspline_qp_optimizer.hpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_local_planner/include/elevation_local_planner/bspline_qp_optimizer.hpp) (被现有优化器替代)、[`collision_checker.h/.cpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_local_planner/src/collision_checker.cpp) (已被 GraphNode/Zone 机制原生覆盖)；
+  - `elevation_planner_core`: [`topological_corridor.hpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_planner_core/include/elevation_planner_core/topological_corridor.hpp) (TEB 走廊遗留)、[`frenet_frame.hpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_planner_core/include/elevation_planner_core/frenet_frame.hpp)、[`layer_portal.h/.cpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_planner_core/src/layer_portal.cpp)、[`local_elevation_grid.hpp`](file:///home/hggshiwo/catkin_ws/src/elevation_nav/elevation_planner_core/include/elevation_planner_core/local_elevation_grid.hpp)；
+- **清理无用函数与废弃接口**：
+  - 移除了 `cloud_graph_builder` 中未被调用的 `fuseColumnTables`（建图已统一收敛至 `mergeColumnSurfaces` 及原位原子刷新）；
+  - 移除了 `offline_test.cpp` 中未引用的测试函数 `printZHistogram` 与冗余变量；
+- **清理 Web 前端旧版废弃脚本**：
+  - 彻底移除了 `elevation_sim/web/static/js` 下未在 `index.html` 中引入的 7 个历史弃用脚本（`main.js`, `scene.js`, `robot_visualizer.js`, `ws_client.js`, `pcd_modal.js`, `path_visualizer.js`, `corridor_visualizer.js`）；
+- **同步更新构建配置**：
+  - 清理了 `CMakeLists.txt`、`package.xml` 中的多余源文件编译依赖，全包保持 0 警告、0 死代码编译。
+
+---
+
+
+

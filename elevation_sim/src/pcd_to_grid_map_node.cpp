@@ -7,7 +7,6 @@
 #include <std_msgs/String.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
-#include <yaml-cpp/yaml.h>
 
 #include "elevation_planner_core/pcd_map_io.hpp"
 #include "elevation_sim/manifold_forest.hpp"
@@ -23,7 +22,9 @@ public:
     pnh.param<std::string>("grid_map_topic", grid_map_topic, "/grid_map");
     pnh.param<std::string>("frame_id", frame_id_, "map");
     pnh.param<std::string>("config_file", config_file_, "");
-    pnh.param<std::string>("map_config_file", map_config_file_, "");
+
+    crop_box_cfg_ = elevation_planner::loadCropBoxConfig(pnh);
+    cluster_cfg_ = elevation_planner::loadClusterFilterConfig(pnh);
 
     elevation_sim::ExtractorConfig cfg;
     pnh.param<double>("resolution", cfg.resolution, 0.10);
@@ -56,15 +57,12 @@ public:
   {
     if (msg && !msg->data.empty()) {
       std::string pcd_path = msg->data;
-      std::string custom_config = "";
       size_t sep = pcd_path.find(';');
       if (sep != std::string::npos) {
-        custom_config = pcd_path.substr(sep + 1);
         pcd_path = pcd_path.substr(0, sep);
       }
-      ROS_INFO("[PcdToGridMapNode] Received PCD switch command: %s (map_config: %s)",
-               pcd_path.c_str(), custom_config.empty() ? "(default)" : custom_config.c_str());
-      loadPcdAndProcess(pcd_path, custom_config);
+      ROS_INFO("[PcdToGridMapNode] Received PCD switch command: %s", pcd_path.c_str());
+      loadPcdAndProcess(pcd_path);
     }
   }
 
@@ -73,31 +71,20 @@ public:
     publishMap();
   }
 
-  void loadPcdAndProcess(const std::string & pcd_path, const std::string & override_map_config = "")
+  void loadPcdAndProcess(const std::string & pcd_path)
   {
     ROS_INFO("[PcdToGridMapNode] Loading PCD file: %s", pcd_path.c_str());
-    std::string active_map_config = override_map_config.empty() ? map_config_file_ : override_map_config;
 
-    auto cloud = elevation_planner::loadAndCropPcd(pcd_path, active_map_config);
+    auto cloud = elevation_planner::loadAndCropPcd(pcd_path, crop_box_cfg_, cluster_cfg_);
     if (!cloud) {
       ROS_ERROR("[PcdToGridMapNode] Failed to load PCD file: %s", pcd_path.c_str());
       return;
     }
 
-    // 2. 网格与高程图提取参数：专属配置优先，缺省回退基础配置
-    std::string config_to_load = config_file_;
-    if (!active_map_config.empty()) {
-      try {
-        YAML::Node root = YAML::LoadFile(active_map_config);
-        if (root["pcl_grid_map_extraction"]) {
-          config_to_load = active_map_config;
-        }
-      } catch (...) {}
-    }
-    ROS_INFO("[PcdToGridMapNode] Applying grid map parameters from: %s", config_to_load.c_str());
+    ROS_INFO("[PcdToGridMapNode] Applying grid map parameters from: %s", config_file_.c_str());
 
     grid_map::GridMapPclLoader loader;
-    loader.loadParameters(config_to_load);
+    loader.loadParameters(config_file_);
 
     try {
       loader.setInputCloud(cloud);
@@ -133,7 +120,8 @@ public:
 private:
   std::string frame_id_;
   std::string config_file_;
-  std::string map_config_file_;
+  elevation_planner::CropBoxConfig crop_box_cfg_;
+  elevation_planner::ClusterFilterConfig cluster_cfg_;
   elevation_sim::ManifoldForestExtractor extractor_;
 
   grid_map::GridMap grid_map_;

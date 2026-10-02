@@ -1,4 +1,4 @@
-# Configuration for map-specific point cloud cropping and synthetic/sparse map extraction
+# Configuration for map-specific point cloud filtering
 crop_box:
   enable: false
   # min_x: -15.0
@@ -8,38 +8,14 @@ crop_box:
   # min_z: -3.0
   # max_z: 3.5  
 
-# grid_map_pcl 完整参数结构（包含全部 5 个必需模块）
-pcl_grid_map_extraction:
-  num_processing_threads: 4
-  cloud_transform:
-    translation:
-      x: 0.0
-      y: 0.0
-      z: 0.0
-    rotation: # intrinsic rotation X-Y-Z (r-p-y) sequence
-      r: 0.0
-      p: 0.0
-      y: 0.0
-  cluster_extraction:
-    cluster_tolerance: 0.08
-    min_num_points: 3
-    max_num_points: 1000000
-    use_max_height_as_cell_elevation: false
-  outlier_removal:
-    is_remove_outliers: false       # 关闭离群滤波，防止稀疏表面被误当噪点挖孔
-    mean_K: 10
-    stddev_threshold: 1.0
-  downsampling:
-    is_downsample_cloud: false      # 稀疏点云不额外降采样
-    voxel_size:
-      x: 0.03
-      y: 0.03
-      z: 0.03
-  grid_map:
-    min_num_points_per_cell: 1      # 最小点数设为 1，解决生成地图空洞问题
-    resolution: 0.10
+# 覆盖通用参数中的流形拓扑图与离群滤波配置
+sor_mean_k: 24                    # 增大统计近邻点数 (增强对离散浮点的识别)
+sor_std_mul: 1.0                  # 严格过滤空气中的悬浮离散噪点
+min_cluster_points: 2             # 踏面聚类至少 2 个点
+min_obstacle_points: 8            # 碰撞引擎阻挡门槛 (过滤空中散乱噪点误触发锁死)
 
-# 覆盖流形拓扑图参数
-manifold_graph:
-  sor_mean_k: 0                     # 流形图同步关闭离群滤波
-  min_cluster_points: 1             # 踏面单点成格
+# 欧氏聚类小簇过滤 (Euclidean Cluster Filtering) - 筛除空中悬浮的离散小点团/碎片
+cluster_filter_enable: true        # 是否启用欧氏聚类过滤
+cluster_tolerance: 0.05            # 聚类邻域距离容差 (m)
+cluster_min_size: 100               # 最小有效结构点数 (小于此点数的小团块碎片直接剔除)
+cluster_max_size: 1000000          # 最大聚类点数

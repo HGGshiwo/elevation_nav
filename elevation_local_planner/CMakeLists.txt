@@ -32,7 +32,6 @@ include_directories(
 )
 
 add_library(elevation_local_planner_lib
-  src/collision_checker.cpp
   src/velocity_smoother.cpp
   src/astar_local_planner.cpp
 )

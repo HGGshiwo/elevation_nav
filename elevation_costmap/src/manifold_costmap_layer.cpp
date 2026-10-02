@@ -53,6 +53,9 @@ void ManifoldCostmapLayer::onInitialize()
   private_nh.param<bool>  ("body_hard_ring_enabled", build_cfg.body_hard_ring_enabled, true);
   private_nh.param<int>   ("sor_mean_k",         build_cfg.sor_mean_k, 16);
   private_nh.param<double>("sor_std_mul",        build_cfg.sor_std_mul, 1.5);
+  private_nh.param<bool>  ("cluster_filter_enable", build_cfg.cluster_filter_enable, true);
+  private_nh.param<double>("cluster_tolerance",   build_cfg.cluster_tolerance, 0.15);
+  private_nh.param<int>   ("cluster_min_size",   build_cfg.cluster_min_size, 30);
   private_nh.param<double>("cluster_height_diff", build_cfg.cluster_height_diff, 0.08);
   private_nh.param<int>   ("min_cluster_points", build_cfg.min_cluster_points, 2);
 

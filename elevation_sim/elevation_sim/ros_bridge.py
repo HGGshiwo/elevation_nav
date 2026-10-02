@@ -69,10 +69,6 @@ class ElevationRosBridge:
         self.graph_edges_version = 0
         self.graph_adj: Dict[Tuple[float, float, float], List[Tuple[float, float, float]]] = {}
         self.current_graph_node: Optional[Tuple[float, float, float]] = None
-        # 拓扑流形管道节点与状态
-        self.corridor_nodes: List[List[float]] = []
-        self.corridor_lines: List[List[float]] = []
-        self.corridor_nodes_version = 0
         # 局部 SFC 走廊诊断数据 (各路径点与扩散节点群)
         self.sfc_corridors_debug: List[Dict[str, Any]] = []
         self.sfc_corridors_debug_version = 0
@@ -94,6 +90,7 @@ class ElevationRosBridge:
         self.rebound_arrows_version = 0
         # 平移锁止/碰撞节点 (供前端高亮显示): [x, y, z, zone] (zone=3物理障碍/2机体禁行环/4顶盖)
         self.collision_node: Optional[List[float]] = None
+        self.collision_points: List[List[float]] = []
         self.collision_node_time: float = 0.0
 
         # ROS 话题发布者与订阅者
@@ -194,11 +191,9 @@ class ElevationRosBridge:
             rospy.Subscriber("/move_base/local_plan", ROSPath, self._local_path_callback, queue_size=2)
             rospy.Subscriber("/elevation_local_plan", ROSPath, self._local_path_callback, queue_size=2)
 
-            # 订阅流形图节点与边可视化数据，以及全局/局部 3D 走廊
+            # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
             rospy.Subscriber("/elevation_graph_edges", MarkerArray, self._graph_edges_callback, queue_size=1)
-            rospy.Subscriber("/elevation_corridor_nodes", PointCloud2, self._corridor_nodes_callback, queue_size=1)
-            rospy.Subscriber("/move_base/local_sfc_corridor", MarkerArray, self._corridor_boundaries_callback, queue_size=1)
             rospy.Subscriber("/elevation_local_corridors_debug", RosString, self._sfc_corridors_debug_callback, queue_size=1)
             rospy.Subscriber("/elevation_debug_result", RosString, self._debug_result_callback, queue_size=5)
             rospy.Subscriber("/elevation_injected_obstacles", MarkerArray, self._injected_obstacles_callback, queue_size=1)
@@ -219,19 +214,22 @@ class ElevationRosBridge:
             rospy.logwarn(f"[ElevationRosBridge] ROS init exception: {e}")
 
     def _collision_node_callback(self, msg: RosString):
-        """接收独立仿真器发出的碰撞事件"""
+        """接收独立仿真器发出的碰撞事件与碰撞点云"""
         try:
             if not msg.data:
                 with self._lock:
                     self.collision_node = None
+                    self.collision_points = []
                 return
             data = json.loads(msg.data)
             if data and "x" in data:
                 with self._lock:
                     self.collision_node = [float(data["x"]), float(data["y"]), float(data["z"]), int(data.get("type", 3))]
+                    self.collision_points = data.get("points", [])
             else:
                 with self._lock:
                     self.collision_node = None
+                    self.collision_points = []
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 collision_node 异常: {e}")
 
@@ -451,37 +449,6 @@ class ElevationRosBridge:
                 self.injected_obstacles_version += 1
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 injected_obstacles 异常: {e}")
-
-    def _corridor_boundaries_callback(self, msg: MarkerArray):
-        """解析局部 SFC 凸走廊 3D 边界发光线框"""
-        try:
-            lines = []
-            for m in msg.markers:
-                if m.ns == "sfc_corridor_wireframe" and m.type == 5:  # LINE_LIST
-                    for p in m.points:
-                        lines.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
-            with self._lock:
-                self.corridor_lines = lines
-                self.corridor_nodes_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 corridor boundaries 异常: {e}")
-
-    def _corridor_nodes_callback(self, msg: PointCloud2):
-        """解析拓扑流形管道点云并更新管道 (节流 5Hz, 避免 20Hz 反序列化耗尽 Python 算力)"""
-        try:
-            now_sec = rospy.Time.now().to_sec()
-            if hasattr(self, '_last_corridor_parse_time') and (now_sec - self._last_corridor_parse_time) < 0.2:
-                return
-            self._last_corridor_parse_time = now_sec
-
-            pts = []
-            for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-                pts.append([round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3)])
-            with self._lock:
-                self.corridor_nodes = pts
-                self.corridor_nodes_version += 1
-        except Exception as e:
-            rospy.logwarn(f"[ElevationRosBridge] 解析 corridor nodes 点云异常: {e}")
 
     def _graph_nodes_callback(self, msg: PointCloud2):
         """解析流形踏面节点点云并建立空间栅格哈希。
@@ -1042,6 +1009,7 @@ class ElevationRosBridge:
             else:
                 self.sim_z = float(z) if z is not None else self.get_terrain_z(self.sim_x, self.sim_y, 0.0)
             self.collision_node = None
+            self.collision_points = []
             self.collision_node_time = 0.0
         self.cmd_vx, self.cmd_vy, self.cmd_wz = 0.0, 0.0, 0.0
         self.last_sim_time = rospy.Time.now()
@@ -1303,12 +1271,10 @@ class ElevationRosBridge:
                 "global_path": list(self.global_path),
                 "local_path": list(self.local_path),
                 "collision_node": list(self.collision_node) if self.collision_node else None,
+                "collision_points": list(self.collision_points) if self.collision_points else [],
                 "path_version": self.path_version,
                 "graph_nodes_version": self.graph_nodes_version,
                 "graph_edges_version": self.graph_edges_version,
-                "corridor_nodes": list(self.corridor_nodes),
-                "corridor_lines": list(self.corridor_lines),
-                "corridor_nodes_version": self.corridor_nodes_version,
                 "sfc_corridors_debug": list(self.sfc_corridors_debug),
                 "sfc_corridors_debug_version": self.sfc_corridors_debug_version,
                 "injected_obstacles": list(self.injected_obstacles) + [

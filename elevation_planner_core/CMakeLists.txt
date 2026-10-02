@@ -19,7 +19,6 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(PCL REQUIRED)
-find_package(yaml-cpp REQUIRED)
 
 add_service_files(
   FILES
@@ -42,13 +41,11 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
-  ${YAML_CPP_INCLUDE_DIRS}
 )
 
 add_library(elevation_planner_core
   src/manifold_graph.cpp
   src/cloud_graph_builder.cpp
-  src/layer_portal.cpp
   src/pcd_map_io.cpp
   src/manifold_fusion_engine.cpp
 )
@@ -56,7 +53,6 @@ add_dependencies(elevation_planner_core ${${PROJECT_NAME}_EXPORTED_TARGETS} ${ca
 target_link_libraries(elevation_planner_core
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
-  ${YAML_CPP_LIBRARIES}
 )
 
 if (CATKIN_ENABLE_TESTING)

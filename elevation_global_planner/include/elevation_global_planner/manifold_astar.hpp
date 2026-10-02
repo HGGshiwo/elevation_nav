@@ -2,7 +2,6 @@
 
 #include "elevation_planner_core/manifold_graph.hpp"
 #include "elevation_planner_core/manifold_search.hpp"
-#include "elevation_planner_core/layer_portal.hpp"
 #include "elevation_planner_core/planner_interface.hpp"
 #include "elevation_planner_core/path_simplifier.hpp"
 
@@ -29,7 +28,6 @@ public:
   ~ManifoldAStarPlanner() override = default;
 
   bool initialize(const elevation_planner::ManifoldGraph & graph) override;
-  void setPortalManager(const elevation_planner::LayerPortalManager & portal_mgr);
 
   /**
    * @brief SC-LOS 剪枝开关与最大段长 (2D, m); 需在 initialize 前调用
@@ -59,7 +57,6 @@ private:
   // 零拷贝绑定: 只持指针, 指向 GraphStore 的融合活图 (makePlan 每次重绑定,
   // 融合引擎在另一线程原位刷新节点属性 —— 4 字节对齐 float 的良性竞争, 已接受)
   const elevation_planner::ManifoldGraph * graph_{nullptr};
-  elevation_planner::LayerPortalManager portal_mgr_;
   elevation_planner::PathSimplifier los_simplifier_;
   bool los_prune_enabled_{true};
   double los_max_segment_{0.60};

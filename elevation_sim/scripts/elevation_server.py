@@ -259,7 +259,6 @@ async def websocket_live(websocket: WebSocket):
     """实时推送机器人位姿、导航规划路径、流形拓扑图版本与 C++ 节点发布的 GridMap"""
     await websocket.accept()
     last_path_v = -1
-    last_corridor_v = -1
     last_sfc_corridors_v = -1
     last_obstacles_v = -1
     last_dyn_nodes_v = -1
@@ -272,6 +271,7 @@ async def websocket_live(websocket: WebSocket):
                 "robot_pose": state["robot_pose"],
                 "local_path": state["local_path"],
                 "collision_node": state.get("collision_node"),
+                "collision_points": state.get("collision_points", []),
                 "graph_nodes_version": state.get("graph_nodes_version", 0),
                 "graph_edges_version": state.get("graph_edges_version", 0)
             }
@@ -279,12 +279,6 @@ async def websocket_live(websocket: WebSocket):
                 frame["global_path"] = state["global_path"]
                 frame["path_version"] = state["path_version"]
                 last_path_v = state["path_version"]
-
-            if state.get("corridor_nodes_version", 0) != last_corridor_v:
-                frame["corridor_nodes"] = state.get("corridor_nodes", [])
-                frame["corridor_lines"] = state.get("corridor_lines", [])
-                frame["corridor_nodes_version"] = state["corridor_nodes_version"]
-                last_corridor_v = state["corridor_nodes_version"]
 
             if state.get("sfc_corridors_debug_version", 0) != last_sfc_corridors_v:
                 frame["sfc_corridors_debug"] = state.get("sfc_corridors_debug", [])

@@ -176,47 +176,12 @@ export function initRobotTracker(scene, controls) {
         scene.add(localAStarPathLine);
     }
 
-    // ---- 碰撞/锁止格子高亮显示 (3D 标记柱: 圆点 + 竖线 + 踏面底框) ----
+    // ---- 碰撞/锁止格子高亮显示 (3D 标记柱: 悬浮警示柱 + 顶部圆球，不加底部方格遮挡踏面) ----
     const collisionGroup = new THREE.Group();
     collisionGroup.visible = false;
     scene.add(collisionGroup);
 
-    // 1. 贴地高清晰边缘方框 (0.092m 踏面外框)
-    const colHalfSize = 0.046;
-    const colOutlinePos = new Float32Array([
-        -colHalfSize, -colHalfSize, 0,   colHalfSize, -colHalfSize, 0,
-         colHalfSize, -colHalfSize, 0,   colHalfSize,  colHalfSize, 0,
-         colHalfSize,  colHalfSize, 0,  -colHalfSize,  colHalfSize, 0,
-        -colHalfSize,  colHalfSize, 0,  -colHalfSize, -colHalfSize, 0
-    ]);
-    const colOutlineGeo = new THREE.BufferGeometry();
-    colOutlineGeo.setAttribute('position', new THREE.BufferAttribute(colOutlinePos, 3));
-    const colOutlineMat = new THREE.LineBasicMaterial({
-        color: 0xffffff,
-        linewidth: 3,
-        transparent: true,
-        opacity: 0.98
-    });
-    const colOutlineLine = new THREE.LineSegments(colOutlineGeo, colOutlineMat);
-    colOutlineLine.position.set(0, 0, 0.003);
-    colOutlineLine.renderOrder = 20;
-    collisionGroup.add(colOutlineLine);
-
-    // 2. 贴地半透明发光底面
-    const colTileGeo = new THREE.PlaneGeometry(0.092, 0.092);
-    const colTileMat = new THREE.MeshBasicMaterial({
-        color: 0xff1744,
-        transparent: true,
-        opacity: 0.85,
-        side: THREE.DoubleSide,
-        depthWrite: false
-    });
-    const colTileMesh = new THREE.Mesh(colTileGeo, colTileMat);
-    colTileMesh.position.set(0, 0, 0.002);
-    colTileMesh.renderOrder = 19;
-    collisionGroup.add(colTileMesh);
-
-    // 3. 立体竖线标杆 (Cylinder)
+    // 1. 立体竖线标杆 (Cylinder)
     const poleH = 0.28;
     const colPoleGeo = new THREE.CylinderGeometry(0.012, 0.012, poleH, 12);
     const colPoleMat = new THREE.MeshBasicMaterial({ color: 0xff1744 });
@@ -226,7 +191,7 @@ export function initRobotTracker(scene, controls) {
     colPoleMesh.renderOrder = 21;
     collisionGroup.add(colPoleMesh);
 
-    // 4. 顶部高亮警示圆点 (Sphere)
+    // 2. 顶部高亮警示圆点 (Sphere)
     const colSphereGeo = new THREE.SphereGeometry(0.065, 20, 20);
     const colSphereMat = new THREE.MeshStandardMaterial({
         color: 0xff1744,
@@ -239,7 +204,7 @@ export function initRobotTracker(scene, controls) {
     colSphereMesh.renderOrder = 22;
     collisionGroup.add(colSphereMesh);
 
-    // 5. 顶部环绕发光光环 (Torus)
+    // 3. 顶部环绕发光光环 (Torus)
     const colHaloGeo = new THREE.TorusGeometry(0.095, 0.008, 8, 32);
     const colHaloMat = new THREE.MeshBasicMaterial({
         color: 0xff8a80,
@@ -251,9 +216,27 @@ export function initRobotTracker(scene, controls) {
     colHaloMesh.renderOrder = 23;
     collisionGroup.add(colHaloMesh);
 
-    function updateCollisionNode(node) {
+    // 4. 触碰碰撞点云高亮实例网格 (InstancedMesh: 发光粒子球)
+    const maxColPts = 1000;
+    const colPtGeo = new THREE.SphereGeometry(0.025, 10, 10);
+    const colPtMat = new THREE.MeshStandardMaterial({
+        color: 0xff1744,
+        emissive: 0xd50000,
+        emissiveIntensity: 0.9,
+        roughness: 0.2,
+        metalness: 0.3
+    });
+    const colPtsMesh = new THREE.InstancedMesh(colPtGeo, colPtMat, maxColPts);
+    colPtsMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    colPtsMesh.visible = false;
+    colPtsMesh.renderOrder = 25;
+    scene.add(colPtsMesh);
+    const colPtsDummy = new THREE.Object3D();
+
+    function updateCollisionNode(node, hitPoints = null) {
         if (!node || !Array.isArray(node) || node.length < 3) {
             collisionGroup.visible = false;
+            colPtsMesh.visible = false;
             return;
         }
         const [cx, cy, cz, zone] = node;
@@ -262,45 +245,68 @@ export function initRobotTracker(scene, controls) {
 
         if (zone === 2) {
             // BODY_HARD 机体禁行环 (亮橙)
-            colTileMat.color.setHex(0xff9100);
             colPoleMat.color.setHex(0xff9100);
             colSphereMat.color.setHex(0xff9100);
             colSphereMat.emissive.setHex(0xff6d00);
             colHaloMat.color.setHex(0xffd180);
-            colOutlineMat.color.setHex(0xffe57f);
+            colPtMat.color.setHex(0xff9100);
+            colPtMat.emissive.setHex(0xff6d00);
         } else if (zone === 4) {
             // 顶盖碰撞 (紫红)
-            colTileMat.color.setHex(0xd500f9);
             colPoleMat.color.setHex(0xd500f9);
             colSphereMat.color.setHex(0xd500f9);
             colSphereMat.emissive.setHex(0xaa00ff);
             colHaloMat.color.setHex(0xea80fc);
-            colOutlineMat.color.setHex(0xff80ab);
+            colPtMat.color.setHex(0xd500f9);
+            colPtMat.emissive.setHex(0xaa00ff);
         } else {
             // zone === 3 或默认 真实物理障碍禁行 (鲜红)
-            colTileMat.color.setHex(0xff1744);
             colPoleMat.color.setHex(0xff1744);
             colSphereMat.color.setHex(0xff1744);
             colSphereMat.emissive.setHex(0xd50000);
             colHaloMat.color.setHex(0xff8a80);
-            colOutlineMat.color.setHex(0xffffff);
+            colPtMat.color.setHex(0xff1744);
+            colPtMat.emissive.setHex(0xd50000);
         }
 
         collisionGroup.visible = true;
+
+        // 渲染触发碰撞的具体点云点
+        if (hitPoints && Array.isArray(hitPoints) && hitPoints.length > 0) {
+            const count = Math.min(hitPoints.length, maxColPts);
+            for (let i = 0; i < count; i++) {
+                const pt = hitPoints[i];
+                colPtsDummy.position.set(pt[0], pt[1], pt[2]);
+                colPtsDummy.scale.set(1, 1, 1);
+                colPtsDummy.updateMatrix();
+                colPtsMesh.setMatrixAt(i, colPtsDummy.matrix);
+            }
+            colPtsMesh.count = count;
+            colPtsMesh.instanceMatrix.needsUpdate = true;
+            colPtsMesh.visible = true;
+        } else {
+            colPtsMesh.visible = false;
+        }
     }
 
     function updateCollisionAnimation() {
-        if (!collisionGroup.visible) return;
         const now = Date.now();
-        const bounce = 0.03 * Math.sin(now * 0.008);
-        const curH = poleH + bounce;
+        if (collisionGroup.visible) {
+            const bounce = 0.03 * Math.sin(now * 0.008);
+            const curH = poleH + bounce;
 
-        colSphereMesh.position.set(0, 0, curH);
-        colHaloMesh.position.set(0, 0, curH);
-        colHaloMesh.rotation.z = now * 0.002;
+            colSphereMesh.position.set(0, 0, curH);
+            colHaloMesh.position.set(0, 0, curH);
+            colHaloMesh.rotation.z = now * 0.002;
 
-        colPoleMesh.scale.set(1, curH / poleH, 1);
-        colPoleMesh.position.set(0, 0, curH * 0.5);
+            colPoleMesh.scale.set(1, curH / poleH, 1);
+            colPoleMesh.position.set(0, 0, curH * 0.5);
+        }
+
+        if (colPtsMesh.visible) {
+            const glow = 0.8 + 0.4 * Math.sin(now * 0.01);
+            colPtMat.emissiveIntensity = glow;
+        }
     }
 
     function updatePose(pose) {

@@ -94,11 +94,18 @@ class QuadrupedPointCloudSimulator:
         self.publish_tf = rospy.get_param("~publish_tf", True)
         self.cmd_vel_freeze = bool(rospy.get_param("~cmd_vel_freeze", False))
 
-        # 物理几何参数
-        self.footprint_radius = float(rospy.get_param("~footprint_radius", 0.22))
-        self.body_hard_radius = float(rospy.get_param("~body_hard_radius", 0.17))
+        # 物理几何参数 (优先从 ROS 参数服务器读取 planner_common 中的统一配置)
+        robot_width = float(rospy.get_param("~robot_width", 0.26))
+        robot_length = float(rospy.get_param("~robot_length", 0.36))
+        margin = float(rospy.get_param("~obstacle_safety_margin", 0.04))
+        derived_hard_radius = robot_width * 0.5 + margin
+        derived_footprint = math.hypot(robot_length * 0.5, robot_width * 0.5) + margin
+
+        self.footprint_radius = float(rospy.get_param("~footprint_radius", derived_footprint))
+        self.body_hard_radius = float(rospy.get_param("~body_hard_radius", derived_hard_radius))
         self.max_step_height = float(rospy.get_param("~max_step_height", 0.25))
         self.dog_height = float(rospy.get_param("~dog_height", 0.45))
+        self.min_obstacle_points = int(rospy.get_param("~min_obstacle_points", 8))
 
         # 运动学噪声参数
         self.linear_noise_std = float(rospy.get_param("~linear_noise_std", 0.008))
@@ -158,7 +165,7 @@ class QuadrupedPointCloudSimulator:
 
     # ------------------ 点云加载与空间索引构建 ------------------
     def _load_static_pcd(self, pcd_path: str):
-        """从 PCD 文件加载点云并构建 2D KD-Tree"""
+        """从 PCD 文件加载点云并构建 2D KD-Tree (支持 CropBox 空间裁剪)"""
         try:
             path = Path(pcd_path).expanduser().resolve()
             if not path.is_file():
@@ -169,6 +176,53 @@ class QuadrupedPointCloudSimulator:
             if len(pts) == 0:
                 rospy.logwarn(f"[Simulator] PCD 文件点云为空: {path}")
                 return
+
+            # 应用 CropBox 空间裁剪 (若配置)
+            crop_enable = bool(rospy.get_param("~crop_box/enable", False))
+            if crop_enable:
+                min_x = float(rospy.get_param("~crop_box/min_x", -100.0))
+                max_x = float(rospy.get_param("~crop_box/max_x", 100.0))
+                min_y = float(rospy.get_param("~crop_box/min_y", -100.0))
+                max_y = float(rospy.get_param("~crop_box/max_y", 100.0))
+                min_z = float(rospy.get_param("~crop_box/min_z", -100.0))
+                max_z = float(rospy.get_param("~crop_box/max_z", 100.0))
+
+                mask = (
+                    (pts[:, 0] >= min_x) & (pts[:, 0] <= max_x) &
+                    (pts[:, 1] >= min_y) & (pts[:, 1] <= max_y) &
+                    (pts[:, 2] >= min_z) & (pts[:, 2] <= max_z)
+                )
+                pts = pts[mask]
+                rospy.loginfo(
+                    f"[Simulator] CropBox applied: {len(pts)} points kept in "
+                    f"[{min_x:.2f}, {max_x:.2f}] x [{min_y:.2f}, {max_y:.2f}] x [{min_z:.2f}, {max_z:.2f}]"
+                )
+
+            # 应用欧氏聚类小簇过滤 (Euclidean Cluster Filtering 筛除空中漂浮小噪点碎片)
+            cluster_enable = bool(rospy.get_param("~cluster_filter_enable", True))
+            cluster_tol = float(rospy.get_param("~cluster_tolerance", 0.15))
+            cluster_min_size = int(rospy.get_param("~cluster_min_size", 30))
+
+            if cluster_enable and cluster_min_size > 0 and len(pts) > cluster_min_size:
+                try:
+                    import scipy.sparse as sp
+                    import scipy.sparse.csgraph as csgraph
+                    tree3d = cKDTree(pts)
+                    pairs = tree3d.query_pairs(cluster_tol, output_type='ndarray')
+                    if len(pairs) > 0:
+                        adj = sp.coo_matrix((np.ones(len(pairs), dtype=bool), (pairs[:, 0], pairs[:, 1])), shape=(len(pts), len(pts)))
+                        n_components, labels = csgraph.connected_components(adj, directed=False)
+                        unique, counts = np.unique(labels, return_counts=True)
+                        valid_labels = set(unique[counts >= cluster_min_size])
+                        cluster_mask = np.isin(labels, list(valid_labels))
+                        n_removed = len(pts) - np.count_nonzero(cluster_mask)
+                        pts = pts[cluster_mask]
+                        rospy.loginfo(
+                            f"[Simulator] EuclideanClusterExtraction applied: {n_components} components found, "
+                            f"kept {len(pts)} points (removed {n_removed} noise points in small clusters < {cluster_min_size})"
+                        )
+                except Exception as e:
+                    rospy.logwarn(f"[Simulator] EuclideanClusterExtraction skipped: {e}")
 
             with self._lock:
                 self.static_pts = pts
@@ -182,6 +236,8 @@ class QuadrupedPointCloudSimulator:
         """动态重载 PCD 点云"""
         pcd_path = msg.data.strip()
         if pcd_path:
+            if ";" in pcd_path:
+                pcd_path = pcd_path.split(";")[0].strip()
             self._load_static_pcd(pcd_path)
             self._snap_to_terrain(self.sim_x, self.sim_y, self.sim_z)
 
@@ -269,7 +325,7 @@ class QuadrupedPointCloudSimulator:
             self.sim_z = float(np.median(near_pts[:, 2]))
 
     # ------------------ 核心物理引擎：点云挤压越障与碰撞检测 ------------------
-    def evaluate_step_motion(self, new_x: float, new_y: float, curr_z: float) -> Tuple[bool, float, str, Optional[List[float]]]:
+    def evaluate_step_motion(self, new_x: float, new_y: float, curr_z: float) -> Tuple[bool, float, str, Optional[List[float]], List[List[float]]]:
         """
         纯点云物理越障判定 (Squeeze-Up Physics):
         1. 收集目标点 (new_x, new_y) 半径 footprint_radius (0.22m) 柱体内的所有点云;
@@ -277,10 +333,10 @@ class QuadrupedPointCloudSimulator:
         3. 决策规则:
            - 0.02m < dz <= 0.25m: 【自动往上挤 (上楼/越障)】放行并抬升高度至新表面 z_target;
            - -0.25m <= dz <= 0.02m: 【平地/正常下楼】放行并贴地降落至 z_target;
-           - dz > 0.25m: 【超高立面障碍】阻挡锁止，报警并返回碰撞节点;
+           - dz > 0.25m: 【超高立面障碍】阻挡锁止，报警并返回碰撞节点与触碰点云;
            - dz < -0.25m 或 无点: 【悬崖/悬空跌落】阻挡锁止，报警并返回碰撞节点;
            - 机身顶盖带 [z_target + 0.25, z_target + dog_height + 0.10] 存在点云: 【顶盖碰撞】阻挡锁止。
-        返回: (是否放行, 目标高度 z_target, 原因描述, 冲突节点[x, y, z, zone])
+        返回: (是否放行, 目标高度 z_target, 原因描述, 冲突节点[x, y, z, zone], 触碰点云列表[[x, y, z], ...])
         """
         with self._lock:
             static_tree = self.static_kdtree_2d
@@ -290,7 +346,7 @@ class QuadrupedPointCloudSimulator:
 
         if static_tree is None or static_pts is None or len(static_pts) == 0:
             # 无地图点云时直接放行
-            return True, curr_z, "no_pointcloud", None
+            return True, curr_z, "no_pointcloud", None, []
 
         # 1. 动态障碍物碰撞硬拦截 (来自 /lidar_points 的圆柱/方块障碍物, 严禁踏踩或攀爬)
         if dyn_tree is not None and dyn_pts is not None and len(dyn_pts) > 0:
@@ -300,13 +356,14 @@ class QuadrupedPointCloudSimulator:
                 # 检查与当前机身高度重叠的障碍区间 [-0.10m, +dog_height+0.10m]
                 dyn_hit_mask = (dyn_near[:, 2] >= curr_z - 0.10) & (dyn_near[:, 2] <= curr_z + self.dog_height + 0.10)
                 if np.any(dyn_hit_mask):
+                    hit_pts = dyn_near[dyn_hit_mask].round(3).tolist()
                     hit_dyn = dyn_near[dyn_hit_mask][0]
-                    return False, curr_z, f"触碰动态物理障碍(圆柱/实体): 坐标({hit_dyn[0]:.2f}, {hit_dyn[1]:.2f}, z={hit_dyn[2]:.2f})", [float(hit_dyn[0]), float(hit_dyn[1]), float(hit_dyn[2]), 3]
+                    return False, curr_z, f"触碰动态物理障碍(圆柱/实体): 坐标({hit_dyn[0]:.2f}, {hit_dyn[1]:.2f}, z={hit_dyn[2]:.2f})", [float(hit_dyn[0]), float(hit_dyn[1]), float(hit_dyn[2]), 3], hit_pts
 
         # 2. 静态地形点云查询 (仅使用静态环境点云计算地面与楼梯踏面)
         idx_static = static_tree.query_ball_point([new_x, new_y], r=self.footprint_radius)
         if not idx_static:
-            return False, curr_z, f"前方悬空踏空: 半径 {self.footprint_radius:.2f}m 内无地面点云支撑", [new_x, new_y, curr_z, 3]
+            return False, curr_z, f"前方悬空踏空: 半径 {self.footprint_radius:.2f}m 内无地面点云支撑", [new_x, new_y, curr_z, 3], []
 
         col_pts = static_pts[idx_static]
 
@@ -315,9 +372,10 @@ class QuadrupedPointCloudSimulator:
         if idx_body:
             body_pts = static_pts[idx_body]
             wall_mask = (body_pts[:, 2] > curr_z + self.max_step_height) & (body_pts[:, 2] <= curr_z + self.dog_height + 0.10)
-            if np.count_nonzero(wall_mask) >= 3:
+            if np.count_nonzero(wall_mask) >= self.min_obstacle_points:
+                hit_pts = body_pts[wall_mask].round(3).tolist()
                 hit_wall = body_pts[wall_mask][0]
-                return False, curr_z, f"触碰静态立面高墙: 障碍高度 z={hit_wall[2]:.2f} (高出 {hit_wall[2]-curr_z:.2f}m > {self.max_step_height:.2f}m)", [float(hit_wall[0]), float(hit_wall[1]), float(hit_wall[2]), 3]
+                return False, curr_z, f"触碰静态立面高墙: 障碍高度 z={hit_wall[2]:.2f} (高出 {hit_wall[2]-curr_z:.2f}m > {self.max_step_height:.2f}m)", [float(hit_wall[0]), float(hit_wall[1]), float(hit_wall[2]), 3], hit_pts
 
         # 4. 提取当前单步可达范围内的踏面候选点 [-0.25m, +0.25m]
         reach_mask = (col_pts[:, 2] >= curr_z - self.max_step_height - 0.05) & (col_pts[:, 2] <= curr_z + self.max_step_height + 0.05)
@@ -327,11 +385,13 @@ class QuadrupedPointCloudSimulator:
             # 范围内无有效踏面：检查是深坑还是高墙
             all_below = np.all(col_pts[:, 2] < curr_z - self.max_step_height)
             if all_below:
-                return False, curr_z, f"危险断崖跌落: 前方地面下陷落差超过 {self.max_step_height:.2f}m", [new_x, new_y, curr_z - self.max_step_height, 3]
+                return False, curr_z, f"危险断崖跌落: 前方地面下陷落差超过 {self.max_step_height:.2f}m", [new_x, new_y, curr_z - self.max_step_height, 3], []
             else:
+                high_mask = col_pts[:, 2] > curr_z + self.max_step_height
+                hit_pts = col_pts[high_mask].round(3).tolist() if np.any(high_mask) else []
                 highest_pt = col_pts[np.argmax(col_pts[:, 2])]
                 dz_high = highest_pt[2] - curr_z
-                return False, curr_z, f"超高立面障碍: 障碍高度 z={highest_pt[2]:.2f} (高出 {dz_high:.2f}m > {self.max_step_height:.2f}m)", [float(highest_pt[0]), float(highest_pt[1]), float(highest_pt[2]), 3]
+                return False, curr_z, f"超高立面障碍: 障碍高度 z={highest_pt[2]:.2f} (高出 {dz_high:.2f}m > {self.max_step_height:.2f}m)", [float(highest_pt[0]), float(highest_pt[1]), float(highest_pt[2]), 3], hit_pts
 
         # 5. 寻找支撑表面并自适应抬升 (Squeeze-Up)
         # 如果前方足印内有高于当前地面 (0.02m < dz <= 0.25m) 的上行台阶/凸起，机身自动被“往上挤”
@@ -350,10 +410,10 @@ class QuadrupedPointCloudSimulator:
             dz_down = z_target - curr_z
             if dz_down < -self.max_step_height - 0.05:
                 # 超过 0.25m 下落极限 -> 断崖跌落保护
-                return False, curr_z, f"危险断崖跌落: 下台阶落差 dz={dz_down:.2f}m 超出安全极限", [new_x, new_y, z_target, 3]
+                return False, curr_z, f"危险断崖跌落: 下台阶落差 dz={dz_down:.2f}m 超出安全极限", [new_x, new_y, z_target, 3], []
 
         # 所有检查通过，放行运动
-        return True, z_target, "ok", None
+        return True, z_target, "ok", None, []
 
     # ------------------ 100Hz 仿真主循环 ------------------
     def _sim_loop_worker(self):
@@ -396,7 +456,7 @@ class QuadrupedPointCloudSimulator:
 
             if is_translating:
                 # 执行纯点云越障与碰撞评估
-                ok, target_z, reason, hit_node = self.evaluate_step_motion(new_x, new_y, self.sim_z)
+                ok, target_z, reason, hit_node, hit_points = self.evaluate_step_motion(new_x, new_y, self.sim_z)
                 if ok:
                     self.sim_x = new_x
                     self.sim_y = new_y
@@ -404,7 +464,7 @@ class QuadrupedPointCloudSimulator:
                 else:
                     # 发生碰撞截断
                     self.collision_node = hit_node
-                    self._publish_collision_event(hit_node)
+                    self._publish_collision_event(hit_node, hit_points)
                     rospy.logerr_throttle(
                         1.0,
                         f"[Simulator] 物理截断 (锁止于 x={self.sim_x:.2f}, y={self.sim_y:.2f}, z={self.sim_z:.2f}): {reason}"
@@ -452,7 +512,7 @@ class QuadrupedPointCloudSimulator:
         self._loc_base_pub.publish(odom)
         self._odom_pub.publish(odom)
 
-    def _publish_collision_event(self, hit_node: Optional[List[float]]):
+    def _publish_collision_event(self, hit_node: Optional[List[float]], hit_points: Optional[List[List[float]]] = None):
         """发布碰撞事件与 3D Marker (若 hit_node 为 None 则清空标记)"""
         if hit_node is None:
             self._collision_node_pub.publish(RosString(data=""))
@@ -466,7 +526,13 @@ class QuadrupedPointCloudSimulator:
             return
 
         # 1. 发布 JSON 字符串
-        data = json.dumps({"x": hit_node[0], "y": hit_node[1], "z": hit_node[2], "type": hit_node[3]})
+        data = json.dumps({
+            "x": hit_node[0],
+            "y": hit_node[1],
+            "z": hit_node[2],
+            "type": hit_node[3],
+            "points": hit_points or []
+        })
         self._collision_node_pub.publish(RosString(data=data))
 
         # 2. 发布 Marker

@@ -23,7 +23,6 @@
 #include <elevation_planner_core/path_simplifier.hpp>
 #include "elevation_local_planner/control_types.h"
 #include "elevation_local_planner/velocity_smoother.h"
-#include "elevation_local_planner/collision_checker.hpp"
 #include "elevation_local_planner/kinematic_astar.hpp"
 #include "elevation_local_planner/bspline_trajectory.hpp"
 #include "elevation_local_planner/sfc_corridor.hpp"
@@ -116,7 +115,6 @@ private:
 
   // 算法模块
   VelocitySmoother velocity_smoother_;
-  CollisionChecker collision_checker_;
   KinematicAStar kinematic_astar_;
   BSplineTrajectory bspline_traj_;
   ScanBsplineOptimizer scan_optimizer_;

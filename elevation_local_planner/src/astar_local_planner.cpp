@@ -1,4 +1,5 @@
 #include "elevation_local_planner/astar_local_planner.h"
+#include "elevation_planner_core/crash_handler.hpp"
 #include <pluginlib/class_list_macros.h>
 #include <chrono>
 #include <string>
@@ -70,6 +71,8 @@ void AStarLocalPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costma
     ROS_WARN("[AStarLocalPlanner] Already initialized, doing nothing.");
     return;
   }
+
+  elevation_planner::CrashHandler::install("/tmp/elevation_local_planner_crash.log");
 
   tf_buffer_ = tf;
   costmap_ros_ = costmap_ros;
@@ -216,7 +219,7 @@ bool AStarLocalPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
       cmd_vel = geometry_msgs::Twist();
       return true;   // 恒成功, 避免 move_base 进入 recovery/abort
     }
-    const bool ok = computeVelocityCommandsImpl(cmd_vel);
+    (void)computeVelocityCommandsImpl(cmd_vel);
     cmd_vel = geometry_msgs::Twist();   // 只看轨迹不动狗 (伪 TF 侧另有 cmd_vel_freeze 双保险)
     return true;
   }
@@ -262,48 +265,92 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
   }
   last_control_time_ = now;
 
-  // 2. 终点高精度对齐模式
+  // 2. 终点直接距离探测与全向对齐吸附模式 (真 3D + 姿态全向解耦微调: 允许正负 vx/vy, 绝不绕圈掉头)
+  const auto & final_goal_pose = global_plan_.back();
+  const double dist_to_goal_xy = std::hypot(final_goal_pose.pose.position.x - robot_pose.x,
+                                            final_goal_pose.pose.position.y - robot_pose.y);
+  const double dist_to_goal_z  = std::abs(final_goal_pose.pose.position.z - robot_pose.z);
+  const double remaining_dist_3d = remainingPlanLength3D(robot_pose);
+
+  // 严格的真 3D 接近终点判定：必须剩余 3D 路径 < 0.35m，或 (同层 z 满足 && xy 满足 && 剩余 3D 路径 < 0.60m)
+  const bool is_near_final_goal = (remaining_dist_3d < 0.35) ||
+                                  (dist_to_goal_xy < 0.35 && dist_to_goal_z < goal_z_tol_ + 0.05 && remaining_dist_3d < 0.60);
+
+  if (!pose_adjusting_ && is_near_final_goal)
+  {
+    pose_adjusting_ = true;
+    ROS_INFO("[AStarLocalPlanner] Near final goal (3D path: %.2fm, direct xy: %.2fm, dz: %.2fm). Activating holonomic goal alignment.",
+             remaining_dist_3d, dist_to_goal_xy, dist_to_goal_z);
+  }
+
   if (pose_adjusting_)
   {
-    geometry_msgs::PoseStamped final_pose_base;
-    if (!transformToBase(global_plan_.back(), final_pose_base))
+    // 防脱靶迟滞保护: 只要未大幅脱离 0.60m 或 z 高程错位，保持吸附模式
+    if (dist_to_goal_xy > 0.60 || dist_to_goal_z > goal_z_tol_ + 0.20 || remaining_dist_3d > 1.0)
     {
-      cmd_vel = geometry_msgs::Twist();
-      return false;
+      pose_adjusting_ = false;
+      ROS_WARN("[AStarLocalPlanner] Deviated from goal alignment region (xy: %.3fm, dz: %.3fm, 3D: %.2fm), fallback to trajectory tracking.",
+               dist_to_goal_xy, dist_to_goal_z, remaining_dist_3d);
     }
-
-    geometry_msgs::Twist raw_cmd;
-    raw_cmd.linear.x = final_pose_base.pose.position.x * linear_gain_;
-    raw_cmd.linear.y = enable_lateral_motion_ ? final_pose_base.pose.position.y * lateral_gain_ : 0.0;
-
-    double final_yaw_error = 0.0;
-    if (align_final_yaw_)
+    else
     {
-      if (!computeFinalYawErrorXY(global_plan_.back(), final_yaw_error))
+      geometry_msgs::PoseStamped final_pose_base;
+      if (!transformToBase(global_plan_.back(), final_pose_base))
       {
         cmd_vel = geometry_msgs::Twist();
         return false;
       }
-      raw_cmd.angular.z = final_yaw_error * final_yaw_gain_;
-    }
 
-    const bool pos_ok = std::hypot(final_pose_base.pose.position.x, final_pose_base.pose.position.y) < goal_pos_tol_;
-    const bool z_ok = std::abs(final_pose_base.pose.position.z) < goal_z_tol_;
-    const bool yaw_ok = !align_final_yaw_ || std::abs(final_yaw_error) < goal_yaw_tol_;
-    if (pos_ok && z_ok && yaw_ok)
-    {
-      goal_reached_ = true;
-      velocity_smoother_.reset();
-      cmd_vel = geometry_msgs::Twist();
-      ROS_INFO("[AStarLocalPlanner] Goal successfully reached (xy: %.3fm, dz: %.3fm, yaw: %.3frad).",
-               std::hypot(final_pose_base.pose.position.x, final_pose_base.pose.position.y),
-               final_pose_base.pose.position.z, final_yaw_error);
+      double dx_b = final_pose_base.pose.position.x;
+      double dy_b = final_pose_base.pose.position.y;
+      double dz_b = final_pose_base.pose.position.z;
+      double cur_dist_xy = std::hypot(dx_b, dy_b);
+
+      double final_yaw_error = 0.0;
+      if (align_final_yaw_)
+      {
+        if (!computeFinalYawErrorXY(global_plan_.back(), final_yaw_error))
+        {
+          cmd_vel = geometry_msgs::Twist();
+          return false;
+        }
+      }
+
+      const bool pos_ok = cur_dist_xy < goal_pos_tol_;
+      const bool z_ok   = std::abs(dz_b) < goal_z_tol_;
+      const bool yaw_ok = !align_final_yaw_ || std::abs(final_yaw_error) < goal_yaw_tol_;
+      if (pos_ok && z_ok && yaw_ok)
+      {
+        goal_reached_ = true;
+        velocity_smoother_.reset();
+        cmd_vel = geometry_msgs::Twist();
+        ROS_INFO("[AStarLocalPlanner] Goal successfully reached (xy: %.3fm, dz: %.3fm, yaw: %.3frad).",
+                 cur_dist_xy, dz_b, final_yaw_error);
+        return true;
+      }
+
+      // 全向速度限幅与比例控制 (前后进退、左右平移、原地自转三自由度解耦)
+      const double max_align_v = 0.25;
+      const double max_align_w = 0.60;
+      geometry_msgs::Twist raw_cmd;
+      raw_cmd.linear.x = std::max(-max_align_v, std::min(max_align_v, dx_b * linear_gain_));
+      raw_cmd.linear.y = enable_lateral_motion_ ? std::max(-max_align_v, std::min(max_align_v, dy_b * lateral_gain_)) : 0.0;
+      raw_cmd.linear.z = 0.0;
+
+      if (align_final_yaw_)
+      {
+        raw_cmd.angular.z = std::max(-max_align_w, std::min(max_align_w, final_yaw_error * final_yaw_gain_));
+      }
+      else if (cur_dist_xy > 0.05)
+      {
+        double angle_to_target = std::atan2(dy_b, dx_b);
+        raw_cmd.angular.z = std::max(-max_align_w, std::min(max_align_w, angle_to_target * heading_gain_));
+      }
+
+      cmd_vel = velocity_smoother_.smooth(raw_cmd, dt);
+      last_cmd_vel_ = cmd_vel;
       return true;
     }
-
-    cmd_vel = velocity_smoother_.smooth(raw_cmd, dt);
-    last_cmd_vel_ = cmd_vel;
-    return true;
   }
 
   // 3. 截取前方局部切片 (2.5m 视距，严格单调向前推进，彻底防止发夹弯跳点)
@@ -524,8 +571,6 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
       max_edge = std::max(max_edge, std::sqrt(dxy * dxy + dz * dz));
     }
     knot_dt = std::max(0.10, std::min(5.0, max_edge / std::max(0.05, cruise_speed)));
-
-    const Eigen::Vector2d anchor_2d = robot_start_2d + knot_dt * v_start_2d;
 
     // 6.1 生成 1:1 严格对应的 2D 凸多边形走廊 (零 findClosestNode 查点)
     //     segment 模式: 以 SC-LOS 支撑链为种子的多源 BFS, 走廊沿 A→B 连线向外发散 (0.5m 阈值不变);
@@ -799,14 +844,50 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
                           &opt_control_points_2d, knot_dt, 0.05);
   }
 
-  // 8. 终点距离判断: 剩余 3D 路程长度 (沿路径弧长, 楼梯高程与绕行形状计入, 跨层投影重合不再误判)
-  const double remaining_dist_3d = remainingPlanLength3D(robot_pose);
-  if (remaining_dist_3d < goal_pos_tol_ + 0.10)
+  // 8. 终点距离判断: 剩余 3D 路程长度在真 3D 满足时无缝进入终点吸附 (直接计算控制量，严禁自递归)
+  if (is_near_final_goal)
   {
     pose_adjusting_ = true;
-    ROS_INFO("[AStarLocalPlanner] Near final goal (remaining 3D path length: %.2fm). Entering final alignment.",
-             remaining_dist_3d);
-    return computeVelocityCommands(cmd_vel);
+    ROS_INFO("[AStarLocalPlanner] Near final goal in step 8 (remaining 3D: %.2fm, direct xy: %.2fm, dz: %.2fm). Activating alignment.",
+             remaining_dist_3d, dist_to_goal_xy, dist_to_goal_z);
+
+    geometry_msgs::PoseStamped final_pose_base;
+    if (transformToBase(global_plan_.back(), final_pose_base))
+    {
+      double dx_b = final_pose_base.pose.position.x;
+      double dy_b = final_pose_base.pose.position.y;
+      double dz_b = final_pose_base.pose.position.z;
+      double cur_dist_xy = std::hypot(dx_b, dy_b);
+      double final_yaw_error = 0.0;
+      if (align_final_yaw_) computeFinalYawErrorXY(global_plan_.back(), final_yaw_error);
+
+      if (cur_dist_xy < goal_pos_tol_ && std::abs(dz_b) < goal_z_tol_ && (!align_final_yaw_ || std::abs(final_yaw_error) < goal_yaw_tol_))
+      {
+        goal_reached_ = true;
+        velocity_smoother_.reset();
+        cmd_vel = geometry_msgs::Twist();
+        return true;
+      }
+
+      const double max_align_v = 0.25;
+      const double max_align_w = 0.60;
+      geometry_msgs::Twist raw_cmd;
+      raw_cmd.linear.x = std::max(-max_align_v, std::min(max_align_v, dx_b * linear_gain_));
+      raw_cmd.linear.y = enable_lateral_motion_ ? std::max(-max_align_v, std::min(max_align_v, dy_b * lateral_gain_)) : 0.0;
+      raw_cmd.linear.z = 0.0;
+      if (align_final_yaw_)
+      {
+        raw_cmd.angular.z = std::max(-max_align_w, std::min(max_align_w, final_yaw_error * final_yaw_gain_));
+      }
+      else if (cur_dist_xy > 0.05)
+      {
+        double angle_to_target = std::atan2(dy_b, dx_b);
+        raw_cmd.angular.z = std::max(-max_align_w, std::min(max_align_w, angle_to_target * heading_gain_));
+      }
+      cmd_vel = velocity_smoother_.smooth(raw_cmd, dt);
+      last_cmd_vel_ = cmd_vel;
+      return true;
+    }
   }
 
   // 9. 纯 2D 沿曲线单调前瞻与微分几何速度前馈 (消灭发夹弯掉头区航向 180 度跳变)
@@ -836,18 +917,34 @@ bool AStarLocalPlanner::computeVelocityCommandsImpl(geometry_msgs::Twist& cmd_ve
                                                   : std::atan2(p_lookahead.y() - robot_pose.y, p_lookahead.x() - robot_pose.x);
   double heading_error = angles::shortest_angular_distance(robot_pose.yaw, target_yaw);
 
-  // 9.1 连续平滑余弦调速与保底蠕动 (保证转弯前进不卡死，彻底消灭震荡看门狗停机)
+  // 9.0 航向门控 (SCAN-Planner 式防绕圈): 航向偏差过大 (>35°) 时原地旋转对准，抑制前进线速度
+  const double max_w = velocity_smoother_.getParams().max_angular_speed;
+  if (std::abs(heading_error) > 0.60)
+  {
+    geometry_msgs::Twist turn_cmd;
+    turn_cmd.linear.x = 0.0;
+    turn_cmd.linear.y = 0.0;
+    turn_cmd.linear.z = 0.0;
+    turn_cmd.angular.z = std::max(-max_w, std::min(max_w, heading_error * heading_gain_));
+    cmd_vel = velocity_smoother_.smooth(turn_cmd, dt);
+    last_cmd_vel_ = cmd_vel;
+    return true;
+  }
+
+  // 9.1 连续平滑余弦调速与近终点平滑减速 (进站动量自然衰减)
   double kappa = bspline_traj_.evaluateCurvature(t_lookahead);
   double curve_speed_limit = cruise_speed;
   if (kappa > 0.15)
   {
     curve_speed_limit = std::min(cruise_speed, std::sqrt(max_lateral_acc_ / kappa));
   }
-  double goal_scale = (remaining_dist_3d < 0.60) ? std::max(0.30, remaining_dist_3d / 0.60) : 1.0;
-  // 保底保留 0.20 系数保证转弯时持续前行出弯
+  double goal_scale = (remaining_dist_3d < 0.60) ? std::max(0.15, remaining_dist_3d / 0.60) : 1.0;
   double heading_scale = std::max(0.20, std::cos(heading_error));
   double forward_speed = std::min(cruise_speed, curve_speed_limit) * goal_scale * heading_scale;
-  forward_speed = std::max(0.12, forward_speed); // 保底 0.12m/s，永不挂零锁死
+
+  // 近终点保底速度平滑淡出 (剩余距离 < 0.50m 时保底由 0.12m/s 衰减到 0.0m/s，消除冲出动量)
+  double min_floor = (remaining_dist_3d < 0.50) ? (0.12 * std::max(0.0, (remaining_dist_3d - 0.20) / 0.30)) : 0.12;
+  forward_speed = std::max(min_floor, forward_speed);
 
   // 9.2 构造下发指令 (B 样条曲率前馈 + 比例航向跟踪 + 四足横向全向辅助)
   double omega_ff = bspline_traj_.evaluateAngularVelocity(t_lookahead);

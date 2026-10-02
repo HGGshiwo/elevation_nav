@@ -76,7 +76,8 @@ void CrashHandler::writeCallstack(int fd, int sig, const char *extra_msg) {
         if (!str) return;
         size_t len = 0;
         while (str[len] != '\0') ++len;
-        (void)write(fd, str, len);
+        ssize_t ret = write(fd, str, len);
+        (void)ret;
     };
 
     safe_write("\n=======================================================\n");

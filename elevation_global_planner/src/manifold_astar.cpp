@@ -23,11 +23,6 @@ bool ManifoldAStarPlanner::initialize(const elevation_planner::ManifoldGraph & g
   return is_initialized_;
 }
 
-void ManifoldAStarPlanner::setPortalManager(const elevation_planner::LayerPortalManager & portal_mgr)
-{
-  portal_mgr_ = portal_mgr;
-}
-
 float ManifoldAStarPlanner::computeHeuristic(uint32_t a_id, uint32_t b_id) const
 {
   const auto & a = graph_->getNode(a_id);

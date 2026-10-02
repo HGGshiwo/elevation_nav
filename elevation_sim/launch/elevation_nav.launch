@@ -10,7 +10,7 @@
     <node pkg="elevation_sim" type="pcd_to_grid_map_node" name="pcd_to_grid_map" output="screen">
         <param name="pcd_file" value="$(arg pcd_file)"/>
         <param name="config_file" value="$(arg config_file)"/>
-        <param name="map_config_file" value="$(arg map_config_file)"/>
+        <rosparam file="$(arg map_config_file)" command="load" if="$(eval arg('map_config_file') != '')"/>
         <param name="pcd_file_cmd_topic" value="/pcd_file_cmd"/>
         <param name="grid_map_topic" value="/grid_map"/>
         <param name="frame_id" value="map"/>

@@ -2,6 +2,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl/search/kdtree.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <sstream>
@@ -123,6 +125,36 @@ bool CloudGraphBuilder::buildColumnTable(const pcl::PointCloud<pcl::PointXYZ>::C
 
   if (filtered_cloud->empty()) return false;
 
+  // 1.6 欧氏聚类小簇过滤 (Euclidean Cluster Filtering):
+  //     过滤空中漂浮的离散小点团/噪点碎片 (点数少于 cluster_min_size 的小簇直接剔除)
+  if (config_.cluster_filter_enable && config_.cluster_min_size > 0 &&
+      filtered_cloud->size() > static_cast<size_t>(config_.cluster_min_size)) {
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(filtered_cloud);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(config_.cluster_tolerance > 0.0 ? config_.cluster_tolerance : 0.15);
+    ec.setMinClusterSize(config_.cluster_min_size);
+    ec.setMaxClusterSize(config_.cluster_max_size > 0 ? config_.cluster_max_size : 1000000);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(filtered_cloud);
+    ec.extract(cluster_indices);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr clustered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    for (const auto & indices : cluster_indices) {
+      for (int idx : indices.indices) {
+        clustered_cloud->points.push_back(filtered_cloud->points[idx]);
+      }
+    }
+    clustered_cloud->width = clustered_cloud->points.size();
+    clustered_cloud->height = 1;
+    clustered_cloud->is_dense = true;
+    filtered_cloud = clustered_cloud;
+  }
+
+  if (filtered_cloud->empty()) return false;
+
   // 2. 栅格几何: 对齐模式直接沿用全局图几何 (格对齐融合的前提), 否则按点云包围盒自算
   double res = config_.resolution;
   double min_x = 0.0, min_y = 0.0;
@@ -197,68 +229,6 @@ bool CloudGraphBuilder::buildColumnTable(const pcl::PointCloud<pcl::PointXYZ>::C
     }
   }
   return true;
-}
-
-ColumnTable fuseColumnTables(const ColumnTable & prior,
-                             const ColumnTable & observed,
-                             double same_surface_tol,
-                             int boundary_ring)
-{
-  // 先验缺失或分辨率不一致 (无法逐格对齐) 时, 退化为纯观测
-  if (prior.empty() || observed.empty()) return observed;
-  if (std::abs(prior.extent.resolution - observed.extent.resolution) > 1e-9) return observed;
-
-  const GridExtent & oe = observed.extent;
-  const GridExtent & pe = prior.extent;
-
-  ColumnTable fused = observed; // extent 沿用观测表, 逐格覆写融合结果
-
-  for (int r = 0; r < oe.rows; ++r) {
-    for (int c = 0; c < oe.cols; ++c) {
-      // 窗口最外 boundary_ring 圈强制先验, 保证出窗处与全局图衔接
-      const bool boundary = (r < boundary_ring || r >= oe.rows - boundary_ring ||
-                             c < boundary_ring || c >= oe.cols - boundary_ring);
-
-      // 观测格中心世界坐标 -> 先验表格索引
-      const double wx = oe.min_x + (r + 0.5) * oe.resolution;
-      const double wy = oe.min_y + (c + 0.5) * oe.resolution;
-      int pr = static_cast<int>(std::floor((wx - pe.min_x) / pe.resolution));
-      int pc = static_cast<int>(std::floor((wy - pe.min_y) / pe.resolution));
-      const bool has_prior = pr >= 0 && pr < pe.rows && pc >= 0 && pc < pe.cols &&
-                             !prior.cells[static_cast<size_t>(pr * pe.cols + pc)].empty();
-      if (!has_prior) continue; // 无先验: 保留观测原样
-
-      const auto & pri = prior.cells[static_cast<size_t>(pr * pe.cols + pc)];
-      if (boundary) {
-        fused.cells[static_cast<size_t>(r * oe.cols + c)] = pri;
-        continue;
-      }
-
-      // 双指针并集合并 (两列表均按 z 升序)
-      const auto & obs = observed.cells[static_cast<size_t>(r * oe.cols + c)];
-      std::vector<ColumnSurface> merged;
-      merged.reserve(obs.size() + pri.size());
-      size_t i = 0, j = 0;
-      while (i < obs.size() || j < pri.size()) {
-        if (j >= pri.size()) { merged.push_back(obs[i++]); continue; }
-        if (i >= obs.size()) { merged.push_back(pri[j++]); continue; }
-        const ColumnSurface & a = obs[i];
-        const ColumnSurface & b = pri[j];
-        if (std::abs(static_cast<double>(a.z_top) - static_cast<double>(b.z_top)) <= same_surface_tol) {
-          ColumnSurface m = a; // 同一物理面: 几何取观测 (反映当前状态)
-          m.count = std::max(a.count, b.count); // 一次稀疏观测不推翻先验支撑面
-          merged.push_back(m);
-          ++i; ++j;
-        } else if (b.z_top < a.z_top) {
-          merged.push_back(b); ++j; // 仅先验: 保留 (雷达扫不到的脚下支撑面)
-        } else {
-          merged.push_back(a); ++i; // 仅观测: 新增 (新踏面/新障碍)
-        }
-      }
-      fused.cells[static_cast<size_t>(r * oe.cols + c)] = std::move(merged);
-    }
-  }
-  return fused;
 }
 
 std::vector<ColumnSurface> CloudGraphBuilder::mergeColumnSurfaces(

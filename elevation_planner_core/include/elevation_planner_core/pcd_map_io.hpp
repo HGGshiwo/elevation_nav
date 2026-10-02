@@ -1,13 +1,14 @@
 #pragma once
 
 #include <string>
+#include <ros/ros.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
 namespace elevation_planner
 {
 
-/// CropBox 三维裁剪配置 (map 专属配置 yaml 的 crop_box 段)
+/// CropBox 三维裁剪配置
 struct CropBoxConfig
 {
   bool enable{false};
@@ -19,24 +20,32 @@ struct CropBoxConfig
   float max_z{100.0f};
 };
 
-/// 解析 yaml 中的 crop_box 段; 文件缺失或无该段时返回默认(关闭)配置
-CropBoxConfig parseCropBoxConfig(const std::string & yaml_file);
+/// 欧氏聚类过滤配置
+struct ClusterFilterConfig
+{
+  bool enable{false};
+  float tolerance{0.15f};
+  int min_size{30};
+  int max_size{1000000};
+};
+
+/// 从 ROS NodeHandle 读取 crop_box 参数 (默认前缀 "crop_box")
+CropBoxConfig loadCropBoxConfig(const ros::NodeHandle & nh, const std::string & prefix = "crop_box");
+
+/// 从 ROS NodeHandle 读取 欧氏聚类过滤 参数 (默认前缀 "")
+ClusterFilterConfig loadClusterFilterConfig(const ros::NodeHandle & nh, const std::string & prefix = "");
 
 /**
- * @brief 统一的先验点云加载管线前缀: 读 PCD 文件 → 按 map 配置做 CropBox 三维裁剪
- *
- * 全局规划器 (先验流形图) 与 Web 展示节点 (grid_map) 共用此入口,
- * 保证两边的裁剪口径与日志一致。裁剪边界针对单张地图手工配置在
- * map_crop_config.yaml 中, 切图时通过 /pcd_file_cmd 的 "路径;配置" 语法切换。
+ * @brief 统一的先验点云加载管线: 读 PCD 文件 → 按 CropBoxConfig 做三维裁剪 → 欧氏聚类剔除小簇噪点
  *
  * @param pcd_path PCD 文件路径
- * @param map_config_yaml map 专属配置文件 (crop_box 段), 允许为空串
- * @param out_crop 非空时回传解析出的裁剪配置
- * @return 裁剪后点云; 读取失败或裁剪后为空返回空指针
+ * @param crop 裁剪配置 (默认不裁剪)
+ * @param cluster 聚类过滤配置 (默认不聚类)
+ * @return 过滤后点云; 读取失败或处理后为空返回空指针
  */
 pcl::PointCloud<pcl::PointXYZ>::Ptr loadAndCropPcd(
   const std::string & pcd_path,
-  const std::string & map_config_yaml,
-  CropBoxConfig * out_crop = nullptr);
+  const CropBoxConfig & crop = CropBoxConfig{},
+  const ClusterFilterConfig & cluster = ClusterFilterConfig{});
 
 } // namespace elevation_planner

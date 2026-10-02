@@ -31,8 +31,8 @@
         <!-- 全局插件配置: 离线 PCD 先验建图 (建图产物写入同进程 GraphStore 供局部图层零拷贝访问) -->
         <param name="ElevationGlobalPlanner/map_frame" value="$(arg map_frame)"/>
         <param name="ElevationGlobalPlanner/pcd_file"  value="$(arg pcd_file)"/>
-        <param name="ElevationGlobalPlanner/map_config_file" value="$(arg map_config_file)"/>
         <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load" ns="ElevationGlobalPlanner"/>
+        <rosparam file="$(arg map_config_file)" command="load" ns="ElevationGlobalPlanner" if="$(eval arg('map_config_file') != '')"/>
 
         <!-- 局部插件配置: AStarLocalPlanner 专用参数 -->
         <rosparam file="$(find elevation_sim)/config/move_base/astar_local_planner_params.yaml" command="load" ns="AStarLocalPlanner"/>

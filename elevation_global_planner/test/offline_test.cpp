@@ -48,20 +48,6 @@ Diag analyzeComponents(const elevation_planner::ManifoldGraph & graph)
   return d;
 }
 
-void printZHistogram(const elevation_planner::ManifoldGraph & graph,
-                     const std::vector<uint32_t> & ids, const char * tag)
-{
-  std::map<int, size_t> buckets;
-  for (uint32_t id : ids) {
-    const auto & nd = graph.getNode(id);
-    if (nd.traversability >= 0.95f) continue;
-    buckets[static_cast<int>(std::floor(nd.z / 0.5))]++;
-  }
-  printf("  %s free-node z histogram (0.5m buckets):\n", tag);
-  for (const auto & kv : buckets)
-    printf("    z [%+5.1f, %+5.1f): %zu\n", kv.first * 0.5, kv.first * 0.5 + 0.5, kv.second);
-}
-
 // 路径点同层(±0.12m)硬阻挡节点的最近水平距离 —— 近似 "离墙距离"
 double minWallDist(const elevation_planner::ManifoldGraph & graph, const nav_msgs::Path & path)
 {
@@ -184,7 +170,6 @@ int main(int argc, char ** argv)
     elevation_planner::CloudGraphBuilder builder;
     elevation_planner::ManifoldGraph graph;
     if (!builder.buildFromPointCloud(cloud, graph)) { printf("ERROR: graph build failed\n"); return 1; }
-    elevation_planner::GraphBuildConfig cfg = builder.getConfig();
     printf("dump nodes within 0.5m of (%.2f, %.2f, %.2f)\n", qx, qy, qz);
     printf("flags: H=headroom-blocked(0x10) L=lateral-blocked(0x20)\n");
     for (size_t i = 0; i < graph.numNodes(); ++i) {

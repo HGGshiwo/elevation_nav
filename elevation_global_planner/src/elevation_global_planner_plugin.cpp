@@ -10,14 +10,12 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <yaml-cpp/yaml.h>
 #include <string>
 #include <cmath>
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include "elevation_planner_core/graph_store.hpp"
 #include "elevation_planner_core/pcd_map_io.hpp"
-#include "elevation_planner_core/topological_corridor.hpp"
 #include "elevation_planner_core/DiagnoseQuery.h"
 #include "elevation_global_planner/manifold_astar.hpp"
 #include "elevation_global_planner/path_smoother.hpp"
@@ -47,7 +45,7 @@ public:
 
     ros::NodeHandle private_nh("~/" + name);
     private_nh.param<std::string>("map_frame", map_frame_, "map");
-    private_nh.param<std::string>("map_config_file", map_config_file_, "");
+    crop_box_cfg_ = elevation_planner::loadCropBoxConfig(private_nh);
 
     elevation_planner::GraphBuildConfig cfg;
     private_nh.param<double>("resolution", cfg.resolution, 0.10);
@@ -61,11 +59,12 @@ public:
     private_nh.param<bool>("body_hard_ring_enabled", cfg.body_hard_ring_enabled, true);
     private_nh.param<int>("sor_mean_k", cfg.sor_mean_k, 16);
     private_nh.param<double>("sor_std_mul", cfg.sor_std_mul, 1.5);
+    private_nh.param<bool>("cluster_filter_enable", cfg.cluster_filter_enable, true);
+    private_nh.param<double>("cluster_tolerance", cfg.cluster_tolerance, 0.15);
+    private_nh.param<int>("cluster_min_size", cfg.cluster_min_size, 30);
     private_nh.param<double>("cluster_height_diff", cfg.cluster_height_diff, 0.08);
     private_nh.param<int>("min_cluster_points", cfg.min_cluster_points, 2);
 
-    private_nh.param<double>("corridor_radius", corridor_radius_, 3.0);
-    private_nh.param<double>("corridor_lookahead", corridor_lookahead_, 5.0);
     max_step_height_ = cfg.max_step_height;
     dog_height_ = cfg.dog_height;
 
@@ -98,8 +97,6 @@ public:
     ros::NodeHandle nh;
     path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan", 1, true);
     dense_path_pub_ = nh.advertise<nav_msgs::Path>("/elevation_global_plan_dense", 1, true);
-    corridor_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_corridor_nodes", 1, true);
-    corridor_boundary_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/elevation_global_corridor_boundaries", 1, true);
     nodes_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/elevation_graph_nodes", 1, true);
     edges_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/elevation_graph_edges", 1, true);
     debug_result_pub_ = nh.advertise<std_msgs::String>("/elevation_debug_result", 5, true);
@@ -111,12 +108,11 @@ public:
     std::string pcd_file;
     private_nh.param<std::string>("pcd_file", pcd_file, "");
     if (!pcd_file.empty()) {
-      loadMap(pcd_file, map_config_file_);
+      loadMap(pcd_file);
     }
 
     initialized_ = true;
-    ROS_INFO("[ElevationGlobalPlanner] Manifold global planner plugin is ready (corridor_radius=%.2fm, corridor_lookahead=%.2fm)",
-             corridor_radius_, corridor_lookahead_);
+    ROS_INFO("[ElevationGlobalPlanner] Manifold global planner plugin is ready");
   }
 
   bool makePlan(const geometry_msgs::PoseStamped & start,
@@ -227,15 +223,6 @@ public:
       plan[i].pose.orientation.w = std::cos(yaw * 0.5);
     }
 
-    // 扩展 A* 规划结果为局部前瞻拓扑流形管道 (供 TEB 局部规划器在管道内部避障与同伦优化)
-    auto corridor = std::make_shared<elevation_planner::TopologicalCorridor>(
-        elevation_planner::TopologicalCorridorGenerator::generate(
-            plan_graph, plan, corridor_radius_, corridor_lookahead_, max_step_height_, dog_height_));
-    elevation_planner::GraphStore::instance().setTopologicalCorridor(corridor);
-    ROS_INFO("[ElevationGlobalPlanner] Initial topological corridor generated: %zu nodes within radius %.2fm, lookahead %.2fm",
-             corridor->size(), corridor_radius_, corridor_lookahead_);
-    publishCorridorVisuals(*corridor);
-
     // latched 兼容发布: Web 端与旧消费者订阅 /elevation_global_plan
     smoothed_path.header.stamp = ros::Time::now();
     path_pub_.publish(smoothed_path);
@@ -254,30 +241,12 @@ public:
   }
 
 private:
-  void loadMap(const std::string & path, const std::string & override_map_config = "")
+  void loadMap(const std::string & path)
   {
-    std::string active_map_config = override_map_config.empty() ? map_config_file_ : override_map_config;
-
-    auto cloud = elevation_planner::loadAndCropPcd(path, active_map_config);
+    auto cloud = elevation_planner::loadAndCropPcd(path, crop_box_cfg_);
     if (!cloud) {
       ROS_ERROR("[ElevationGlobalPlanner] Failed to load PCD file: %s", path.c_str());
       return;
-    }
-
-    // 覆盖流形拓扑图构建参数 (抗空洞: min_cluster_points, sor_mean_k)
-    if (!active_map_config.empty()) {
-      try {
-        YAML::Node root = YAML::LoadFile(active_map_config);
-        if (root["manifold_graph"]) {
-          auto mg = root["manifold_graph"];
-          auto cfg = builder_.getConfig();
-          if (mg["sor_mean_k"]) cfg.sor_mean_k = mg["sor_mean_k"].as<int>();
-          if (mg["min_cluster_points"]) cfg.min_cluster_points = mg["min_cluster_points"].as<int>();
-          builder_.setConfig(cfg);
-          ROS_INFO("[ElevationGlobalPlanner] Overrode manifold_graph params: sor_mean_k=%d, min_cluster_points=%d",
-                   cfg.sor_mean_k, cfg.min_cluster_points);
-        }
-      } catch (...) {}
     }
 
     ROS_INFO("[ElevationGlobalPlanner] Building manifold graph from %zu points...", cloud->size());
@@ -323,15 +292,12 @@ private:
   {
     if (msg && !msg->data.empty()) {
       std::string pcd_path = msg->data;
-      std::string custom_config = "";
       size_t sep = pcd_path.find(';');
       if (sep != std::string::npos) {
-        custom_config = pcd_path.substr(sep + 1);
         pcd_path = pcd_path.substr(0, sep);
       }
-      ROS_INFO("[ElevationGlobalPlanner] Received PCD switch command: %s (map_config: %s)",
-               pcd_path.c_str(), custom_config.empty() ? "(default)" : custom_config.c_str());
-      loadMap(pcd_path, custom_config);
+      ROS_INFO("[ElevationGlobalPlanner] Received PCD switch command: %s", pcd_path.c_str());
+      loadMap(pcd_path);
     }
   }
 
@@ -382,21 +348,6 @@ private:
     std_msgs::String out_msg;
     out_msg.data = res.result;
     debug_result_pub_.publish(out_msg);
-  }
-
-  void publishCorridorVisuals(const elevation_planner::TopologicalCorridor & corridor)
-  {
-    if (corridor.empty() || !has_map_) return;
-
-    sensor_msgs::PointCloud2 cloud_msg;
-    elevation_planner::TopologicalCorridorGenerator::toPointCloudMsg(
-        graph_, corridor, map_frame_, cloud_msg);
-    corridor_pub_.publish(cloud_msg);
-
-    visualization_msgs::MarkerArray marker_msg;
-    elevation_planner::TopologicalCorridorGenerator::toBoundaryMarkers(
-        graph_, corridor, map_frame_, marker_msg, dog_height_, max_step_height_);
-    corridor_boundary_pub_.publish(marker_msg);
   }
 
   double computeDominantSide(const nav_msgs::Path & path,
@@ -518,11 +469,9 @@ private:
   }
 
   std::string map_frame_;
-  std::string map_config_file_;
+  elevation_planner::CropBoxConfig crop_box_cfg_;
   bool initialized_{false};
   bool has_map_{false};
-  double corridor_radius_{3.0};
-  double corridor_lookahead_{5.0};
   double max_step_height_{0.25};
   double dog_height_{0.45};
 
@@ -540,8 +489,6 @@ private:
 
   ros::Publisher path_pub_;
   ros::Publisher dense_path_pub_;
-  ros::Publisher corridor_pub_;
-  ros::Publisher corridor_boundary_pub_;
   ros::Publisher nodes_pub_;
   ros::Publisher edges_pub_;
   ros::Publisher debug_result_pub_;

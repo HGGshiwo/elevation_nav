@@ -18,8 +18,6 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(PCL REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(YAML_CPP REQUIRED yaml-cpp)
 
 catkin_python_setup()
 
@@ -34,7 +32,6 @@ include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
-  ${YAML_CPP_INCLUDE_DIRS}
 )
 
 add_library(elevation_sim_lib
@@ -52,7 +49,6 @@ target_link_libraries(pcd_to_grid_map_node
   elevation_sim_lib
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
-  ${YAML_CPP_LIBRARIES}
 )
 
 catkin_install_python(PROGRAMS

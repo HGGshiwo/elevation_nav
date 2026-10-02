@@ -2,8 +2,6 @@
 
 #include "elevation_planner_core/cloud_graph_builder.hpp"
 #include "elevation_planner_core/manifold_graph.hpp"
-#include "elevation_planner_core/local_elevation_grid.hpp"
-#include "elevation_planner_core/topological_corridor.hpp"
 
 #include <memory>
 #include <mutex>
@@ -60,30 +58,6 @@ public:
     return global_graph_;
   }
 
-  void setLocalElevationGrid(std::shared_ptr<const LocalElevationGrid> grid)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    local_elevation_grid_ = std::move(grid);
-  }
-
-  std::shared_ptr<const LocalElevationGrid> getLocalElevationGrid() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return local_elevation_grid_;
-  }
-
-  void setTopologicalCorridor(std::shared_ptr<const TopologicalCorridor> corridor)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    topological_corridor_ = std::move(corridor);
-  }
-
-  std::shared_ptr<const TopologicalCorridor> getTopologicalCorridor() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return topological_corridor_;
-  }
-
 private:
   GraphStore() = default;
   GraphStore(const GraphStore &) = delete;
@@ -92,8 +66,6 @@ private:
   mutable std::mutex mutex_;
   std::shared_ptr<const ColumnTable> global_table_;
   std::shared_ptr<ManifoldGraph> global_graph_;
-  std::shared_ptr<const LocalElevationGrid> local_elevation_grid_;
-  std::shared_ptr<const TopologicalCorridor> topological_corridor_;
 };
 
 } // namespace elevation_planner
