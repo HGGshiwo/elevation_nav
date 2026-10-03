@@ -1,0 +1,21 @@
+# Configuration for map-specific point cloud filtering
+crop_box:
+  enable: false
+  # min_x: -15.0
+  # max_x: -5.0
+  # min_y: -17.0
+  # max_y: -12.0
+  # min_z: -3.0
+  # max_z: 3.5  
+
+# 离群滤波配置
+sor_mean_k: 24                    # 增大统计近邻点数 (增强对离散浮点的识别)
+sor_std_mul: 1.0                  # 严格过滤空气中的悬浮离散噪点
+min_cluster_points: 2             # 踏面聚类至少 2 个点
+min_obstacle_points: 8            # 碰撞引擎阻挡门槛 (过滤空中散乱噪点误触发锁死)
+
+# 欧氏聚类小簇过滤 (Euclidean Cluster Filtering) - 筛除空中悬浮的离散小点团/碎片
+cluster_filter_enable: false        # 是否启用欧氏聚类过滤
+cluster_tolerance: 0.05            # 聚类邻域距离容差 (m)
+cluster_min_size: 100               # 最小有效结构点数 (小于此点数的小团块碎片直接剔除)
+cluster_max_size: 100000000          # 最大聚类点数

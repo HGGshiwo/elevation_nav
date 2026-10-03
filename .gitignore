@@ -1,2 +1,5 @@
 *.pyc
 __pycache__
+elevation_sim/web/static/three.module.js
+elevation_sim/web/static/OrbitControls.js
+elevation_sim/web/static/generated_maps/

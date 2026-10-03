@@ -96,10 +96,6 @@ function getVoxelColor(layerName, z, minZ, maxZ) {
         const s = 0.85;
         const l = 0.4 + ratio * 0.3;
         color.setHSL(h, s, l);
-    } else if (layerName === 'emergency_stop_free') {
-        color.setHex(0x00ff44);
-    } else if (layerName === 'emergency_stop_occupied') {
-        color.setHex(0xff0033);
     } else { // traversable (green gradient)
         const h = (100 + ratio * 40) / 360;
         const s = 0.8;

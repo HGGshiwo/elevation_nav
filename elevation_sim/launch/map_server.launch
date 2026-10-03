@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 独立 3D 流形地图服务与 Web 交互/分层导出套件 (无需启动 move_base 或机器人底盘) -->
+    <arg name="pcd_file" default="/home/hggshiwo/catkin_ws/src/pcd/map.pcd"/>
+    <arg name="map_config_file" default="$(find elevation_sim)/config/map_crop_config.yaml"/>
+    <arg name="resolution" default="0.10"/>
+    <arg name="web_port" default="8080"/>
+
+    <!-- 1. 3D 流形地图服务节点 (解析 PCD，发布 /elevation_graph_nodes 与 /elevation_graph_edges) -->
+    <node pkg="elevation_sim" type="manifold_map_server_node" name="manifold_map_server" output="screen">
+        <param name="pcd_file" value="$(arg pcd_file)"/>
+        <rosparam file="$(find elevation_sim)/config/planner_common.yaml" command="load"/>
+        <rosparam file="$(arg map_config_file)" command="load" if="$(eval arg('map_config_file') != '')"/>
+        <param name="frame_id" value="map"/>
+        <param name="resolution" value="$(arg resolution)"/>
+    </node>
+
+    <!-- 2. Web 服务端与三维可视化 (FastAPI + Three.js) -->
+    <node pkg="elevation_sim" type="elevation_server.py" name="elevation_web_server" output="screen">
+        <param name="web_port" value="$(arg web_port)"/>
+        <param name="publish_fake_tf" value="false"/>
+        <param name="tf_child_frame" value="base_link"/>
+    </node>
+
+    <!-- 3. 3D 流形拓扑踏面转 2D 分层地图生成器 (提供拓扑 Dijkstra/K-medoids 切层与 ROS YAML/ZIP 导出) -->
+    <node pkg="elevation_sim" type="floor_map_generator.py" name="floor_map_generator" output="screen">
+        <param name="resolution" value="$(arg resolution)"/>
+        <param name="output_dir" value="$(find elevation_sim)/web/static/generated_maps"/>
+    </node>
+</launch>

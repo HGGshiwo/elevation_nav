@@ -933,5 +933,67 @@ trav=0.9 可通行，SC-LOS 剪枝的支撑匹配又不感知软代价数值，�
 
 ---
 
+## ⚠️ 十八、2026-10-03 更新：3D 流形拓扑 2D 分层地图自动生成、独立 Map Server 解耦、前端极简重构与 Git 瘦身
 
+### 1. 3D 流形拓扑 2D 分层地图自动生成系统 (`floor_map_generator.py`, `floor_map_visualizer.js`)
 
+针对传统 2D/2.5D 栅格地图无法表达立体建筑多层重叠、以及多层空间难以直接供上位机 2D 监控与路径导引的问题，系统新增了从 3D 流形拓扑图（`ManifoldGraph`）自动切层与生成标准 2D 多层栅格地图的全套算法与工具链：
+
+```mermaid
+flowchart TD
+    A["3D 流形图节点 (GraphNodes) & 拓扑边 (Edges)"] --> B["拓扑距离场构建 (多源 Dijkstra)"]
+    B --> C["K-medoids / 拓扑连通切层 (Topological Partitioning)"]
+    C --> D["0 垂直自重叠校验与局部连通归属调整"]
+    D --> E["生成独立楼层 2D 栅格 (OccupancyGrid) 与 Turbo 高程着色"]
+    E --> F["构建 2D 像素 (u, v) 到 3D 节点 (x, y, z, nid) 1-to-1 反查索引"]
+    F --> G["Web 2D 分层地图交互查看 & ROS 标准 YAML/PNG ZIP 打包导出"]
+```
+
+- **拓扑连通分层算法（Topological Dijkstra + K-medoids Partitioning）**：
+  - 基于真实 3D 拓扑图连接关系，避免单纯基于几何 $Z$ 坐标切割导致的坡道/楼梯断裂；
+  - 自动依据空间高程分布确定楼层数 $K$，采用拓扑测地距离进行 K-medoids 聚类；
+  - **0 垂直自重叠保证（Zero Self-Overlap）**：严格约束同一水平坐标 $(x, y)$ 在同一张分层 2D 地图内至多出现一个踏面节点，若有重叠则按拓扑近邻平滑划分至相邻独立楼层。
+- **1-to-1 2D-3D 像素精准反查**：
+  - 生成 `node_lookup_table`，记录 2D 图像每个有效像素对应的 3D 图节点 ID 及高程 $(x, y, z)$；
+  - Web 端点击 2D 分层地图上任意位置，3D 相机平滑飞跃对焦至对应的 3D 空间三维踏面点，实现 2D 俯视与 3D 场景的所见即所得联动。
+- **标准化 ROS 地图导出与 Turbo 科学着色**：
+  - 每层地图独立生成标准 ROS `map_server` 格式（`.yaml` 元数据 + `.png` 灰度栅格），可直接被下游 2D ROS 节点消费；
+  - 配套生成 Turbo 伪彩色高程图与高程图例，并支持在 Web 端一键下载包含全楼层地图与元数据的 ZIP 压缩包。
+
+### 2. 独立流形地图服务器解耦 (`manifold_map_server_node.cpp`, `map_server.launch`)
+
+- **彻底解耦 `move_base` 与 ETH `grid_map`**：
+  - 废除原有的 `grid_map` 依赖及旧版 `pcd_to_grid_map_node`；
+  - 新增独立的 C++ 地图服务节点 `manifold_map_server_node`，单节点负责点云加载、`CropBox` 空间裁剪、SOR/欧氏聚类滤波、`ManifoldGraph` 拓扑构建与 Latched 话题发布（`/elevation_graph_nodes`, `/elevation_graph_edges`）；
+  - 支持通过 `/pcd_file_cmd` 话题在运行时动态热重载新地图。
+- **轻量独立看图模式**：
+  - 提供全新轻量 Launch 文件：`roslaunch elevation_sim map_server.launch`；
+  - 仅加载 `manifold_map_server` + `elevation_web_server` + `floor_map_generator`，在无需启动物理仿真器、控制器或 `move_base` 的情况下，实现毫秒级快速预览点云拓扑图并导出 2D 分层地图。
+
+### 3. C++ 核心诊断与参数读取完善
+
+- **全流程英文规范化诊断日志 (`cloud_graph_builder.cpp`)**：
+  - 统一并规范了 Step 1 (VoxelGrid)、Step 1.5 (SOR 离群滤波)、Step 1.6 (Euclidean Clustering 聚类滤波)、Step 2 (Column Surfaces 踏面提取)、Step 3 (Graph Nodes & Edges 建图建边) 的耗时与过滤统计诊断日志，符合纯英文日志规范。
+- **补齐 `cluster_max_size` 读取 (`elevation_global_planner_plugin.cpp`)**：
+  - 修复全局规划器插件在加载点云欧氏聚类配置时遗漏读取 `cluster_max_size` 参数的问题。
+
+### 4. Web 前端 UI 极简重构与可拖拽交互体系
+
+- **废弃死代码清理**：
+  - 彻底移除了 3D 体素画笔/橡皮擦、文件管理面板、实时同步 ROS、本地保存、紧急制动探针、动态代价层等过时冗余逻辑与 DOM 元素；
+  - 移除了未被引用的废弃模块 `map_storage.js` 及 `layer.js` 中的冗余材质分支。
+- **标准化视觉与去 Emoji 化**：
+  - 统一控制面板、调试面板、2D 分层地图面板等标题与按钮样式，去除所有 Emoji 图标，回归工业级紧凑视觉体验。
+- **全局视口约束拖拽组件 (`draggable.js`)**：
+  - 封装轻量通用拖拽模块，为 `#floor-map-modal`、`#ui-panel`、`#debug-panel`、`#sfc-debug-panel` 等所有浮动面板赋予自由拖拽与视口边缘安全吸附能力。
+
+### 5. Git 历史瘦身与 CMake 第三方依赖自动管理
+
+- **Git 历史提交清洗 (`git-filter-repo`)**：
+  - 使用 `git-filter-repo` 从全量 Git 提交历史中彻底清除了 `three.module.js` 和 `OrbitControls.js` 等大体积第三方 Vendor 脚本（减重 ~1.3MB 历史冗余提交）。
+- **CMakeLists.txt 构建期自动下载**：
+  - 在 `elevation_sim/CMakeLists.txt` 中配置 `file(DOWNLOAD ...)` 规则，在 `catkin build` 时若本地不存在则自动从 CDN 获取对应版本的 Three.js 依赖，兼顾仓库轻量化与开箱即用体验。
+- **完善 `.gitignore`**：
+  - 将第三方 JS 库及动态生成的 2D 分层地图临时目录（`generated_maps/`）纳入全局忽略规则。
+
+---
