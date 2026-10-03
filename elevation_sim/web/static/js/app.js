@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { initScene } from '../scene.js';
 import { LayerManager } from '../layer.js';
 import { GraphVisualizer } from './graph_visualizer.js';
+import { CorridorVisualizer } from './corridor_visualizer.js';
 import { SfcDebugVisualizer } from './sfc_debug_visualizer.js';
 import { InjectedObstacleVisualizer } from './obstacle_visualizer.js';
 import { DynamicNodeVisualizer } from './dynamic_nodes_visualizer.js';
@@ -41,6 +42,9 @@ const reboundVisualizer = new ReboundVisualizer(scene);
 
 // 3D 流形拓扑图渲染器 (点云直通踏面与连通网格)
 const graphVisualizer = new GraphVisualizer(scene, camera, controls);
+
+// 3D 拓扑管道渲染器 (SFC 凸走廊边界线框, 默认显示)
+const corridorVisualizer = new CorridorVisualizer(scene);
 
 // 3D 可通行走廊诊断与单步扩散调试渲染器
 const sfcDebugVisualizer = new SfcDebugVisualizer(scene, camera, controls);
@@ -296,12 +300,13 @@ document.getElementById('btn-sfc-copy-all')?.addEventListener('click', () => {
     }
 });
 
-// 3.4 WebSocket 全双工流式同步模块 (支持流形图、注入障碍、点云直通与 SFC 走廊诊断)
+// 3.4 WebSocket 全双工流式同步模块 (支持流形图、注入障碍、拓扑管道、点云直通与 SFC 走廊诊断)
 const wsStream = initWsStream(
     layers,
     robotTracker,
     getActiveRequestedLayers,
     graphVisualizer,
+    corridorVisualizer,
     sfcDebugVisualizer,
     (corridors) => updateSfcDebugPanel(corridors),
     obstacleVisualizer,
@@ -310,6 +315,11 @@ const wsStream = initWsStream(
 );
 
 // ---- 4. 图层显隐开关与 WebSocket 订阅联动 ----
+// 4.0.0 拓扑管道(走廊边界线框)显隐
+document.getElementById('show-corridor')?.addEventListener('change', (e) => {
+    corridorVisualizer.setVisible(e.target.checked);
+});
+
 // 4.0.1 调试可通行走廊显隐与侧边栏控制
 document.getElementById('show-sfc-debug')?.addEventListener('change', (e) => {
     const isChecked = e.target.checked;

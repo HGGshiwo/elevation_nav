@@ -260,6 +260,7 @@ async def websocket_live(websocket: WebSocket):
     await websocket.accept()
     last_path_v = -1
     last_sfc_corridors_v = -1
+    last_corridor_lines_v = -1
     last_obstacles_v = -1
     last_dyn_nodes_v = -1
     last_rebound_v = -1
@@ -284,6 +285,12 @@ async def websocket_live(websocket: WebSocket):
                 frame["sfc_corridors_debug"] = state.get("sfc_corridors_debug", [])
                 frame["sfc_corridors_debug_version"] = state.get("sfc_corridors_debug_version", 0)
                 last_sfc_corridors_v = state.get("sfc_corridors_debug_version", 0)
+
+            # 拓扑管道边界线框 (仅规划触发产生增量时推送)
+            if state.get("corridor_lines_version", 0) != last_corridor_lines_v:
+                frame["corridor_lines"] = state.get("corridor_lines", [])
+                frame["corridor_lines_version"] = state.get("corridor_lines_version", 0)
+                last_corridor_lines_v = state.get("corridor_lines_version", 0)
 
             # 注入障碍物真值 (低频低量, 版本门控即推)
             if state.get("injected_obstacles_version", 0) != last_obstacles_v:

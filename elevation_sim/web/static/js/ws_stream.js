@@ -2,7 +2,7 @@
  * WebSocket 流式增量数据同步模块 (WebSocket Stream)
  * 完整保留原版：全双工通道、图层差量版本同步(unchanged 跳过)、状态主动分发与断线重连
  */
-export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, sfcDebugVisualizer = null, onSfcDebugUpdated = null, obstacleVisualizer = null, dynamicNodeVisualizer = null, reboundVisualizer = null) {
+export function initWsStream(layers, robotTracker, getActiveRequestedLayers, graphVisualizer = null, corridorVisualizer = null, sfcDebugVisualizer = null, onSfcDebugUpdated = null, obstacleVisualizer = null, dynamicNodeVisualizer = null, reboundVisualizer = null) {
     let ws = null;
     let isConnecting = false;
     const clientLayerVersions = {};
@@ -111,7 +111,12 @@ export function initWsStream(layers, robotTracker, getActiveRequestedLayers, gra
             }
         }
 
-        // 3. 局部可通行走廊单步扩散调试数据更新
+        // 3. 拓扑管道边界线框更新 (仅规划触发产生增量时推送)
+        if (corridorVisualizer && frame.corridor_lines !== undefined) {
+            corridorVisualizer.update(null, frame.corridor_lines);
+        }
+
+        // 3.1 局部可通行走廊单步扩散调试数据更新
         if (frame.sfc_corridors_debug) {
             if (sfcDebugVisualizer) {
                 sfcDebugVisualizer.updateData(frame.sfc_corridors_debug);

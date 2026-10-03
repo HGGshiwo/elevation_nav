@@ -69,6 +69,9 @@ class ElevationRosBridge:
         self.graph_edges_version = 0
         self.graph_adj: Dict[Tuple[float, float, float], List[Tuple[float, float, float]]] = {}
         self.current_graph_node: Optional[Tuple[float, float, float]] = None
+        # 局部 SFC 凸走廊边界线框 (来自 /move_base/local_sfc_corridor 的 wireframe LINE_LIST)
+        self.corridor_lines: List[List[float]] = []
+        self.corridor_lines_version = 0
         # 局部 SFC 走廊诊断数据 (各路径点与扩散节点群)
         self.sfc_corridors_debug: List[Dict[str, Any]] = []
         self.sfc_corridors_debug_version = 0
@@ -194,6 +197,7 @@ class ElevationRosBridge:
             # 订阅流形图节点与边可视化数据
             rospy.Subscriber("/elevation_graph_nodes", PointCloud2, self._graph_nodes_callback, queue_size=1)
             rospy.Subscriber("/elevation_graph_edges", MarkerArray, self._graph_edges_callback, queue_size=1)
+            rospy.Subscriber("/move_base/local_sfc_corridor", MarkerArray, self._corridor_boundaries_callback, queue_size=1)
             rospy.Subscriber("/elevation_local_corridors_debug", RosString, self._sfc_corridors_debug_callback, queue_size=1)
             rospy.Subscriber("/elevation_debug_result", RosString, self._debug_result_callback, queue_size=5)
             rospy.Subscriber("/elevation_injected_obstacles", MarkerArray, self._injected_obstacles_callback, queue_size=1)
@@ -232,6 +236,20 @@ class ElevationRosBridge:
                     self.collision_points = []
         except Exception as e:
             rospy.logwarn(f"[ElevationRosBridge] 解析 collision_node 异常: {e}")
+
+    def _corridor_boundaries_callback(self, msg: MarkerArray):
+        """解析局部 SFC 凸走廊 3D 边界发光线框 (供前端拓扑管道渲染)"""
+        try:
+            lines = []
+            for m in msg.markers:
+                if m.ns == "sfc_corridor_wireframe" and m.type == 5:  # LINE_LIST
+                    for p in m.points:
+                        lines.append([round(float(p.x), 3), round(float(p.y), 3), round(float(p.z), 3)])
+            with self._lock:
+                self.corridor_lines = lines
+                self.corridor_lines_version += 1
+        except Exception as e:
+            rospy.logwarn(f"[ElevationRosBridge] 解析 corridor boundaries 异常: {e}")
 
     def _sfc_corridors_debug_callback(self, msg: RosString):
         """解析局部 SFC 凸多边形走廊调试数据 (包含各路径点坐标、node_id 及 8 邻域扩散节点群)"""
@@ -1277,6 +1295,8 @@ class ElevationRosBridge:
                 "graph_edges_version": self.graph_edges_version,
                 "sfc_corridors_debug": list(self.sfc_corridors_debug),
                 "sfc_corridors_debug_version": self.sfc_corridors_debug_version,
+                "corridor_lines": list(self.corridor_lines),
+                "corridor_lines_version": self.corridor_lines_version,
                 "injected_obstacles": list(self.injected_obstacles) + [
                     {"id": 10000 + i, "type": 3, "x": ox, "y": oy, "z": oz + self.OBSTACLE_HEIGHT / 2,
                      "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0,
